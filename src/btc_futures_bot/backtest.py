@@ -7,11 +7,15 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .costs import CostConfig
-from .indicators import atr
 from .models import Candle, Position
 from .reporting import TradeRecord, TradeReporter
 from .risk import RiskConfig, RiskManager
-from .strategy import MultiTimeframeStrategy, StrategyConfig, signal_position_size_multiplier
+from .strategy import (
+    MultiTimeframeStrategy,
+    StrategyConfig,
+    dynamic_stop_loss_pct,
+    signal_position_size_multiplier,
+)
 
 
 _TIMEFRAME_MS = {
@@ -311,18 +315,13 @@ def run_backtest(
             # market order is therefore modeled at the next 1m open rather
             # than retroactively at the signal candle's close.
             entry_price = next_execution_open
-            stop_loss_pct = risk.config.stop_loss_pct
-            if len(trigger_candles) >= max(2, strategy.config.atr_period):
-                atr_values = atr(
-                    [item.high for item in trigger_candles],
-                    [item.low for item in trigger_candles],
-                    [item.close for item in trigger_candles],
-                    strategy.config.atr_period,
-                )
-                current_atr = atr_values[-1]
-                if current_atr is not None and entry_price > 0:
-                    raw_stop_pct = (current_atr / entry_price) * strategy.config.atr_stop_multiplier
-                    stop_loss_pct = max(strategy.config.min_stop_loss_pct, min(strategy.config.max_stop_loss_pct, raw_stop_pct))
+            stop_loss_pct = dynamic_stop_loss_pct(
+                trigger_candles,
+                strategy.config,
+                risk.config.stop_loss_pct,
+                side=signal.side,
+                entry_price=entry_price,
+            )
             protection = risk.protection(
                 signal.side,
                 equity,

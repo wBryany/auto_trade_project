@@ -32,6 +32,8 @@ class StrategyConfig:
     atr_stop_multiplier: float = 1.4
     min_stop_loss_pct: float = 0.0025
     max_stop_loss_pct: float = 0.006
+    structure_stop_lookback_bars: int = 0
+    structure_stop_buffer_atr: float = 0.0
     min_hold_seconds: int = 90
     reversal_min_score: int = 5
     max_hold_seconds: int = 420
@@ -187,6 +189,63 @@ def _features(candles: Sequence[Candle], config: StrategyConfig) -> _Features | 
         previous_low=previous_low,
         volume_ratio=volume_ratio,
     )
+
+
+def dynamic_stop_loss_pct(
+    candles: Sequence[Candle],
+    config: StrategyConfig,
+    fallback: float,
+    *,
+    side: str | None = None,
+    entry_price: float | None = None,
+) -> float:
+    """Return a volatility stop widened to a nearby market structure level.
+
+    ATR remains the baseline.  When structure stops are enabled, a long stop
+    sits below the lowest recent trigger-bar low and a short stop above the
+    highest recent high, with an optional ATR buffer.  The configured maximum
+    still caps the distance so one large wick cannot create unbounded risk.
+    """
+    fallback = float(fallback)
+    minimum = float(getattr(config, "min_stop_loss_pct", fallback))
+    maximum = float(getattr(config, "max_stop_loss_pct", fallback))
+    if minimum <= 0 or maximum < minimum:
+        return fallback
+
+    period = max(1, int(getattr(config, "atr_period", 7)))
+    if len(candles) < max(2, period):
+        return fallback
+
+    values = atr(
+        [float(candle.high) for candle in candles],
+        [float(candle.low) for candle in candles],
+        [float(candle.close) for candle in candles],
+        period,
+    )
+    current_atr = values[-1]
+    close = float(candles[-1].close)
+    if current_atr is None or close <= 0:
+        return fallback
+
+    atr_pct = (float(current_atr) / close) * float(getattr(config, "atr_stop_multiplier", 1.4))
+    selected = max(minimum, min(maximum, atr_pct))
+
+    lookback = max(0, int(getattr(config, "structure_stop_lookback_bars", 0)))
+    price = float(entry_price or 0.0)
+    if lookback <= 0 or side not in {"long", "short"} or price <= 0:
+        return selected
+
+    window = candles[-lookback:]
+    buffer_distance = float(current_atr) * max(0.0, float(getattr(config, "structure_stop_buffer_atr", 0.0)))
+    if side == "long":
+        structure_price = min(float(candle.low) for candle in window) - buffer_distance
+        structure_pct = (price - structure_price) / price
+    else:
+        structure_price = max(float(candle.high) for candle in window) + buffer_distance
+        structure_pct = (structure_price - price) / price
+    if structure_pct > 0:
+        selected = max(selected, min(maximum, structure_pct))
+    return selected
 
 
 class MultiTimeframeStrategy:

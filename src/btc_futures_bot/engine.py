@@ -10,13 +10,12 @@ from pathlib import Path
 from typing import Any
 
 from .exchanges.base import ExchangeAdapter
-from .indicators import atr
 from .macro_risk import MacroRiskController, MacroRiskDecision
 from .models import Candle, OrderRequest, Position, Signal, TradeResult
 from .notifications import EmailNotifier
 from .reporting import TradeRecord, TradeReporter
 from .risk import RiskManager
-from .strategy import MultiTimeframeStrategy, signal_position_size_multiplier
+from .strategy import MultiTimeframeStrategy, dynamic_stop_loss_pct, signal_position_size_multiplier
 
 LOG = logging.getLogger(__name__)
 MIN_POLL_SECONDS = 1
@@ -248,7 +247,11 @@ class TradingEngine:
             return TradeResult(self.adapter.name, "risk_blocked", signal=signal, position=self.position)
 
         equity = self.config.paper_equity if self.config.mode != "live" else self.adapter.fetch_equity()
-        dynamic_stop_pct = self._dynamic_stop_loss_pct(candles_by_timeframe[trigger_timeframe])
+        dynamic_stop_pct = self._dynamic_stop_loss_pct(
+            candles_by_timeframe[trigger_timeframe],
+            signal.side,
+            current_price,
+        )
         protection = self.risk.protection(
             signal.side,
             equity,
@@ -310,7 +313,12 @@ class TradingEngine:
                 entry_payload,
                 fallback_price=current_price,
             )
-            stop_distance = filled_price * dynamic_stop_pct
+            filled_stop_pct = self._dynamic_stop_loss_pct(
+                candles_by_timeframe[trigger_timeframe],
+                signal.side,
+                filled_price,
+            )
+            stop_distance = filled_price * filled_stop_pct
             stop_price = filled_price - stop_distance if signal.side == "long" else filled_price + stop_distance
             take_profit_price = (
                 filled_price + stop_distance * self.config.take_profit_r
@@ -992,33 +1000,19 @@ class TradingEngine:
         required_score = max(1, int(getattr(self.strategy.config, "reversal_min_score", 5)))
         return signal.score >= required_score
 
-    def _dynamic_stop_loss_pct(self, candles: list[Any]) -> float:
-        """Set the stop distance from recent 30-second volatility.
-
-        The configured risk stop remains the fallback when ATR is unavailable.
-        Clamping prevents a single noisy candle from creating an unusably wide
-        stop or a stop that is too close to survive normal market noise.
-        """
-        config = self.strategy.config
-        fallback = float(self.risk.config.stop_loss_pct)
-        if len(candles) < max(2, int(getattr(config, "atr_period", 7))):
-            return fallback
-        values = atr(
-            [float(candle.high) for candle in candles],
-            [float(candle.low) for candle in candles],
-            [float(candle.close) for candle in candles],
-            int(getattr(config, "atr_period", 7)),
+    def _dynamic_stop_loss_pct(
+        self,
+        candles: list[Any],
+        side: str | None = None,
+        entry_price: float | None = None,
+    ) -> float:
+        return dynamic_stop_loss_pct(
+            candles,
+            self.strategy.config,
+            float(self.risk.config.stop_loss_pct),
+            side=side,
+            entry_price=entry_price,
         )
-        current_atr = values[-1]
-        close = float(candles[-1].close)
-        if current_atr is None or close <= 0:
-            return fallback
-        raw_pct = (float(current_atr) / close) * float(getattr(config, "atr_stop_multiplier", 1.4))
-        minimum = float(getattr(config, "min_stop_loss_pct", fallback))
-        maximum = float(getattr(config, "max_stop_loss_pct", fallback))
-        if minimum <= 0 or maximum < minimum:
-            return fallback
-        return max(minimum, min(maximum, raw_pct))
 
     def _entry_allowed(self) -> bool:
         threshold = int(self.risk.config.max_consecutive_losses)

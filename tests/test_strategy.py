@@ -23,6 +23,7 @@ from btc_futures_bot.strategy import (
     _traditional_strong_regime_quality,
     _traditional_setup_macd_handoff,
     _traditional_setup_volume_handoff,
+    dynamic_stop_loss_pct,
     signal_position_size_multiplier,
 )
 
@@ -116,6 +117,61 @@ def test_risk_protection_accepts_dynamic_stop_distance() -> None:
     protection = RiskManager().protection("long", 10_000, 100, 1.6, stop_loss_pct=0.0035)
     assert protection.stop_price == 99.65
     assert protection.take_profit_price == 100.56
+
+
+def test_dynamic_stop_uses_recent_structure_for_long_and_short() -> None:
+    candles = [
+        Candle(1, 100.0, 102.0, 98.0, 100.0, 10.0),
+        Candle(2, 100.0, 103.0, 99.0, 102.0, 10.0),
+    ]
+    config = StrategyConfig(
+        atr_period=2,
+        atr_stop_multiplier=1.0,
+        min_stop_loss_pct=0.001,
+        max_stop_loss_pct=0.10,
+        structure_stop_lookback_bars=2,
+    )
+
+    long_stop = dynamic_stop_loss_pct(candles, config, 0.05, side="long", entry_price=104.0)
+    short_stop = dynamic_stop_loss_pct(candles, config, 0.05, side="short", entry_price=96.0)
+
+    assert abs(long_stop - ((104.0 - 98.0) / 104.0)) < 1e-12
+    assert abs(short_stop - ((103.0 - 96.0) / 96.0)) < 1e-12
+
+
+def test_dynamic_structure_stop_honors_atr_buffer_and_maximum() -> None:
+    candles = [
+        Candle(1, 100.0, 102.0, 98.0, 100.0, 10.0),
+        Candle(2, 100.0, 103.0, 99.0, 102.0, 10.0),
+    ]
+    config = StrategyConfig(
+        atr_period=2,
+        atr_stop_multiplier=1.0,
+        min_stop_loss_pct=0.001,
+        max_stop_loss_pct=0.06,
+        structure_stop_lookback_bars=2,
+        structure_stop_buffer_atr=0.5,
+    )
+
+    assert dynamic_stop_loss_pct(candles, config, 0.05, side="long", entry_price=104.0) == 0.06
+
+
+def test_dynamic_stop_keeps_legacy_atr_result_when_structure_is_disabled() -> None:
+    candles = [
+        Candle(1, 100.0, 102.0, 98.0, 100.0, 10.0),
+        Candle(2, 100.0, 103.0, 99.0, 102.0, 10.0),
+    ]
+    config = StrategyConfig(
+        atr_period=2,
+        atr_stop_multiplier=1.0,
+        min_stop_loss_pct=0.001,
+        max_stop_loss_pct=0.10,
+    )
+
+    without_side = dynamic_stop_loss_pct(candles, config, 0.05)
+    with_side = dynamic_stop_loss_pct(candles, config, 0.05, side="long", entry_price=104.0)
+
+    assert without_side == with_side
 
 
 def test_risk_protection_scales_countertrend_position_size() -> None:

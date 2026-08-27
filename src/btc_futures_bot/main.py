@@ -169,7 +169,7 @@ def load_config(path: str) -> dict[str, Any]:
     for name in config.get("exchanges", {}):
         ensure_exchange_defaults(config, name)
     strategy = config.setdefault("strategy", {})
-    for key, default in (("mode", "scalp"), ("trigger_timeframe", "30s"), ("regime_timeframe", "5m"), ("max_hold_seconds", 420), ("hard_max_hold_seconds", 900), ("take_profit_r", 2.0), ("atr_stop_multiplier", 1.4), ("min_stop_loss_pct", 0.0025), ("max_stop_loss_pct", 0.006), ("min_hold_seconds", 90), ("reversal_min_score", 5), ("require_volume_confirmation", True)):
+    for key, default in (("mode", "scalp"), ("trigger_timeframe", "30s"), ("regime_timeframe", "5m"), ("max_hold_seconds", 420), ("hard_max_hold_seconds", 900), ("take_profit_r", 2.0), ("atr_stop_multiplier", 1.4), ("min_stop_loss_pct", 0.0025), ("max_stop_loss_pct", 0.006), ("structure_stop_lookback_bars", 0), ("structure_stop_buffer_atr", 0.0), ("min_hold_seconds", 90), ("reversal_min_score", 5), ("require_volume_confirmation", True)):
         strategy.setdefault(key, default)
     strategy.setdefault("volume_sma_period", 20)
     strategy.setdefault("min_volume_ratio", 1.3)
