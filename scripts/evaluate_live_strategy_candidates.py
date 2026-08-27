@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import random
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,9 @@ FOLDS = {
     "wf_2": (datetime(2026, 8, 13, tzinfo=timezone.utc), datetime(2026, 8, 20, tzinfo=timezone.utc)),
     "wf_3_holdout": (datetime(2026, 8, 20, tzinfo=timezone.utc), None),
 }
+MIN_FULL_TRADES = 30
+MIN_HOLDOUT_TRADES = 10
+BOOTSTRAP_SAMPLES = 2_000
 
 
 def _read_rows(path: Path) -> list[dict[str, str]]:
@@ -28,7 +32,7 @@ def _read_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(file))
 
 
-def _metrics(rows: list[dict[str, str]]) -> dict[str, float | int]:
+def _metrics(rows: list[dict[str, str]]) -> dict[str, float | int | None]:
     pnl = [float(row["net_pnl"]) for row in rows]
     gross = [float(row["gross_pnl"]) for row in rows]
     costs = [float(row["total_cost"]) for row in rows]
@@ -50,8 +54,35 @@ def _metrics(rows: list[dict[str, str]]) -> dict[str, float | int]:
         "total_cost": sum(costs),
         "net_pnl": sum(pnl),
         "expectancy_per_trade": (sum(pnl) / len(rows)) if rows else 0.0,
-        "profit_factor": (gross_profit / gross_loss) if gross_loss else (float("inf") if gross_profit else 0.0),
+        # JSON has no portable infinity value.  ``None`` explicitly means the
+        # sample contains profit but no losing trades.
+        "profit_factor": (gross_profit / gross_loss) if gross_loss else (None if gross_profit else 0.0),
         "max_drawdown_usdt": max_drawdown,
+    }
+
+
+def _bootstrap_expectancy_ci(
+    rows: list[dict[str, str]],
+    *,
+    samples: int = BOOTSTRAP_SAMPLES,
+    seed: int = 0,
+) -> dict[str, float | int | None]:
+    """Return a deterministic 95% bootstrap interval for mean net PnL."""
+    pnl = [float(row["net_pnl"]) for row in rows]
+    if not pnl:
+        return {"samples": 0, "lower": None, "upper": None}
+    sample_count = max(100, int(samples))
+    rng = random.Random(seed)
+    means = sorted(
+        sum(rng.choice(pnl) for _ in pnl) / len(pnl)
+        for _ in range(sample_count)
+    )
+    lower_index = max(0, int(sample_count * 0.025) - 1)
+    upper_index = min(sample_count - 1, int(sample_count * 0.975))
+    return {
+        "samples": sample_count,
+        "lower": means[lower_index],
+        "upper": means[upper_index],
     }
 
 
@@ -67,6 +98,34 @@ def _fold_rows(rows: list[dict[str, str]], start: datetime, end: datetime | None
 def _candidates() -> list[dict[str, Any]]:
     return [
         {"name": "baseline", "strategy": {}, "risk": {}},
+        {
+            "name": "break_even_0_75",
+            "strategy": {"break_even_trigger_r": 0.75},
+            "risk": {},
+        },
+        {
+            "name": "break_even_1_0",
+            "strategy": {"break_even_trigger_r": 1.0},
+            "risk": {},
+        },
+        *[
+            {
+                "name": f"regime_gap_only_{str(gap).replace('.', '_')}",
+                "strategy": {"traditional_strong_regime_min_gap_atr": gap},
+                "risk": {},
+            }
+            for gap in (0.25, 0.5)
+        ],
+        {
+            "name": "regime_slope_only",
+            "strategy": {"traditional_strong_regime_require_fast_slope": True},
+            "risk": {},
+        },
+        {
+            "name": "regime_macd_only",
+            "strategy": {"traditional_strong_regime_require_macd": True},
+            "risk": {},
+        },
         {
             "name": "regime_slope_macd",
             "strategy": {
@@ -399,16 +458,28 @@ def main() -> None:
                 "full": _metrics(rows),
                 "walk_forward_folds": folds,
                 "walk_forward_aggregate": _metrics(aggregate_rows),
+                "expectancy_ci_95": {
+                    "full": _bootstrap_expectancy_ci(rows, seed=11),
+                    "walk_forward": _bootstrap_expectancy_ci(aggregate_rows, seed=17),
+                    "latest_holdout": _bootstrap_expectancy_ci(
+                        _fold_rows(rows, *FOLDS["wf_3_holdout"]),
+                        seed=23,
+                    ),
+                },
             }
         )
         print(name, json.dumps(results[-1]["full"], ensure_ascii=False), flush=True)
 
     baseline = results[0]
     for item in results:
+        holdout_ci_lower = item["expectancy_ci_95"]["latest_holdout"]["lower"]
         item["deployment_gate"] = {
+            "minimum_full_trades": item["full"]["trades"] >= MIN_FULL_TRADES,
+            "minimum_holdout_trades": item["walk_forward_folds"]["wf_3_holdout"]["trades"] >= MIN_HOLDOUT_TRADES,
             "full_expectancy_positive": item["full"]["expectancy_per_trade"] > 0,
             "walk_forward_expectancy_positive": item["walk_forward_aggregate"]["expectancy_per_trade"] > 0,
             "latest_holdout_expectancy_positive": item["walk_forward_folds"]["wf_3_holdout"]["expectancy_per_trade"] > 0,
+            "latest_holdout_ci_lower_positive": holdout_ci_lower is not None and holdout_ci_lower > 0,
             "drawdown_not_worse_than_baseline": item["full"]["max_drawdown_usdt"] <= baseline["full"]["max_drawdown_usdt"],
         }
         item["deployment_gate"]["passed"] = all(item["deployment_gate"].values())

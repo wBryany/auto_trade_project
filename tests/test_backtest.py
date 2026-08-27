@@ -6,6 +6,7 @@ from pathlib import Path
 from btc_futures_bot.backtest import run_backtest
 from btc_futures_bot.models import Signal
 from btc_futures_bot.reporting import TradeReporter
+from btc_futures_bot.risk import RiskConfig, RiskManager
 from btc_futures_bot.strategy import StrategyConfig
 
 
@@ -171,3 +172,83 @@ def test_backtest_dynamic_exit_default_does_not_force_fixed_take_profit(tmp_path
 
     assert dynamic.trades == 0
     assert fixed.trades == 1
+
+
+def test_backtest_enters_at_next_open_and_prices_gap_through_stop(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    report_dir = tmp_path / "reports"
+    data_dir.mkdir()
+    rows = [
+        (0, 100.0, 101.0, 99.0, 100.0),
+        (1, 100.0, 101.0, 99.0, 100.0),
+        (2, 110.0, 111.0, 109.0, 110.0),
+        (3, 90.0, 91.0, 89.0, 90.0),
+        (4, 90.0, 91.0, 89.0, 90.0),
+    ]
+    with (data_dir / "1m.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(("timestamp", "open", "high", "low", "close", "volume", "volume_quote"))
+        for index, open_price, high, low, close in rows:
+            writer.writerow((1_700_000_000_000 + index * 60_000, open_price, high, low, close, 10, 1000))
+
+    class OneLongSignal:
+        config = StrategyConfig(
+            mode="scalp",
+            trigger_timeframe="1m",
+            regime_timeframe="1m",
+            enable_profit_trend_exit=False,
+            break_even_trigger_r=0.0,
+            trailing_trigger_r=0.0,
+        )
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def evaluate(self, candles_by_timeframe: dict[str, list[object]]) -> Signal:
+            self.calls += 1
+            timestamp = candles_by_timeframe["1m"][-1].timestamp
+            return Signal("long", 6, timestamp, ("entry",)) if self.calls == 1 else Signal("flat", 0, timestamp, ("hold",))
+
+    reporter = TradeReporter(report_dir)
+    try:
+        summary = run_backtest(
+            data_dir,
+            strategy=OneLongSignal(),
+            risk=RiskManager(RiskConfig(stop_loss_pct=0.05, cooldown_minutes=0)),
+            reporter=reporter,
+        )
+    finally:
+        reporter.close()
+
+    with (report_dir / "trade_report.csv").open("r", encoding="utf-8-sig", newline="") as handle:
+        trades = list(csv.DictReader(handle))
+
+    assert summary.trades == 1
+    assert float(trades[0]["entry_price"]) == 110.0
+    assert float(trades[0]["exit_price"]) == 90.0
+    assert trades[0]["exit_reason"] == "stop_loss"
+
+
+def test_backtest_uses_one_minute_driver_for_slow_trigger(tmp_path: Path) -> None:
+    _write_candles(tmp_path / "1m.csv", count=60, interval_ms=60_000)
+    _write_candles(tmp_path / "15m.csv", count=4, interval_ms=900_000)
+
+    class RecordingSlowStrategy:
+        config = StrategyConfig(
+            mode="scalp",
+            trigger_timeframe="15m",
+            regime_timeframe="15m",
+        )
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def evaluate(self, candles_by_timeframe: dict[str, list[object]]) -> Signal:
+            self.calls += 1
+            timestamp = candles_by_timeframe["15m"][-1].timestamp
+            return Signal("flat", 0, timestamp, ("recording",))
+
+    strategy = RecordingSlowStrategy()
+    run_backtest(tmp_path, strategy=strategy)
+
+    assert strategy.calls > 20

@@ -42,6 +42,8 @@ py -m btc_futures_bot.backtest .\data\btc
 py -m btc_futures_bot.backtest .\data\btc --report-dir .\reports\backtest
 ```
 
+回测统一以 1 分钟数据推进持仓管理；信号只能在对应 K 线收盘后确认，因此入场与反转按下一根 1 分钟 K 线开盘价建模。若开盘已经跳过止损价，止损按更差的开盘价成交，避免用信号当根收盘价或理想止损价高估结果。候选评估还要求完整样本和最新留出段达到最小交易数，并用 bootstrap 置信区间检查单笔期望。
+
 ## 交易报表
 
 每次纸面交易平仓后，系统会把记录写入 `report_dir`，默认是 `reports/`：

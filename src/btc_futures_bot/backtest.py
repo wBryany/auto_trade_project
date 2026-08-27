@@ -68,7 +68,11 @@ def run_backtest(
         if not path.exists() and timeframe == "30s":
             path = data_dir / "1m.csv"
         bars[timeframe] = load_csv(path)
-    driver_timeframe = "1m" if strategy.config.mode == "traditional_kline" else trigger_timeframe
+    # Live evaluation always has a closed 1m execution stream.  Driving a
+    # replay from a slower trigger timeframe skips the intervening 1m bars and
+    # materially delays stop/trailing management, so 1m is the universal
+    # replay clock even when signals come from 5m or 15m candles.
+    driver_timeframe = "1m"
     driver = bars[driver_timeframe]
     if not driver:
         raise ValueError(f"{driver_timeframe}.csv contains no candles")
@@ -102,6 +106,11 @@ def run_backtest(
         if index < 1:
             continue
         decision_timestamp = candle.timestamp + _TIMEFRAME_MS[driver_timeframe]
+        next_execution_candle = driver[index + 1] if index + 1 < len(driver) else None
+        next_execution_open = next_execution_candle.open if next_execution_candle is not None else None
+        next_execution_timestamp = (
+            next_execution_candle.timestamp if next_execution_candle is not None else None
+        )
         candles_by_timeframe: dict[str, list[Candle]] = {}
         for timeframe, series in bars.items():
             latest_closed_open = decision_timestamp - _TIMEFRAME_MS[timeframe]
@@ -129,14 +138,16 @@ def run_backtest(
             exit_price: float | None = None
             if position.side == "long":
                 if exit_candle.low <= position.stop_price:
-                    exit_price = position.stop_price
+                    # A market stop cannot fill at the stop price after the
+                    # candle has already opened below it.
+                    exit_price = min(position.stop_price, exit_candle.open)
                     exit_reason = _stop_exit_reason(position)
                 elif use_fixed_take_profit and exit_candle.high >= position.take_profit_price:
                     exit_price = position.take_profit_price
                     exit_reason = "take_profit"
             else:
                 if exit_candle.high >= position.stop_price:
-                    exit_price = position.stop_price
+                    exit_price = max(position.stop_price, exit_candle.open)
                     exit_reason = _stop_exit_reason(position)
                 elif use_fixed_take_profit and exit_candle.low <= position.take_profit_price:
                     exit_price = position.take_profit_price
@@ -228,14 +239,14 @@ def run_backtest(
             and signal.side != position.side
             and signal.timestamp != last_signal_timestamp
         ):
-            execution_candle = candles_by_timeframe["1m"][-1]
-            held_seconds = max(0.0, (decision_timestamp - position.opened_at) / 1000)
+            execution_timestamp = next_execution_timestamp or decision_timestamp
+            held_seconds = max(0.0, (execution_timestamp - position.opened_at) / 1000)
             minimum_hold = max(0, int(getattr(strategy.config, "min_hold_seconds", 60)))
-            if held_seconds >= minimum_hold:
+            if held_seconds >= minimum_hold and next_execution_open is not None:
                 net_exit = risk.estimate_net_pnl(
                     position.side,
                     position.entry_price,
-                    execution_candle.close,
+                    next_execution_open,
                     position.quantity,
                     holding_hours=held_seconds / 3600,
                 )
@@ -245,7 +256,7 @@ def run_backtest(
                     pnl = risk.estimate_net_pnl(
                         position.side,
                         position.entry_price,
-                        execution_candle.close,
+                        next_execution_open,
                         position.quantity,
                         holding_hours=held_seconds / 3600,
                     )
@@ -256,8 +267,8 @@ def run_backtest(
                                 symbol="BTC-USDT",
                                 mode="backtest",
                                 position=position,
-                                exit_price=execution_candle.close,
-                                exit_time_ms=decision_timestamp,
+                                exit_price=next_execution_open,
+                                exit_time_ms=execution_timestamp,
                                 exit_reason="opposite_signal",
                                 costs=risk.costs,
                                 equity_before=position_equity_before,
@@ -285,6 +296,8 @@ def run_backtest(
 
         if position is None and signal.side != "flat" and signal.timestamp != last_signal_timestamp:
             last_signal_timestamp = signal.timestamp
+            if next_execution_open is None:
+                continue
             loss_streak_pause = max(0, int(getattr(risk.config, "loss_streak_pause_minutes", 0)))
             threshold = int(risk.config.max_consecutive_losses)
             if threshold > 0 and consecutive_losses >= threshold and loss_streak_pause:
@@ -294,8 +307,10 @@ def run_backtest(
             if decision_timestamp < cooldown_until_ms:
                 continue
             trigger_candles = candles_by_timeframe[trigger_timeframe]
-            execution_candle = candles_by_timeframe["1m"][-1]
-            entry_price = execution_candle.close
+            # The signal is known only after the latest candle closes.  A
+            # market order is therefore modeled at the next 1m open rather
+            # than retroactively at the signal candle's close.
+            entry_price = next_execution_open
             stop_loss_pct = risk.config.stop_loss_pct
             if len(trigger_candles) >= max(2, strategy.config.atr_period):
                 atr_values = atr(
@@ -324,7 +339,7 @@ def run_backtest(
                 entry_price,
                 protection.stop_price,
                 protection.take_profit_price,
-                decision_timestamp,
+                next_execution_timestamp or decision_timestamp,
                 initial_stop_price=protection.stop_price,
                 best_price=entry_price,
                 worst_price=entry_price,
