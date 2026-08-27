@@ -76,6 +76,8 @@ def test_dashboard_uses_saved_live_configuration_without_duplicate_confirmation(
     assert "理论最大可开金额使用比例 (%)" in DASHBOARD_HTML
     assert "s.market.mark_price_raw" in DASHBOARD_HTML
     assert "动态退出" in DASHBOARD_HTML
+    assert "pollSecondsInput.min='1'" in DASHBOARD_HTML
+    assert "不改变 K 线周期" in DASHBOARD_HTML
 
 
 def test_dashboard_marks_live_take_profit_as_dynamic() -> None:

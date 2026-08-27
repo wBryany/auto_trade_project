@@ -34,6 +34,17 @@ def test_dashboard_execution_mode_does_not_overwrite_strategy_mode(tmp_path) -> 
     assert saved["strategy"]["mode"] == "traditional_kline"
 
 
+def test_dashboard_accepts_one_second_polling_and_clamps_lower_values(tmp_path) -> None:
+    source = tmp_path / "config.json"
+    source.write_text(json.dumps(_source_config()), encoding="utf-8")
+
+    target = save_dashboard_config(source, {"exchange": "okx", "poll_seconds": 1})
+    assert json.loads(target.read_text(encoding="utf-8"))["poll_seconds"] == 1
+
+    target = save_dashboard_config(source, {"exchange": "okx", "poll_seconds": 0})
+    assert json.loads(target.read_text(encoding="utf-8"))["poll_seconds"] == 1
+
+
 def test_dashboard_strategy_mode_requires_explicit_valid_field(tmp_path) -> None:
     source = tmp_path / "config.json"
     source.write_text(json.dumps(_source_config()), encoding="utf-8")

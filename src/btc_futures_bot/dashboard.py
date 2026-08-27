@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .engine import normalized_poll_seconds
 from .main import (
     build_engine,
     credential_values,
@@ -397,7 +398,7 @@ class DashboardService:
                 if str(error) != self._last_logged_error:
                     self._last_logged_error = str(error)
                     self.operation_logger.record("engine_cycle", "cycle", status="error", summary="行情周期执行失败，引擎保持运行", result={"error": str(error)})
-            poll = max(5, int(self.engine.config.poll_seconds)) if self.engine else 15
+            poll = normalized_poll_seconds(self.engine.config.poll_seconds) if self.engine else 15
             stop_event.wait(poll)
 
     def _adapter(self, config: dict[str, Any], exchange_name: str) -> Any:
@@ -824,6 +825,7 @@ document.querySelector('.nav').insertAdjacentHTML('beforeend','<button data-tab=
  document.getElementById('reports').insertAdjacentHTML('afterend',`<section id="operations" class="tab"><div class="panel"><h2>操作日志</h2><div class="toolbar"><div class="field"><label>开始日期</label><input id="operationsFrom" type="date"></div><div class="field"><label>结束日期</label><input id="operationsTo" type="date"></div><div class="field"><label>类型</label><select id="operationsType"><option value="">全部类型</option><option value="config_change">配置变更</option><option value="strategy_change">策略变更</option><option value="code_change">代码变更</option><option value="engine_start">启动引擎</option><option value="engine_stop">停止引擎</option><option value="engine_restart">重启引擎</option><option value="dashboard_restart">页面服务重启</option><option value="engine_cycle">运行周期</option></select></div><div class="field grow"><label>关键词</label><input id="operationsQuery" placeholder="搜索摘要、文件或结果"></div><button id="operationsBtn">查询日志</button></div><div class="note">日志文件：<span id="operationPath">—</span>；API Secret、Passphrase 等敏感字段不会写入日志。</div><div class="table-wrap"><table><thead><tr><th>本地时间</th><th>类型</th><th>动作</th><th>状态</th><th>摘要</th><th>变更文件</th><th>详情/结果</th><th>来源</th></tr></thead><tbody id="operationsBody"><tr><td colspan="8" class="empty">暂无操作日志</td></tr></tbody></table></div></div></section>`);
 document.querySelector('#config .actions').insertAdjacentHTML('beforebegin',`<div style="margin-top:20px;border-top:1px solid var(--line);padding-top:4px"><h3>邮件通知</h3><div class="note">最多 5 个收件邮箱。SMTP 密码只从环境变量读取，不保存到配置或日志。</div><div class="grid columns"><div class="check"><input type="checkbox" id="emailEnabled"><label for="emailEnabled">启用开仓、平仓和每日邮件</label></div><div class="check"><input type="checkbox" id="dailyEmailEnabled"><label for="dailyEmailEnabled">每天 0 点发送上一日交易报告</label></div><div class="field"><label>SMTP 服务器</label><input id="smtpHost" placeholder="例如 smtp.qq.com"></div><div class="field"><label>SMTP 端口</label><input id="smtpPort" type="number" min="1" max="65535" value="465"></div><div class="field"><label>连接安全</label><select id="emailSecurity"><option value="ssl">SSL</option><option value="starttls">STARTTLS</option><option value="plain">Plain</option></select></div><div class="field"><label>发件邮箱</label><input id="emailSender" type="email" placeholder="sender@example.com"></div><div class="field"><label>收件邮箱（逗号分隔，最多5个）</label><input id="emailRecipients" placeholder="a@example.com,b@example.com"></div><div class="field"><label>SMTP 用户名环境变量</label><input id="emailUsernameEnv" value="BTC_EMAIL_USERNAME"></div><div class="field"><label>SMTP 密码环境变量</label><input id="emailPasswordEnv" value="BTC_EMAIL_PASSWORD"></div><div class="field"><label>报告时区</label><input id="emailTimezone" value="Asia/Shanghai"></div><div class="field"><label>每日报告小时</label><input id="dailyReportHour" type="number" min="0" max="23" value="0"></div></div><div id="emailState" class="note">邮件通知未配置</div></div>`);
 const $=id=>document.getElementById(id);const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const pollSecondsInput=$('pollSeconds');pollSecondsInput.min='1';pollSecondsInput.title='每次策略评估完成后等待的秒数；不改变 K 线周期';pollSecondsInput.closest('.field').querySelector('label').textContent='轮询间隔（秒，最小 1）';
 document.querySelector('#reports h2').insertAdjacentHTML('afterend','<div id="reportScopeButtons" class="scope-tabs"><button type="button" class="active" data-scope="all">全部交易</button><button type="button" data-scope="testnet">测试网交易</button><button type="button" data-scope="production">正式交易</button></div>');
 let reportScope='all';
 const reportTradeHeader=document.querySelector('#tradesBody')?.closest('table')?.querySelector('thead tr');

@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .engine import EngineConfig, TradingEngine
+from .engine import EngineConfig, TradingEngine, normalized_poll_seconds
 from .costs import CostConfig
 from .exchanges.factory import make_adapter
 from .macro_risk import MacroRiskConfig, MacroRiskController
@@ -216,7 +216,7 @@ def save_dashboard_config(path: str, updates: dict[str, Any]) -> Path:
         raise ValueError("mode must be paper or live")
     config["mode"] = requested_mode
     if "poll_seconds" in updates:
-        config["poll_seconds"] = max(5, int(updates["poll_seconds"]))
+        config["poll_seconds"] = normalized_poll_seconds(updates["poll_seconds"])
     if "paper_equity" in updates:
         config["paper_equity"] = float(updates["paper_equity"])
     account = config.setdefault("account", {})

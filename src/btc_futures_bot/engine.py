@@ -19,6 +19,12 @@ from .risk import RiskManager
 from .strategy import MultiTimeframeStrategy, signal_position_size_multiplier
 
 LOG = logging.getLogger(__name__)
+MIN_POLL_SECONDS = 1
+
+
+def normalized_poll_seconds(value: int | float | str) -> int:
+    """Return the supported delay between completed evaluation cycles."""
+    return max(MIN_POLL_SECONDS, int(value))
 
 
 @dataclass
@@ -1331,7 +1337,7 @@ class TradingEngine:
                     LOG.warning("%s", result)
             except Exception:
                 LOG.exception("cycle failed for %s; no new order submitted", self.adapter.name)
-            time.sleep(max(5, self.config.poll_seconds))
+            time.sleep(normalized_poll_seconds(self.config.poll_seconds))
 
     @staticmethod
     def _opposite_side(side: str) -> str:
