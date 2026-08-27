@@ -4,9 +4,94 @@ import time
 from types import SimpleNamespace
 
 from btc_futures_bot.engine import EngineConfig, TradingEngine
+from btc_futures_bot.costs import CostConfig
 from btc_futures_bot.models import Candle, Position, Signal
+from btc_futures_bot.reporting import TradeRecord, TradeReporter
 from btc_futures_bot.risk import RiskConfig, RiskManager
 from btc_futures_bot.strategy import MultiTimeframeStrategy, StrategyConfig
+
+
+def test_live_engine_restores_timed_loss_streak_after_restart(tmp_path: object) -> None:
+    reporter = TradeReporter(tmp_path)
+    now_ms = int(time.time() * 1000)
+    costs = CostConfig(maker_fee_pct=0.0, taker_fee_pct=0.0, slippage_pct=0.0, funding_rate_pct_per_8h=0.0)
+    try:
+        for index in range(3):
+            opened_at = now_ms - (3 - index) * 120_000
+            position = Position(
+                "long",
+                1.0,
+                100.0,
+                99.0,
+                102.5,
+                opened_at,
+                initial_stop_price=99.0,
+                best_price=100.0,
+                worst_price=99.0,
+            )
+            reporter.record_trade(
+                TradeRecord.from_position(
+                    exchange="binance",
+                    symbol="BTCUSDT",
+                    mode="live",
+                    environment="production",
+                    position=position,
+                    exit_price=99.0,
+                    exit_time_ms=opened_at + 60_000,
+                    exit_reason="stop_loss",
+                    costs=costs,
+                    equity_before=100.0,
+                    signal=Signal("long", 6, opened_at, ("test",)),
+                )
+            )
+
+        adapter = SimpleNamespace(
+            name="binance",
+            settings=SimpleNamespace(environment="production"),
+        )
+        engine = TradingEngine(
+            adapter,
+            MultiTimeframeStrategy(StrategyConfig()),
+            RiskManager(
+                RiskConfig(
+                    max_consecutive_losses=3,
+                    cooldown_minutes=5,
+                    loss_streak_pause_minutes=720,
+                )
+            ),
+            EngineConfig(mode="live"),
+            reporter=reporter,
+        )
+
+        assert engine.consecutive_losses == 3
+        assert engine.cooldown_until > time.time()
+        assert not engine._entry_allowed()
+
+        engine.cooldown_until = time.time() - 1
+        assert engine._entry_allowed()
+        assert engine.consecutive_losses == 0
+    finally:
+        reporter.close()
+
+
+def test_zero_loss_streak_threshold_never_blocks_entry() -> None:
+    engine = TradingEngine(
+        SimpleNamespace(name="test"),
+        MultiTimeframeStrategy(StrategyConfig()),
+        RiskManager(
+            RiskConfig(
+                max_consecutive_losses=0,
+                cooldown_minutes=0,
+                loss_streak_pause_minutes=720,
+            )
+        ),
+        EngineConfig(mode="paper"),
+    )
+    engine.consecutive_losses = 100
+    engine.cooldown_until = time.time() - 1
+
+    assert engine._entry_allowed()
+    assert engine.consecutive_losses == 100
 
 
 def _engine(*, enable_time_exit: bool) -> TradingEngine:

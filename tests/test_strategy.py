@@ -18,11 +18,72 @@ from btc_futures_bot.strategy import (
     _TraditionalSetupState,
     _traditional_countertrend_cross_regime,
     _traditional_countertrend_pullback_regime,
+    _traditional_cross_quality,
     _traditional_neutral_transition_regime,
+    _traditional_strong_regime_quality,
     _traditional_setup_macd_handoff,
     _traditional_setup_volume_handoff,
     signal_position_size_multiplier,
 )
+
+
+def test_traditional_strong_regime_quality_rejects_stale_ema_ordering() -> None:
+    feature = _TraditionalFeatures(
+        open=100.0,
+        high=101.0,
+        low=99.0,
+        close=100.5,
+        previous_close=100.4,
+        ema_fast=100.2,
+        previous_ema_fast=100.3,
+        ema_slow=99.9,
+        previous_ema_slow=99.8,
+        rsi=55.0,
+        macd_histogram=-0.1,
+        previous_macd_histogram=0.1,
+        atr=1.0,
+        volume_ratio=1.2,
+    )
+
+    assert _traditional_strong_regime_quality(feature, "long", StrategyConfig())
+    assert not _traditional_strong_regime_quality(
+        feature,
+        "long",
+        StrategyConfig(
+            traditional_strong_regime_min_gap_atr=0.5,
+            traditional_strong_regime_require_fast_slope=True,
+            traditional_strong_regime_require_macd=True,
+        ),
+    )
+
+
+def test_traditional_cross_quality_rejects_weak_wick_close() -> None:
+    feature = _TraditionalFeatures(
+        open=100.0,
+        high=102.0,
+        low=99.0,
+        close=100.4,
+        previous_close=100.0,
+        ema_fast=100.1,
+        previous_ema_fast=99.9,
+        ema_slow=100.0,
+        previous_ema_slow=100.0,
+        rsi=55.0,
+        macd_histogram=0.1,
+        previous_macd_histogram=-0.1,
+        atr=1.0,
+        volume_ratio=1.2,
+    )
+
+    assert _traditional_cross_quality(feature, "long", StrategyConfig())
+    assert not _traditional_cross_quality(
+        feature,
+        "long",
+        StrategyConfig(
+            traditional_cross_min_body_ratio=0.5,
+            traditional_cross_min_close_location=0.7,
+        ),
+    )
 
 
 def test_ema_and_rsi_have_values_after_warmup() -> None:
@@ -683,3 +744,124 @@ def test_traditional_kline_strategy_accepts_early_short_breakdown() -> None:
     ).evaluate(market)
     assert weak_breakout_rejected.side == "flat"
     assert "5m_short_breakout_quality_rejected" in weak_breakout_rejected.reasons
+
+
+def test_traditional_one_minute_impulse_enters_early_once_at_half_size() -> None:
+    def candles(values: list[float], interval_ms: int, volume: float = 10.0) -> list[Candle]:
+        return [
+            Candle(index * interval_ms, value - 0.05, value + 0.10, value - 0.10, value, volume)
+            for index, value in enumerate(values)
+        ]
+
+    regime = candles([100.0 + index * 0.1 for index in range(40)], 3_600_000)
+    trigger_values = [100.0] * 10 + [100.0 + (index**1.3) * 0.02 for index in range(30)]
+    trigger = candles(trigger_values, 300_000)
+    base = trigger_values[-1] - 0.2
+    execution = candles([base + (index % 5) * 0.01 for index in range(45)], 60_000)
+    last = execution[-1]
+    execution[-1] = Candle(last.timestamp, base + 0.04, base + 0.50, base + 0.03, base + 0.48, 80.0)
+    config = StrategyConfig(
+        mode="traditional_kline",
+        trigger_timeframe="5m",
+        regime_timeframe="1h",
+        traditional_trend_fast=5,
+        traditional_trend_slow=20,
+        traditional_signal_fast=3,
+        traditional_signal_slow=5,
+        traditional_rsi_period=3,
+        traditional_macd_fast=3,
+        traditional_macd_slow=6,
+        traditional_macd_signal=2,
+        traditional_atr_period=3,
+        traditional_volume_sma_period=5,
+        traditional_min_volume_ratio=1.1,
+        traditional_rsi_long_min=0.0,
+        traditional_rsi_long_max=100.0,
+        traditional_allow_pullback=False,
+        traditional_allow_breakout=False,
+        traditional_allow_1m_impulse=True,
+        traditional_1m_impulse_lookback=10,
+        traditional_1m_impulse_confirmation_bars=1,
+        traditional_1m_impulse_min_volume_ratio=2.0,
+        traditional_1m_impulse_min_body_ratio=0.6,
+        traditional_1m_impulse_min_close_location=0.8,
+        traditional_1m_impulse_min_range_atr=1.0,
+        traditional_1m_impulse_max_extension_atr=10.0,
+    )
+    strategy = MultiTimeframeStrategy(config)
+
+    first = strategy.evaluate({"5m": trigger, "1m": execution, "1h": regime})
+
+    assert first.side == "long"
+    assert first.timestamp == execution[-1].timestamp
+    assert "1m_impulse_breakout" in first.reasons
+    assert signal_position_size_multiplier(first) == 0.5
+
+    previous = execution[-1]
+    confirmation_strategy = MultiTimeframeStrategy(
+        replace(config, traditional_1m_impulse_confirmation_bars=2)
+    )
+    awaiting_confirmation = confirmation_strategy.evaluate(
+        {"5m": trigger, "1m": execution, "1h": regime}
+    )
+    assert awaiting_confirmation.side == "flat"
+
+    execution.append(
+        Candle(
+            previous.timestamp + 60_000,
+            previous.close,
+            previous.close + 0.50,
+            previous.close - 0.01,
+            previous.close + 0.48,
+            80.0,
+        )
+    )
+    continuation = strategy.evaluate({"5m": trigger, "1m": execution, "1h": regime})
+    confirmed = confirmation_strategy.evaluate({"5m": trigger, "1m": execution, "1h": regime})
+
+    assert continuation.side == "flat"
+    assert confirmed.side == "long"
+    assert confirmed.timestamp == execution[-1].timestamp
+
+
+def test_traditional_one_minute_impulse_respects_5m_extension_cap() -> None:
+    def candles(values: list[float], interval_ms: int, volume: float = 10.0) -> list[Candle]:
+        return [
+            Candle(index * interval_ms, value - 0.05, value + 0.10, value - 0.10, value, volume)
+            for index, value in enumerate(values)
+        ]
+
+    regime = candles([100.0 + index * 0.1 for index in range(40)], 3_600_000)
+    trigger_values = [100.0] * 10 + [100.0 + (index**1.3) * 0.02 for index in range(30)]
+    trigger = candles(trigger_values, 300_000)
+    base = trigger_values[-1] - 0.2
+    execution = candles([base + (index % 5) * 0.01 for index in range(45)], 60_000)
+    last = execution[-1]
+    execution[-1] = Candle(last.timestamp, base + 0.04, base + 0.50, base + 0.03, base + 0.48, 80.0)
+    config = StrategyConfig(
+        mode="traditional_kline",
+        trigger_timeframe="5m",
+        regime_timeframe="1h",
+        traditional_trend_fast=5,
+        traditional_trend_slow=20,
+        traditional_signal_fast=3,
+        traditional_signal_slow=5,
+        traditional_rsi_period=3,
+        traditional_macd_fast=3,
+        traditional_macd_slow=6,
+        traditional_macd_signal=2,
+        traditional_atr_period=3,
+        traditional_volume_sma_period=5,
+        traditional_rsi_long_min=0.0,
+        traditional_rsi_long_max=100.0,
+        traditional_allow_pullback=False,
+        traditional_allow_breakout=False,
+        traditional_allow_1m_impulse=True,
+        traditional_1m_impulse_lookback=10,
+        traditional_1m_impulse_confirmation_bars=1,
+        traditional_1m_impulse_max_extension_atr=0.01,
+    )
+
+    signal = MultiTimeframeStrategy(config).evaluate({"5m": trigger, "1m": execution, "1h": regime})
+
+    assert signal.side == "flat"

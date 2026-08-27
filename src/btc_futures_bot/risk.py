@@ -12,8 +12,9 @@ class RiskConfig:
     stop_loss_pct: float = 0.05
     max_notional_pct: float = 0.20
     max_daily_loss_pct: float = 0.02
-    max_consecutive_losses: int = 3
+    max_consecutive_losses: int = 0
     cooldown_minutes: int = 15
+    loss_streak_pause_minutes: int = 0
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,10 @@ class RiskManager:
             raise ValueError("max_notional_pct must be between 0 and 100%")
         if not 0 < self.max_leverage <= 125:
             raise ValueError("max_leverage must be between 0 and 125")
+        if self.config.max_consecutive_losses < 0:
+            raise ValueError("max_consecutive_losses cannot be negative")
+        if self.config.cooldown_minutes < 0 or self.config.loss_streak_pause_minutes < 0:
+            raise ValueError("cooldown durations cannot be negative")
 
     def protection(
         self,

@@ -51,6 +51,9 @@ class StrategyConfig:
     traditional_atr_period: int = 14
     traditional_volume_sma_period: int = 20
     traditional_min_volume_ratio: float = 1.1
+    traditional_strong_regime_min_gap_atr: float = 0.0
+    traditional_strong_regime_require_fast_slope: bool = False
+    traditional_strong_regime_require_macd: bool = False
     traditional_require_1m_confirmation: bool = True
     traditional_blocked_setup_valid_bars: int = 1
     traditional_setup_macd_handoff_max_extension_atr: float = 0.0
@@ -62,6 +65,19 @@ class StrategyConfig:
     traditional_breakout_min_body_ratio: float = 0.5
     traditional_breakout_min_close_location: float = 0.7
     traditional_breakout_max_extension_atr: float = 1.25
+    traditional_cross_min_body_ratio: float = 0.0
+    traditional_cross_min_close_location: float = 0.0
+    traditional_cross_max_extension_atr: float = 0.0
+    traditional_allow_1m_impulse: bool = False
+    traditional_1m_impulse_allow_long: bool = True
+    traditional_1m_impulse_allow_short: bool = True
+    traditional_1m_impulse_lookback: int = 20
+    traditional_1m_impulse_confirmation_bars: int = 2
+    traditional_1m_impulse_min_volume_ratio: float = 3.0
+    traditional_1m_impulse_min_body_ratio: float = 0.6
+    traditional_1m_impulse_min_close_location: float = 0.65
+    traditional_1m_impulse_min_range_atr: float = 1.0
+    traditional_1m_impulse_max_extension_atr: float = 1.5
     traditional_allow_early_regime: bool = True
     traditional_early_regime_max_gap_pct: float = 0.005
     traditional_early_regime_rsi_long_min: float = 50.0
@@ -374,14 +390,26 @@ class MultiTimeframeStrategy:
             return Signal("flat", 0, 0, ("insufficient_trend_warmup",))
 
         timestamp = trigger_candles[-1].timestamp
-        strong_trend_long = regime.close > regime.ema_fast > regime.ema_slow
-        strong_trend_short = regime.close < regime.ema_fast < regime.ema_slow
+        base_strong_trend_long = regime.close > regime.ema_fast > regime.ema_slow
+        base_strong_trend_short = regime.close < regime.ema_fast < regime.ema_slow
+        strong_trend_long = base_strong_trend_long and _traditional_strong_regime_quality(
+            regime,
+            "long",
+            self.config,
+        )
+        strong_trend_short = base_strong_trend_short and _traditional_strong_regime_quality(
+            regime,
+            "short",
+            self.config,
+        )
         early_trend_long = (
             self.config.traditional_allow_early_regime
+            and not base_strong_trend_long
             and _traditional_early_regime(regime, "long", self.config)
         )
         early_trend_short = (
             self.config.traditional_allow_early_regime
+            and not base_strong_trend_short
             and _traditional_early_regime(regime, "short", self.config)
         )
         current_setup = _traditional_setup_state(trigger_candles, self.config, feature=trigger)
@@ -601,6 +629,68 @@ class MultiTimeframeStrategy:
             if neutral_transition_short:
                 reasons += (f"{regime_name}_neutral_transition_down",)
             return Signal("short", short_score, timestamp, reasons)
+
+        # A fast impulse branch closes the timing gap between a quiet completed
+        # 5-minute context bar and the next 5-minute bar becoming overextended.
+        # It still uses only closed candles: the higher timeframes establish a
+        # strong directional context, while a fresh 1-minute range break supplies
+        # the entry.  Normal 5-minute signals retain priority above this branch.
+        impulse_long = (
+            self.config.traditional_allow_1m_impulse
+            and self.config.traditional_1m_impulse_allow_long
+            and strong_trend_long
+            and macd_long
+            and rsi_long
+            and _traditional_one_minute_impulse(
+                one_minute_candles,
+                execution,
+                trigger,
+                "long",
+                self.config,
+            )
+        )
+        impulse_short = (
+            self.config.traditional_allow_1m_impulse
+            and self.config.traditional_1m_impulse_allow_short
+            and strong_trend_short
+            and macd_short
+            and rsi_short
+            and _traditional_one_minute_impulse(
+                one_minute_candles,
+                execution,
+                trigger,
+                "short",
+                self.config,
+            )
+        )
+        if impulse_long and not impulse_short:
+            return Signal(
+                "long",
+                6,
+                one_minute_candles[-1].timestamp,
+                (
+                    f"{regime_name}_strong_trend_up",
+                    f"{trigger_name}_macd_positive",
+                    f"{trigger_name}_rsi_long_zone",
+                    "1m_impulse_breakout",
+                    "1m_impulse_quality",
+                    "1m_execution_up",
+                ),
+            )
+        if impulse_short and not impulse_long:
+            return Signal(
+                "short",
+                6,
+                one_minute_candles[-1].timestamp,
+                (
+                    f"{regime_name}_strong_trend_down",
+                    f"{trigger_name}_macd_negative",
+                    f"{trigger_name}_rsi_short_zone",
+                    "1m_impulse_breakdown",
+                    "1m_impulse_quality",
+                    "1m_execution_down",
+                ),
+            )
         long_missing = ",".join(name for name, ready in long_checks.items() if not ready)
         short_missing = ",".join(name for name, ready in short_checks.items() if not ready)
         quality_rejections: list[str] = []
@@ -755,7 +845,7 @@ def _traditional_setup_state(
         config.traditional_atr_period,
         config.traditional_volume_sma_period,
     )
-    golden_cross = (
+    golden_cross_raw = (
         selected.previous_ema_fast is not None
         and selected.previous_ema_slow is not None
         and selected.ema_fast is not None
@@ -763,7 +853,7 @@ def _traditional_setup_state(
         and selected.previous_ema_fast <= selected.previous_ema_slow
         and selected.ema_fast > selected.ema_slow
     )
-    death_cross = (
+    death_cross_raw = (
         selected.previous_ema_fast is not None
         and selected.previous_ema_slow is not None
         and selected.ema_fast is not None
@@ -771,6 +861,8 @@ def _traditional_setup_state(
         and selected.previous_ema_fast >= selected.previous_ema_slow
         and selected.ema_fast < selected.ema_slow
     )
+    golden_cross = golden_cross_raw and _traditional_cross_quality(selected, "long", config)
+    death_cross = death_cross_raw and _traditional_cross_quality(selected, "short", config)
     pullback_long = config.traditional_allow_pullback and _traditional_reclaim(selected, "long")
     pullback_short = config.traditional_allow_pullback and _traditional_reclaim(selected, "short")
     breakout_lookback = max(2, int(config.traditional_breakout_lookback))
@@ -913,6 +1005,82 @@ def _traditional_setup_volume_handoff(
     )
     continued = current.close > previous.close if side == "long" else current.close < previous.close
     return close_location >= config.traditional_breakout_min_close_location and continued
+
+
+def _traditional_strong_regime_quality(
+    feature: _TraditionalFeatures,
+    side: str,
+    config: StrategyConfig,
+) -> bool:
+    """Require a directional 1h regime to have measurable strength.
+
+    The legacy strong-regime check only verified price/EMA ordering. That
+    ordering can remain bullish or bearish for hours after momentum has
+    flattened, which lets repeated lower-timeframe continuation signals enter
+    during a range. All thresholds default to disabled for backward
+    compatibility and can be enabled independently after validation.
+    """
+    if (
+        side not in {"long", "short"}
+        or feature.ema_fast is None
+        or feature.ema_slow is None
+        or feature.atr is None
+        or feature.atr <= 0
+    ):
+        return False
+
+    gap_atr = abs(feature.ema_fast - feature.ema_slow) / feature.atr
+    if gap_atr < max(0.0, float(config.traditional_strong_regime_min_gap_atr)):
+        return False
+
+    if config.traditional_strong_regime_require_fast_slope:
+        if feature.previous_ema_fast is None:
+            return False
+        if side == "long" and feature.ema_fast <= feature.previous_ema_fast:
+            return False
+        if side == "short" and feature.ema_fast >= feature.previous_ema_fast:
+            return False
+
+    if config.traditional_strong_regime_require_macd:
+        if feature.macd_histogram is None:
+            return False
+        if side == "long" and feature.macd_histogram <= 0:
+            return False
+        if side == "short" and feature.macd_histogram >= 0:
+            return False
+    return True
+
+
+def _traditional_cross_quality(
+    feature: _TraditionalFeatures,
+    side: str,
+    config: StrategyConfig,
+) -> bool:
+    """Reject weak, wick-heavy or already extended EMA crosses."""
+    if side not in {"long", "short"}:
+        return False
+    candle_range = feature.high - feature.low
+    if candle_range <= 0:
+        return False
+    body_ratio = abs(feature.close - feature.open) / candle_range
+    close_location = (
+        (feature.close - feature.low) / candle_range
+        if side == "long"
+        else (feature.high - feature.close) / candle_range
+    )
+    if body_ratio < max(0.0, float(config.traditional_cross_min_body_ratio)):
+        return False
+    if close_location < max(0.0, float(config.traditional_cross_min_close_location)):
+        return False
+
+    extension_cap = max(0.0, float(config.traditional_cross_max_extension_atr))
+    if extension_cap:
+        if feature.ema_fast is None or feature.atr is None or feature.atr <= 0:
+            return False
+        extension_atr = abs(feature.close - feature.ema_fast) / feature.atr
+        if extension_atr > extension_cap:
+            return False
+    return True
 
 
 def _traditional_early_regime(feature: _TraditionalFeatures, side: str, config: StrategyConfig) -> bool:
@@ -1147,13 +1315,137 @@ def _traditional_neutral_transition_regime(
 
 
 def signal_position_size_multiplier(signal: Signal) -> float:
-    """Use half size for guarded countertrend and neutral-transition signals."""
+    """Use half size for guarded countertrend, transition and fast signals."""
     if any(
-        "_countertrend_pullback_" in reason or "_neutral_transition_" in reason
+        "_countertrend_pullback_" in reason
+        or "_neutral_transition_" in reason
+        or reason.startswith("1m_impulse_")
         for reason in signal.reasons
     ):
         return 0.5
     return 1.0
+
+
+def _traditional_one_minute_impulse(
+    candles: Sequence[Candle],
+    execution: _TraditionalFeatures,
+    trigger: _TraditionalFeatures,
+    side: str,
+    config: StrategyConfig,
+) -> bool:
+    """Accept only the first closed 1-minute breakout inside a safe 5m envelope.
+
+    The freshness check rejects continuation candles after the range has already
+    broken.  Extension is measured against the latest closed 5-minute EMA/ATR,
+    which prevents a fast signal from bypassing the existing anti-chase policy.
+    """
+    lookback = max(2, int(config.traditional_1m_impulse_lookback))
+    confirmation_bars = max(1, min(2, int(config.traditional_1m_impulse_confirmation_bars)))
+    if (
+        side not in {"long", "short"}
+        or len(candles) < lookback + confirmation_bars + 1
+        or execution.atr is None
+        or execution.atr <= 0
+        or execution.ema_fast is None
+        or execution.ema_slow is None
+        or execution.rsi is None
+        or execution.macd_histogram is None
+        or execution.volume_ratio is None
+        or trigger.ema_fast is None
+        or trigger.atr is None
+        or trigger.atr <= 0
+    ):
+        return False
+
+    def quality(feature: _TraditionalFeatures) -> bool:
+        if (
+            feature.atr is None
+            or feature.atr <= 0
+            or feature.ema_fast is None
+            or feature.ema_slow is None
+            or feature.rsi is None
+            or feature.macd_histogram is None
+            or feature.volume_ratio is None
+        ):
+            return False
+        candle_range = feature.high - feature.low
+        if candle_range <= 0:
+            return False
+        body_ratio = abs(feature.close - feature.open) / candle_range
+        close_location = (
+            (feature.close - feature.low) / candle_range
+            if side == "long"
+            else (feature.high - feature.close) / candle_range
+        )
+        range_atr = candle_range / feature.atr
+        extension_atr = abs(feature.close - trigger.ema_fast) / trigger.atr
+        shared = (
+            feature.volume_ratio >= max(0.0, float(config.traditional_1m_impulse_min_volume_ratio))
+            and body_ratio >= max(0.0, float(config.traditional_1m_impulse_min_body_ratio))
+            and close_location >= max(0.0, float(config.traditional_1m_impulse_min_close_location))
+            and range_atr >= max(0.0, float(config.traditional_1m_impulse_min_range_atr))
+            and extension_atr <= max(0.0, float(config.traditional_1m_impulse_max_extension_atr))
+        )
+        if side == "long":
+            return (
+                shared
+                and feature.close >= feature.ema_fast >= feature.ema_slow
+                and feature.macd_histogram > 0
+                and config.traditional_rsi_long_min <= feature.rsi <= config.traditional_rsi_long_max
+            )
+        return (
+            shared
+            and feature.close <= feature.ema_fast <= feature.ema_slow
+            and feature.macd_histogram < 0
+            and config.traditional_rsi_short_min <= feature.rsi <= config.traditional_rsi_short_max
+        )
+
+    if not quality(execution):
+        return False
+
+    current = candles[-1]
+    if confirmation_bars == 1:
+        previous = candles[-2]
+        previous_window = candles[-lookback - 1 : -1]
+        prior_window = candles[-lookback - 2 : -2]
+        if side == "long":
+            return (
+                current.close > max(candle.high for candle in previous_window)
+                and previous.close <= max(candle.high for candle in prior_window)
+            )
+        return (
+            current.close < min(candle.low for candle in previous_window)
+            and previous.close >= min(candle.low for candle in prior_window)
+        )
+
+    first = candles[-2]
+    before_first = candles[-3]
+    base_window = candles[-lookback - 2 : -2]
+    prior_window = candles[-lookback - 3 : -3]
+    first_feature = _traditional_features(
+        candles[:-1],
+        config.traditional_signal_fast,
+        config.traditional_signal_slow,
+        config.traditional_rsi_period,
+        config.traditional_macd_fast,
+        config.traditional_macd_slow,
+        config.traditional_macd_signal,
+        config.traditional_atr_period,
+        config.traditional_volume_sma_period,
+    )
+    if not quality(first_feature):
+        return False
+    if side == "long":
+        return (
+            first.close > max(candle.high for candle in base_window)
+            and before_first.close <= max(candle.high for candle in prior_window)
+            and current.close > first.high
+        )
+    return (
+        first.close < min(candle.low for candle in base_window)
+        and before_first.close >= min(candle.low for candle in prior_window)
+        and current.close < first.low
+    )
 
 
 def _traditional_breakout_quality(feature: _TraditionalFeatures, side: str, config: StrategyConfig) -> bool:

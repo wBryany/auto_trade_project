@@ -91,6 +91,7 @@ def run_backtest(
     # them across an arbitrary multi-day history would invent a session
     # boundary and can permanently suppress the rest of the replay.
     cooldown_until_ms = 0
+    consecutive_losses = 0
     # Production requests ``candle_limit`` rows and removes the newest forming
     # candle before evaluation.  Restrict every historical decision to that
     # same number of closed rows so long-period EMA initialization, transition
@@ -199,7 +200,17 @@ def run_backtest(
                 trades += 1
                 wins += int(pnl > 0)
                 if pnl < 0:
-                    cooldown_until_ms = decision_timestamp + int(risk.config.cooldown_minutes * 60_000)
+                    consecutive_losses += 1
+                    cooldown_minutes = max(0, int(risk.config.cooldown_minutes))
+                    threshold = int(risk.config.max_consecutive_losses)
+                    if threshold > 0 and consecutive_losses >= threshold:
+                        cooldown_minutes = max(
+                            cooldown_minutes,
+                            max(0, int(getattr(risk.config, "loss_streak_pause_minutes", 0))),
+                        )
+                    cooldown_until_ms = decision_timestamp + cooldown_minutes * 60_000
+                else:
+                    consecutive_losses = 0
                 position = None
                 peak_equity = max(peak_equity, equity)
                 max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
@@ -257,13 +268,29 @@ def run_backtest(
                     trades += 1
                     wins += int(pnl > 0)
                     if pnl < 0:
-                        cooldown_until_ms = decision_timestamp + int(risk.config.cooldown_minutes * 60_000)
+                        consecutive_losses += 1
+                        cooldown_minutes = max(0, int(risk.config.cooldown_minutes))
+                        threshold = int(risk.config.max_consecutive_losses)
+                        if threshold > 0 and consecutive_losses >= threshold:
+                            cooldown_minutes = max(
+                                cooldown_minutes,
+                                max(0, int(getattr(risk.config, "loss_streak_pause_minutes", 0))),
+                            )
+                        cooldown_until_ms = decision_timestamp + cooldown_minutes * 60_000
+                    else:
+                        consecutive_losses = 0
                     position = None
                     peak_equity = max(peak_equity, equity)
                     max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
 
         if position is None and signal.side != "flat" and signal.timestamp != last_signal_timestamp:
             last_signal_timestamp = signal.timestamp
+            loss_streak_pause = max(0, int(getattr(risk.config, "loss_streak_pause_minutes", 0)))
+            threshold = int(risk.config.max_consecutive_losses)
+            if threshold > 0 and consecutive_losses >= threshold and loss_streak_pause:
+                if decision_timestamp < cooldown_until_ms:
+                    continue
+                consecutive_losses = 0
             if decision_timestamp < cooldown_until_ms:
                 continue
             trigger_candles = candles_by_timeframe[trigger_timeframe]

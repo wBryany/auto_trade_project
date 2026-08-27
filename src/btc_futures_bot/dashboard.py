@@ -562,6 +562,24 @@ class DashboardService:
                 "recipients_count": len(config.get("email_notifications", {}).get("recipients", [])),
             }
         )
+        risk_guard = {"enabled": False, "blocked": False}
+        if self.engine is not None:
+            threshold = int(self.engine.risk.config.max_consecutive_losses)
+            pause_minutes = max(
+                0,
+                int(getattr(self.engine.risk.config, "loss_streak_pause_minutes", 0)),
+            )
+            blocked = threshold > 0 and self.engine.consecutive_losses >= threshold and (
+                pause_minutes <= 0 or time.time() < self.engine.cooldown_until
+            )
+            risk_guard = {
+                "enabled": threshold > 0,
+                "blocked": blocked,
+                "consecutive_losses": self.engine.consecutive_losses,
+                "max_consecutive_losses": threshold,
+                "cooldown_until": self.engine.cooldown_until,
+                "loss_streak_pause_minutes": pause_minutes,
+            }
         return {
             "running": self.running,
             "exchange": exchange_name,
@@ -585,6 +603,7 @@ class DashboardService:
             "signal": {"side": signal.side, "score": signal.score, "timestamp": signal.timestamp, "reasons": list(signal.reasons)} if signal else None,
             "last_result": result_view,
             "macro_risk": self.engine.macro_risk.status() if self.engine and self.engine.macro_risk else {"enabled": False, "blocked": False},
+            "risk_guard": risk_guard,
             "email_notifications": email_status,
         }
 

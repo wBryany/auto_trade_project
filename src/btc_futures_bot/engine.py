@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +52,7 @@ class TradingEngine:
         self.consecutive_losses = 0
         self.cooldown_until = 0.0
         self.reporter = reporter
+        self._restore_recent_loss_streak()
         self.position_signal: Signal | None = None
         self.position_equity_before = 0.0
         self.last_position_candle_timestamp = 0
@@ -67,6 +68,63 @@ class TradingEngine:
             return self.live_preflight
         self.live_preflight = self.adapter.prepare_live(max_leverage=self.risk.max_leverage)
         return self.live_preflight
+
+    def _restore_recent_loss_streak(self) -> None:
+        """Restore a timed loss-streak guard from completed trade history.
+
+        A process restart must not silently clear a configured multi-loss
+        circuit breaker. Restoration is opt-in through a positive loss
+        threshold and ``loss_streak_pause_minutes``. A threshold of zero
+        disables the loss-streak guard entirely.
+        """
+        threshold = int(self.risk.config.max_consecutive_losses)
+        pause_minutes = max(0, int(getattr(self.risk.config, "loss_streak_pause_minutes", 0)))
+        if self.reporter is None or threshold <= 0 or pause_minutes <= 0:
+            return
+        environment = str(getattr(getattr(self.adapter, "settings", None), "environment", "testnet"))
+        scope = "production" if self.config.mode == "live" and environment == "production" else "testnet"
+        try:
+            rows = self.reporter.query_trades(
+                exchange=self.adapter.name,
+                scope=scope,
+                limit=max(100, threshold + 1),
+            )
+        except Exception:
+            LOG.exception("failed to restore recent loss streak")
+            return
+        if not rows:
+            return
+
+        consecutive = 0
+        for row in rows:
+            if float(row.get("net_pnl") or 0.0) >= 0:
+                break
+            consecutive += 1
+        if consecutive <= 0:
+            return
+
+        latest_exit = str(rows[0].get("exit_time") or "")
+        try:
+            latest_exit_at = datetime.fromisoformat(latest_exit.replace("Z", "+00:00"))
+            if latest_exit_at.tzinfo is None:
+                latest_exit_at = latest_exit_at.replace(tzinfo=timezone.utc)
+            latest_exit_epoch = latest_exit_at.timestamp()
+        except ValueError:
+            LOG.warning("cannot parse latest trade exit time while restoring risk state: %s", latest_exit)
+            return
+
+        self.consecutive_losses = consecutive
+        normal_cooldown = max(0, int(self.risk.config.cooldown_minutes)) * 60
+        selected_cooldown = normal_cooldown
+        if consecutive >= threshold:
+            selected_cooldown = max(selected_cooldown, pause_minutes * 60)
+        self.cooldown_until = latest_exit_epoch + selected_cooldown
+        LOG.warning(
+            "restored loss streak=%s cooldown_until=%s scope=%s",
+            self.consecutive_losses,
+            datetime.fromtimestamp(self.cooldown_until, tz=timezone.utc).isoformat(),
+            scope,
+        )
 
     def evaluate_once(self) -> TradeResult:
         if self.notifier is not None and self.reporter is not None:
@@ -957,8 +1015,13 @@ class TradingEngine:
         return max(minimum, min(maximum, raw_pct))
 
     def _entry_allowed(self) -> bool:
-        if self.consecutive_losses >= self.risk.config.max_consecutive_losses:
-            return False
+        threshold = int(self.risk.config.max_consecutive_losses)
+        if threshold > 0 and self.consecutive_losses >= threshold:
+            pause_minutes = max(0, int(getattr(self.risk.config, "loss_streak_pause_minutes", 0)))
+            if pause_minutes <= 0 or time.time() < self.cooldown_until:
+                return False
+            LOG.info("loss-streak pause elapsed; resetting entry circuit breaker")
+            self.consecutive_losses = 0
         if self.session_pnl <= -(self.config.paper_equity * self.risk.config.max_daily_loss_pct):
             return False
         return time.time() >= self.cooldown_until
@@ -1218,7 +1281,14 @@ class TradingEngine:
         self.session_pnl += pnl
         if pnl < 0:
             self.consecutive_losses += 1
-            self.cooldown_until = time.time() + self.risk.config.cooldown_minutes * 60
+            cooldown_minutes = max(0, int(self.risk.config.cooldown_minutes))
+            threshold = int(self.risk.config.max_consecutive_losses)
+            if threshold > 0 and self.consecutive_losses >= threshold:
+                cooldown_minutes = max(
+                    cooldown_minutes,
+                    max(0, int(getattr(self.risk.config, "loss_streak_pause_minutes", 0))),
+                )
+            self.cooldown_until = time.time() + cooldown_minutes * 60
         else:
             self.consecutive_losses = 0
         LOG.info(
