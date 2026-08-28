@@ -74,9 +74,11 @@ CSV 使用 UTF-8 BOM，Excel 可以直接打开。当前纸面/回测会完整�
 
 `traditional_failed_breakout_short_shadow` 用于观察“高周期仍偏多，但 5m 出现放量长上影见顶并由下一根放量实体确认下破”的快速反转候选。影子模式只把 `shadow_candidate=short` 和判定原因写入信号日志，不会下单；`traditional_failed_breakout_short_enabled` 才会把它转成真实空头信号。真实分支固定使用半风险，并通过 `traditional_failed_breakout_short_stop_lookback_bars` 和 `traditional_failed_breakout_short_max_stop_loss_pct` 使用更宽的摆动高点保护。该分支属于实验功能，默认保持真实交易关闭。
 
+`traditional_predictive_reversal_short_enabled` 用于处理 5m K 线尚未收盘时已经出现的冲高失败。它只读取已收盘的 1m K 线：先识别靠近 10m/15m 均线簇的放量、超买和 ATR 扩张尖峰，再要求随后首根 1m 同时跌回 EMA9/EMA21 下方、MACD 柱转负、RSI 明显回落且卖出确认量不低于近期均量的配置比例。信号仍然非重绘，不会使用正在形成的 K 线；默认按半风险开空，止损锚定最近 8 根 1m 的冲高结构并受最大止损比例限制。若 1m 时间戳不连续，分支直接保持空仓。
+
 传统 K 线模式还支持三层防追价保护：`traditional_cross_max_extension_atr` 限制 5m 金叉/死叉确认时相对快 EMA 的扩张；`traditional_execution_rsi_*` 与 `traditional_execution_max_extension_atr` 拒绝已经过热/过冷的 1m 执行；`traditional_pressure_filter_enabled` 从已收盘 5m K 线本地合成 10m、15m K 线，并要求入场方向到 EMA/SMA 压力或支撑至少保留 `traditional_pressure_min_room_r` 倍的最小止损空间。合成过程不会增加交易所行情请求。
 
-正式环境的签名持仓对账由 `live_reconciliation_seconds` 节流，仪表盘私有快照由 `dashboard_snapshot_seconds` 缓存。默认均为 5 秒；行情评估仍可按更短的 `poll_seconds` 运行，交易所硬止损不依赖轮询。
+正式环境的签名持仓对账由 `live_reconciliation_seconds` 节流，仪表盘私有快照由 `dashboard_snapshot_seconds` 缓存。默认均为 5 秒；`candle_refresh_seconds` 可分别限制 1m、5m、1h 公共 K 线请求频率，正式配置默认为 1/3/15 秒，降低短时间重复请求引发 HTTP 429 的概率。行情评估仍可按更短的 `poll_seconds` 运行，交易所硬止损不依赖轮询。
 
 风险配置支持 `loss_streak_pause_minutes`。当 `max_consecutive_losses` 大于 0 且连续亏损达到该值时，引擎进入有期限的长暂停；正式交易重启后会从持久化交易报表恢复最近连亏次数与剩余暂停时间。将 `max_consecutive_losses` 设为 `0` 会完全禁用连亏入场阈值，但单笔亏损后的 `cooldown_minutes` 短冷却仍然生效。
 

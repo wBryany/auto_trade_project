@@ -16,6 +16,7 @@ from .strategy import (
     dynamic_stop_loss_pct,
     signal_position_size_multiplier,
     signal_stop_loss_overrides,
+    signal_stop_timeframe,
 )
 
 
@@ -312,12 +313,16 @@ def run_backtest(
             if decision_timestamp < cooldown_until_ms:
                 continue
             trigger_candles = candles_by_timeframe[trigger_timeframe]
+            stop_candles = candles_by_timeframe.get(
+                signal_stop_timeframe(signal, strategy.config),
+                trigger_candles,
+            )
             # The signal is known only after the latest candle closes.  A
             # market order is therefore modeled at the next 1m open rather
             # than retroactively at the signal candle's close.
             entry_price = next_execution_open
             stop_loss_pct = dynamic_stop_loss_pct(
-                trigger_candles,
+                stop_candles,
                 strategy.config,
                 risk.config.stop_loss_pct,
                 side=signal.side,

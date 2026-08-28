@@ -4,7 +4,7 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +20,7 @@ from .strategy import (
     dynamic_stop_loss_pct,
     signal_position_size_multiplier,
     signal_stop_loss_overrides,
+    signal_stop_timeframe,
 )
 
 LOG = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ class EngineConfig:
     take_profit_r: float = 2.5
     reconciliation_state_path: str = ""
     live_reconciliation_seconds: float = 5.0
+    candle_refresh_seconds: dict[str, float] = field(default_factory=dict)
 
 
 class TradingEngine:
@@ -73,6 +75,8 @@ class TradingEngine:
         self.live_preflight: dict[str, Any] = {}
         self.unmanaged_live_position = self._load_unmanaged_live_position()
         self._last_live_reconciliation_at = 0.0
+        self._candle_cache: dict[str, list[Any]] = {}
+        self._candle_cache_at: dict[str, float] = {}
 
     def prepare_live(self) -> dict[str, Any]:
         if self.config.mode != "live":
@@ -154,7 +158,7 @@ class TradingEngine:
         requested_timeframes = list(dict.fromkeys((trigger_timeframe, "1m", self.strategy.config.regime_timeframe)))
         for timeframe in requested_timeframes:
             exchange_timeframe = "1m" if timeframe == "30s" and self.adapter.name != "okx" else timeframe
-            candles = self.adapter.fetch_candles(exchange_timeframe, self.config.candle_limit)
+            candles = self._fetch_candles_cached(timeframe, exchange_timeframe)
             # The newest candle may still be forming. Exclude it so a signal is based on closed bars.
             candles_by_timeframe[timeframe] = candles[:-1] if len(candles) > 1 else candles
         if self.config.mode == "live" and self.adapter.name == "binance":
@@ -254,8 +258,13 @@ class TradingEngine:
             return TradeResult(self.adapter.name, "risk_blocked", signal=signal, position=self.position)
 
         equity = self.config.paper_equity if self.config.mode != "live" else self.adapter.fetch_equity()
-        dynamic_stop_pct = self._dynamic_stop_loss_pct(
+        stop_timeframe = signal_stop_timeframe(signal, self.strategy.config)
+        stop_candles = candles_by_timeframe.get(
+            stop_timeframe,
             candles_by_timeframe[trigger_timeframe],
+        )
+        dynamic_stop_pct = self._dynamic_stop_loss_pct(
+            stop_candles,
             signal.side,
             current_price,
             signal=signal,
@@ -322,7 +331,7 @@ class TradingEngine:
                 fallback_price=current_price,
             )
             filled_stop_pct = self._dynamic_stop_loss_pct(
-                candles_by_timeframe[trigger_timeframe],
+                stop_candles,
                 signal.side,
                 filled_price,
                 signal=signal,
@@ -454,6 +463,34 @@ class TradingEngine:
             position=position,
             raw=live_raw if self.config.mode == "live" else None,
         )
+
+    def _fetch_candles_cached(
+        self,
+        strategy_timeframe: str,
+        exchange_timeframe: str,
+    ) -> list[Any]:
+        """Refresh each timeframe only as often as a new closed bar can matter."""
+
+        now = time.monotonic()
+        configured = self.config.candle_refresh_seconds or {}
+        refresh_seconds = max(
+            0.0,
+            float(
+                configured.get(
+                    strategy_timeframe,
+                    configured.get(exchange_timeframe, 0.0),
+                )
+            ),
+        )
+        cache_key = f"{strategy_timeframe}:{exchange_timeframe}"
+        cached = self._candle_cache.get(cache_key)
+        cached_at = self._candle_cache_at.get(cache_key, 0.0)
+        if cached is not None and now - cached_at < refresh_seconds:
+            return cached
+        candles = self.adapter.fetch_candles(exchange_timeframe, self.config.candle_limit)
+        self._candle_cache[cache_key] = candles
+        self._candle_cache_at[cache_key] = now
+        return candles
 
     def _reconcile_binance_live_position_if_due(self, candle: Any) -> None:
         """Throttle signed position polling while retaining exchange-side protection."""

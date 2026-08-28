@@ -124,6 +124,36 @@ def test_live_position_reconciliation_is_throttled_between_poll_cycles() -> None
     assert adapter.position_reads == 2
 
 
+def test_market_candles_are_cached_at_timeframe_specific_refresh_rate() -> None:
+    class Adapter:
+        name = "test"
+        settings = SimpleNamespace(symbol="BTCUSDT", environment="testnet")
+
+        def __init__(self) -> None:
+            self.candle_reads = 0
+
+        def fetch_candles(self, interval: str, limit: int) -> list[Candle]:
+            self.candle_reads += 1
+            return [Candle(self.candle_reads, 100.0, 100.0, 100.0, 100.0, 1.0)]
+
+    adapter = Adapter()
+    engine = TradingEngine(
+        adapter,
+        MultiTimeframeStrategy(StrategyConfig()),
+        RiskManager(),
+        EngineConfig(mode="paper", candle_refresh_seconds={"1m": 1.0}),
+    )
+
+    with patch("btc_futures_bot.engine.time.monotonic", side_effect=(100.0, 100.5, 101.1)):
+        first = engine._fetch_candles_cached("1m", "1m")
+        cached = engine._fetch_candles_cached("1m", "1m")
+        refreshed = engine._fetch_candles_cached("1m", "1m")
+
+    assert first is cached
+    assert refreshed is not first
+    assert adapter.candle_reads == 2
+
+
 def _engine(*, enable_time_exit: bool) -> TradingEngine:
     strategy = MultiTimeframeStrategy(
         StrategyConfig(

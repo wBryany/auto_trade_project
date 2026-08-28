@@ -98,6 +98,21 @@ class StrategyConfig:
     traditional_failed_breakout_short_confirm_close_location: float = 0.6
     traditional_failed_breakout_short_stop_lookback_bars: int = 2
     traditional_failed_breakout_short_max_stop_loss_pct: float = 0.01
+    traditional_predictive_reversal_short_enabled: bool = False
+    traditional_predictive_reversal_lookback: int = 20
+    traditional_predictive_reversal_confirmation_bars: int = 4
+    traditional_predictive_reversal_min_spike_volume_ratio: float = 3.0
+    traditional_predictive_reversal_min_spike_rsi: float = 65.0
+    traditional_predictive_reversal_min_spike_range_atr: float = 1.5
+    traditional_predictive_reversal_min_spike_extension_atr: float = 1.5
+    traditional_predictive_reversal_min_rsi_drop: float = 12.0
+    traditional_predictive_reversal_confirm_rsi_max: float = 55.0
+    traditional_predictive_reversal_min_confirmation_volume_ratio: float = 0.5
+    traditional_predictive_reversal_max_execution_extension_atr: float = 1.0
+    traditional_predictive_reversal_max_pressure_distance_pct: float = 0.008
+    traditional_predictive_reversal_min_room_r: float = 1.2
+    traditional_predictive_reversal_stop_lookback_bars: int = 8
+    traditional_predictive_reversal_max_stop_loss_pct: float = 0.008
     traditional_allow_early_regime: bool = True
     traditional_early_regime_max_gap_pct: float = 0.005
     traditional_early_regime_rsi_long_min: float = 50.0
@@ -751,6 +766,14 @@ class MultiTimeframeStrategy:
             and pressure_short
         ):
             return failed_breakout_short
+
+        predictive_reversal_short = _traditional_predictive_reversal_short(
+            one_minute_candles,
+            trigger_candles,
+            self.config,
+        )
+        if predictive_reversal_short.side == "short":
+            return predictive_reversal_short
 
         # A fast impulse branch closes the timing gap between a quiet completed
         # 5-minute context bar and the next 5-minute bar becoming overextended.
@@ -1524,32 +1547,19 @@ def _traditional_pressure_room(
     if not trigger_candles:
         return False, "insufficient_5m_history"
 
-    configured_timeframes = config.traditional_pressure_timeframes_minutes
-    if isinstance(configured_timeframes, (int, float, str)):
-        configured_timeframes = (int(configured_timeframes),)
-    timeframes = tuple(sorted({int(value) for value in configured_timeframes}))
-    ema_period = max(1, int(config.traditional_pressure_ema_period))
-    sma_period = max(1, int(config.traditional_pressure_sma_period))
     price = float(trigger_candles[-1].close)
-    if price <= 0 or not timeframes:
-        return False, "invalid_pressure_configuration"
+    levels, error = _traditional_higher_timeframe_average_levels(trigger_candles, config)
+    if price <= 0:
+        return False, "invalid_pressure_price"
+    if error:
+        return False, error
 
     barriers: list[tuple[float, str]] = []
-    for minutes in timeframes:
-        aggregated = _aggregate_five_minute_candles(trigger_candles, minutes)
-        closes = [float(candle.close) for candle in aggregated]
-        if len(closes) < max(ema_period, sma_period):
-            return False, f"{minutes}m_insufficient_history"
-        ema_value = ema(closes, ema_period)[-1]
-        sma_value = sma(closes, sma_period)[-1]
-        if ema_value is None or sma_value is None:
-            return False, f"{minutes}m_average_unavailable"
-        for name, value in ((f"{minutes}m_ema{ema_period}", ema_value), (f"{minutes}m_sma{sma_period}", sma_value)):
-            selected = float(value)
-            if side == "long" and selected > price:
-                barriers.append(((selected - price) / price, name))
-            if side == "short" and selected < price:
-                barriers.append(((price - selected) / price, name))
+    for name, selected in levels:
+        if side == "long" and selected > price:
+            barriers.append(((selected - price) / price, name))
+        if side == "short" and selected < price:
+            barriers.append(((price - selected) / price, name))
 
     if not barriers:
         return True, "no_overhead_or_underfoot_average"
@@ -1560,6 +1570,229 @@ def _traditional_pressure_room(
     )
     detail = f"{barrier_name}_room={room_pct:.6f}_required={required_room_pct:.6f}"
     return room_pct >= required_room_pct, detail
+
+
+def _traditional_higher_timeframe_average_levels(
+    trigger_candles: Sequence[Candle],
+    config: StrategyConfig,
+) -> tuple[list[tuple[str, float]], str]:
+    """Return locally synthesized 10m/15m EMA and SMA levels."""
+
+    configured_timeframes = config.traditional_pressure_timeframes_minutes
+    if isinstance(configured_timeframes, (int, float, str)):
+        configured_timeframes = (int(configured_timeframes),)
+    timeframes = tuple(sorted({int(value) for value in configured_timeframes}))
+    if not timeframes:
+        return [], "invalid_pressure_configuration"
+    ema_period = max(1, int(config.traditional_pressure_ema_period))
+    sma_period = max(1, int(config.traditional_pressure_sma_period))
+    levels: list[tuple[str, float]] = []
+    for minutes in timeframes:
+        aggregated = _aggregate_five_minute_candles(trigger_candles, minutes)
+        closes = [float(candle.close) for candle in aggregated]
+        if len(closes) < max(ema_period, sma_period):
+            return [], f"{minutes}m_insufficient_history"
+        ema_value = ema(closes, ema_period)[-1]
+        sma_value = sma(closes, sma_period)[-1]
+        if ema_value is None or sma_value is None:
+            return [], f"{minutes}m_average_unavailable"
+        levels.extend(
+            (
+                (f"{minutes}m_ema{ema_period}", float(ema_value)),
+                (f"{minutes}m_sma{sma_period}", float(sma_value)),
+            )
+        )
+    return levels, ""
+
+
+def _traditional_predictive_reversal_short(
+    one_minute_candles: Sequence[Candle],
+    trigger_candles: Sequence[Candle],
+    config: StrategyConfig,
+) -> Signal:
+    """Anticipate a 5m reversal using only already closed 1m candles.
+
+    A fresh, overextended volume spike arms the setup. The first later 1m bar
+    that closes below both execution EMAs and the nearby 10m/15m average
+    cluster triggers a half-risk short, provided the spike high can be used as
+    a bounded stop and recent 5m structure leaves enough downside room.
+    """
+
+    timestamp = one_minute_candles[-1].timestamp if one_minute_candles else 0
+    if not config.traditional_predictive_reversal_short_enabled:
+        return Signal("flat", 0, timestamp, ("predictive_reversal_short_disabled",))
+    lookback = max(5, int(config.traditional_predictive_reversal_lookback))
+    confirmation_bars = min(
+        15,
+        max(1, int(config.traditional_predictive_reversal_confirmation_bars)),
+    )
+    minimum_history = max(
+        lookback + confirmation_bars + 2,
+        int(config.traditional_volume_sma_period) + confirmation_bars + 2,
+        int(config.traditional_macd_slow) + int(config.traditional_macd_signal) + 2,
+    )
+    if len(one_minute_candles) < minimum_history or len(trigger_candles) < 12:
+        return Signal("flat", 0, timestamp, ("predictive_reversal_short_insufficient_history",))
+    continuity_window = one_minute_candles[-minimum_history:]
+    if not _candles_are_contiguous(continuity_window, 60_000):
+        return Signal("flat", 0, timestamp, ("predictive_reversal_short_data_gap",))
+
+    current = _traditional_features(
+        one_minute_candles,
+        config.traditional_signal_fast,
+        config.traditional_signal_slow,
+        config.traditional_rsi_period,
+        config.traditional_macd_fast,
+        config.traditional_macd_slow,
+        config.traditional_macd_signal,
+        config.traditional_atr_period,
+        config.traditional_volume_sma_period,
+    )
+    previous = _traditional_features(
+        one_minute_candles[:-1],
+        config.traditional_signal_fast,
+        config.traditional_signal_slow,
+        config.traditional_rsi_period,
+        config.traditional_macd_fast,
+        config.traditional_macd_slow,
+        config.traditional_macd_signal,
+        config.traditional_atr_period,
+        config.traditional_volume_sma_period,
+    )
+    if (
+        current.ema_fast is None
+        or current.ema_slow is None
+        or current.rsi is None
+        or current.macd_histogram is None
+        or current.volume_ratio is None
+        or current.atr is None
+        or current.atr <= 0
+        or previous.ema_slow is None
+        or previous.macd_histogram is None
+    ):
+        return Signal("flat", 0, timestamp, ("predictive_reversal_short_indicators_unavailable",))
+
+    levels, level_error = _traditional_higher_timeframe_average_levels(
+        trigger_candles,
+        config,
+    )
+    if level_error or not levels:
+        return Signal(
+            "flat",
+            0,
+            timestamp,
+            (f"predictive_reversal_short_{level_error or 'pressure_unavailable'}",),
+        )
+    pressure_ceiling = max(value for _, value in levels)
+    execution_extension = abs(current.close - current.ema_fast) / current.atr
+    current_confirmed = (
+        current.close < current.ema_fast
+        and current.close < current.ema_slow
+        and current.close < pressure_ceiling
+        and current.macd_histogram < 0
+        and current.volume_ratio
+        >= max(
+            0.0,
+            float(config.traditional_predictive_reversal_min_confirmation_volume_ratio),
+        )
+        and float(config.traditional_execution_rsi_short_min)
+        <= current.rsi
+        <= float(config.traditional_predictive_reversal_confirm_rsi_max)
+        and execution_extension
+        <= max(0.0, float(config.traditional_predictive_reversal_max_execution_extension_atr))
+    )
+    previous_confirmed = (
+        previous.close < (previous.ema_fast or previous.close)
+        and previous.close < previous.ema_slow
+        and previous.close < pressure_ceiling
+        and previous.macd_histogram < 0
+    )
+    if not current_confirmed or previous_confirmed:
+        return Signal("flat", 0, timestamp, ("predictive_reversal_short_not_confirmed",))
+
+    current_index = len(one_minute_candles) - 1
+    for age in range(1, confirmation_bars + 1):
+        spike_index = current_index - age
+        spike = one_minute_candles[spike_index]
+        spike_feature = _traditional_features(
+            one_minute_candles[: spike_index + 1],
+            config.traditional_signal_fast,
+            config.traditional_signal_slow,
+            config.traditional_rsi_period,
+            config.traditional_macd_fast,
+            config.traditional_macd_slow,
+            config.traditional_macd_signal,
+            config.traditional_atr_period,
+            config.traditional_volume_sma_period,
+        )
+        if (
+            spike_feature.atr is None
+            or spike_feature.atr <= 0
+            or spike_feature.ema_fast is None
+            or spike_feature.rsi is None
+            or spike_feature.macd_histogram is None
+            or spike_feature.volume_ratio is None
+        ):
+            continue
+        prior = one_minute_candles[max(0, spike_index - lookback) : spike_index]
+        if not prior:
+            continue
+        spike_range = float(spike.high) - float(spike.low)
+        spike_extension = abs(float(spike.close) - spike_feature.ema_fast) / spike_feature.atr
+        pressure_distance = abs(float(spike.high) - pressure_ceiling) / pressure_ceiling
+        risk_distance = float(spike.high) - current.close
+        if risk_distance <= 0:
+            continue
+        recent_support = min(float(candle.low) for candle in trigger_candles[-12:])
+        downside_room = current.close - recent_support
+        risk_pct = risk_distance / current.close
+        ready = (
+            float(spike.high) >= max(float(candle.high) for candle in prior)
+            and float(spike.close) > float(spike.open)
+            and spike_feature.volume_ratio
+            >= max(0.0, float(config.traditional_predictive_reversal_min_spike_volume_ratio))
+            and spike_feature.rsi
+            >= max(0.0, float(config.traditional_predictive_reversal_min_spike_rsi))
+            and spike_range / spike_feature.atr
+            >= max(0.0, float(config.traditional_predictive_reversal_min_spike_range_atr))
+            and spike_extension
+            >= max(0.0, float(config.traditional_predictive_reversal_min_spike_extension_atr))
+            and pressure_distance
+            <= max(0.0, float(config.traditional_predictive_reversal_max_pressure_distance_pct))
+            and current.close < float(spike.low)
+            and spike_feature.rsi - current.rsi
+            >= max(0.0, float(config.traditional_predictive_reversal_min_rsi_drop))
+            and current.macd_histogram < spike_feature.macd_histogram
+            and risk_pct
+            <= max(0.0, float(config.traditional_predictive_reversal_max_stop_loss_pct))
+            and downside_room
+            >= risk_distance * max(0.0, float(config.traditional_predictive_reversal_min_room_r))
+        )
+        if ready:
+            return Signal(
+                "short",
+                6,
+                timestamp,
+                (
+                    "1m_predictive_reversal_short",
+                    "1m_volume_spike_rejected",
+                    "1m_rsi_momentum_rollover",
+                    "1m_sell_volume_confirmed",
+                    "1m_below_execution_emas",
+                    "10m_15m_pressure_rejected",
+                    "5m_downside_room_confirmed",
+                ),
+            )
+    return Signal("flat", 0, timestamp, ("predictive_reversal_short_no_fresh_spike",))
+
+
+def _candles_are_contiguous(candles: Sequence[Candle], interval_ms: int) -> bool:
+    if interval_ms <= 0 or len(candles) < 2:
+        return False
+    return all(
+        int(current.timestamp) - int(previous.timestamp) == interval_ms
+        for previous, current in zip(candles, candles[1:])
+    )
 
 
 def _traditional_failed_breakout_short_reversal(
@@ -1661,6 +1894,17 @@ def signal_stop_loss_overrides(
 ) -> dict[str, int | float]:
     """Return branch-specific stop settings without weakening normal entries."""
 
+    if "1m_predictive_reversal_short" in signal.reasons:
+        return {
+            "structure_lookback_bars": max(
+                2,
+                int(config.traditional_predictive_reversal_stop_lookback_bars),
+            ),
+            "maximum_stop_loss_pct": max(
+                float(config.max_stop_loss_pct),
+                float(config.traditional_predictive_reversal_max_stop_loss_pct),
+            ),
+        }
     if "failed_breakout_short_reversal" not in signal.reasons:
         return {}
     return {
@@ -1675,12 +1919,21 @@ def signal_stop_loss_overrides(
     }
 
 
+def signal_stop_timeframe(signal: Signal, config: StrategyConfig) -> str:
+    """Use the timeframe that contains the structure which armed the signal."""
+
+    if "1m_predictive_reversal_short" in signal.reasons:
+        return "1m"
+    return config.trigger_timeframe
+
+
 def signal_position_size_multiplier(signal: Signal) -> float:
     """Use half size for guarded countertrend, transition and fast signals."""
     if any(
         "_countertrend_pullback_" in reason
         or "_neutral_transition_" in reason
         or reason.startswith("1m_impulse_")
+        or reason == "1m_predictive_reversal_short"
         or reason == "failed_breakout_short_reversal"
         for reason in signal.reasons
     ):

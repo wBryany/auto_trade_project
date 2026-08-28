@@ -23,6 +23,7 @@ from btc_futures_bot.strategy import (
     _traditional_execution_quality,
     _traditional_failed_breakout_short_reversal,
     _traditional_neutral_transition_regime,
+    _traditional_predictive_reversal_short,
     _traditional_pressure_room,
     _traditional_strong_regime_quality,
     _traditional_setup_macd_handoff,
@@ -30,6 +31,7 @@ from btc_futures_bot.strategy import (
     dynamic_stop_loss_pct,
     signal_position_size_multiplier,
     signal_stop_loss_overrides,
+    signal_stop_timeframe,
 )
 
 
@@ -168,6 +170,106 @@ def test_pressure_filter_aggregates_10m_and_15m_without_extra_market_data() -> N
     far_last = far_resistance[-1]
     far_resistance[-1] = Candle(far_last.timestamp, 101.0, 101.1, 99.9, 100.0, 10.0)
     assert _traditional_pressure_room(far_resistance, "long", config)[0] is True
+
+
+def test_predictive_reversal_short_uses_closed_one_minute_spike_and_structure_stop() -> None:
+    one_minute = []
+    for index in range(70):
+        close = 100.05 if index % 2 else 99.95
+        one_minute.append(
+            Candle(index * 60_000, close, 100.15, 99.85, close, 10.0)
+        )
+    one_minute.extend(
+        (
+            Candle(70 * 60_000, 100.0, 102.0, 99.9, 101.5, 50.0),
+            Candle(71 * 60_000, 101.5, 101.6, 100.4, 100.5, 15.0),
+            Candle(72 * 60_000, 100.5, 100.6, 99.6, 99.7, 15.0),
+            Candle(73 * 60_000, 99.7, 99.8, 98.9, 99.0, 15.0),
+        )
+    )
+    five_minute = [
+        Candle(
+            index * 300_000,
+            100.0,
+            100.2,
+            95.0 if index == 85 else 99.8,
+            100.0,
+            100.0,
+        )
+        for index in range(90)
+    ]
+    config = StrategyConfig(
+        trigger_timeframe="5m",
+        traditional_predictive_reversal_short_enabled=True,
+        traditional_predictive_reversal_confirmation_bars=4,
+        traditional_predictive_reversal_min_spike_volume_ratio=2.0,
+        traditional_predictive_reversal_min_spike_rsi=0.0,
+        traditional_predictive_reversal_min_spike_range_atr=0.0,
+        traditional_predictive_reversal_min_spike_extension_atr=0.0,
+        traditional_predictive_reversal_min_rsi_drop=0.0,
+        traditional_predictive_reversal_confirm_rsi_max=100.0,
+        traditional_predictive_reversal_max_execution_extension_atr=20.0,
+        traditional_predictive_reversal_max_pressure_distance_pct=0.05,
+        traditional_predictive_reversal_min_room_r=1.0,
+        traditional_predictive_reversal_stop_lookback_bars=8,
+        traditional_predictive_reversal_max_stop_loss_pct=0.05,
+        traditional_pressure_timeframes_minutes=(10, 15),
+        traditional_pressure_ema_period=30,
+        traditional_pressure_sma_period=30,
+    )
+
+    signal = _traditional_predictive_reversal_short(
+        one_minute,
+        five_minute,
+        config,
+    )
+
+    assert signal.side == "short"
+    assert "1m_predictive_reversal_short" in signal.reasons
+    assert signal_position_size_multiplier(signal) == 0.5
+    assert signal_stop_timeframe(signal, config) == "1m"
+    assert signal_stop_loss_overrides(signal, config) == {
+        "structure_lookback_bars": 8,
+        "maximum_stop_loss_pct": 0.05,
+    }
+
+    low_volume_confirmation = list(one_minute)
+    low_volume_confirmation[-1] = replace(low_volume_confirmation[-1], volume=0.1)
+    assert (
+        _traditional_predictive_reversal_short(
+            low_volume_confirmation,
+            five_minute,
+            config,
+        ).side
+        == "flat"
+    )
+
+
+def test_predictive_reversal_short_fails_closed_when_one_minute_data_has_gap() -> None:
+    one_minute = [
+        Candle(index * 60_000, 100.0, 100.2, 99.8, 100.0, 10.0)
+        for index in range(80)
+    ]
+    one_minute[-1] = replace(one_minute[-1], timestamp=one_minute[-1].timestamp + 60_000)
+    five_minute = [
+        Candle(index * 300_000, 100.0, 100.2, 99.8, 100.0, 10.0)
+        for index in range(90)
+    ]
+
+    signal = _traditional_predictive_reversal_short(
+        one_minute,
+        five_minute,
+        StrategyConfig(
+            trigger_timeframe="5m",
+            traditional_predictive_reversal_short_enabled=True,
+            traditional_pressure_timeframes_minutes=(10, 15),
+            traditional_pressure_ema_period=30,
+            traditional_pressure_sma_period=30,
+        ),
+    )
+
+    assert signal.side == "flat"
+    assert signal.reasons == ("predictive_reversal_short_data_gap",)
 
 
 def test_ema_and_rsi_have_values_after_warmup() -> None:
