@@ -166,6 +166,8 @@ def load_config(path: str) -> dict[str, Any]:
         selected_path = requested_path
     with selected_path.open("r", encoding="utf-8") as file:
         config = json.load(file)
+    config.setdefault("live_reconciliation_seconds", 5)
+    config.setdefault("dashboard_snapshot_seconds", 5)
     for name in config.get("exchanges", {}):
         ensure_exchange_defaults(config, name)
     strategy = config.setdefault("strategy", {})
@@ -323,6 +325,7 @@ def build_engine(name: str, raw: dict[str, Any], reporter: TradeReporter | None 
         candle_limit=int(raw.get("candle_limit", 300)),
         take_profit_r=float(raw.get("strategy", {}).get("take_profit_r", 1.6)),
         reconciliation_state_path=str(selected_report_dir / "live_reconciliation_state.json"),
+        live_reconciliation_seconds=float(raw.get("live_reconciliation_seconds", 5)),
     )
     if engine_config.mode not in {"paper", "live"}:
         raise ValueError("mode must be paper or live")

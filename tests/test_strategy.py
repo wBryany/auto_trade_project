@@ -16,11 +16,14 @@ from btc_futures_bot.strategy import (
     StrategyConfig,
     _TraditionalFeatures,
     _TraditionalSetupState,
+    _aggregate_five_minute_candles,
     _traditional_countertrend_cross_regime,
     _traditional_countertrend_pullback_regime,
     _traditional_cross_quality,
+    _traditional_execution_quality,
     _traditional_failed_breakout_short_reversal,
     _traditional_neutral_transition_regime,
+    _traditional_pressure_room,
     _traditional_strong_regime_quality,
     _traditional_setup_macd_handoff,
     _traditional_setup_volume_handoff,
@@ -87,6 +90,84 @@ def test_traditional_cross_quality_rejects_weak_wick_close() -> None:
             traditional_cross_min_close_location=0.7,
         ),
     )
+    assert not _traditional_cross_quality(
+        feature,
+        "long",
+        StrategyConfig(traditional_cross_max_extension_atr=0.2),
+    )
+
+
+def test_one_minute_execution_quality_rejects_overheated_or_extended_entry() -> None:
+    feature = _TraditionalFeatures(
+        open=100.0,
+        high=101.2,
+        low=99.9,
+        close=101.0,
+        previous_close=100.0,
+        ema_fast=100.0,
+        previous_ema_fast=99.9,
+        ema_slow=99.8,
+        previous_ema_slow=99.7,
+        rsi=79.0,
+        macd_histogram=1.0,
+        previous_macd_histogram=0.5,
+        atr=0.5,
+        volume_ratio=2.0,
+    )
+    config = StrategyConfig(
+        traditional_execution_rsi_long_max=72.0,
+        traditional_execution_rsi_short_min=28.0,
+        traditional_execution_max_extension_atr=1.0,
+    )
+
+    assert not _traditional_execution_quality(feature, "long", config)
+    assert not _traditional_execution_quality(
+        replace(feature, close=99.0, ema_fast=100.0, ema_slow=100.2, rsi=20.0),
+        "short",
+        config,
+    )
+    assert _traditional_execution_quality(
+        replace(feature, close=100.2, rsi=60.0, atr=1.0),
+        "long",
+        config,
+    )
+
+
+def test_pressure_filter_aggregates_10m_and_15m_without_extra_market_data() -> None:
+    candles = [
+        Candle(index * 300_000, 100.1, 100.2, 99.9, 100.1, 10.0)
+        for index in range(90)
+    ]
+    last = candles[-1]
+    candles[-1] = Candle(last.timestamp, 100.1, 100.2, 99.9, 100.0, 10.0)
+    config = StrategyConfig(
+        mode="traditional_kline",
+        trigger_timeframe="5m",
+        min_stop_loss_pct=0.0045,
+        traditional_pressure_filter_enabled=True,
+        traditional_pressure_timeframes_minutes=(10, 15),
+        traditional_pressure_ema_period=30,
+        traditional_pressure_sma_period=30,
+        traditional_pressure_min_room_r=0.8,
+    )
+
+    ten_minute = _aggregate_five_minute_candles(candles, 10)
+    fifteen_minute = _aggregate_five_minute_candles(candles, 15)
+    clear, reason = _traditional_pressure_room(candles, "long", config)
+
+    assert len(ten_minute) == 45
+    assert len(fifteen_minute) == 30
+    assert clear is False
+    assert "room=" in reason
+    assert "required=" in reason
+
+    far_resistance = [
+        Candle(index * 300_000, 101.0, 101.1, 99.9, 101.0, 10.0)
+        for index in range(90)
+    ]
+    far_last = far_resistance[-1]
+    far_resistance[-1] = Candle(far_last.timestamp, 101.0, 101.1, 99.9, 100.0, 10.0)
+    assert _traditional_pressure_room(far_resistance, "long", config)[0] is True
 
 
 def test_ema_and_rsi_have_values_after_warmup() -> None:

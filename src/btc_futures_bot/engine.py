@@ -39,6 +39,7 @@ class EngineConfig:
     candle_limit: int = 300
     take_profit_r: float = 2.5
     reconciliation_state_path: str = ""
+    live_reconciliation_seconds: float = 5.0
 
 
 class TradingEngine:
@@ -71,6 +72,7 @@ class TradingEngine:
         self.notifier = notifier
         self.live_preflight: dict[str, Any] = {}
         self.unmanaged_live_position = self._load_unmanaged_live_position()
+        self._last_live_reconciliation_at = 0.0
 
     def prepare_live(self) -> dict[str, Any]:
         if self.config.mode != "live":
@@ -158,7 +160,7 @@ class TradingEngine:
         if self.config.mode == "live" and self.adapter.name == "binance":
             reconciliation_candles = candles_by_timeframe.get("1m") or candles_by_timeframe.get(trigger_timeframe, [])
             if reconciliation_candles:
-                self._reconcile_binance_live_position(reconciliation_candles[-1])
+                self._reconcile_binance_live_position_if_due(reconciliation_candles[-1])
         macro_decision = (
             self.macro_risk.decision(candles_by_timeframe)
             if self.macro_risk is not None
@@ -453,6 +455,18 @@ class TradingEngine:
             raw=live_raw if self.config.mode == "live" else None,
         )
 
+    def _reconcile_binance_live_position_if_due(self, candle: Any) -> None:
+        """Throttle signed position polling while retaining exchange-side protection."""
+
+        now = time.monotonic()
+        interval = max(1.0, float(self.config.live_reconciliation_seconds))
+        if self._last_live_reconciliation_at and now - self._last_live_reconciliation_at < interval:
+            return
+        # Record the attempt before the signed request so rate-limit failures
+        # are also throttled instead of immediately retried every poll cycle.
+        self._last_live_reconciliation_at = now
+        self._reconcile_binance_live_position(candle)
+
     def _reconcile_binance_live_position(self, candle: Any) -> None:
         remote = self.adapter.fetch_live_position()
         if self.position is None:
@@ -490,10 +504,18 @@ class TradingEngine:
                     raise RuntimeError(f"unprotected Binance position; emergency close retry failed: {error}") from error
             return
 
+        self._finalize_binance_live_position_closed(candle)
+
+    def _finalize_binance_live_position_closed(self, candle: Any) -> None:
+        """Record a Binance exit after a caller has already confirmed it is flat."""
+
+        if self.position is None:
+            return
         # The venue is flat while the engine still has a position. The hard
         # stop, an online dynamic exit, or an external close most likely won
         # the race between polls. Inspect known bot ids (including legacy
         # take-profit ids), cancel anything left, and record the best price.
+        position = self.position
         statuses = self.adapter.fetch_protection_status(position)
         exit_reason = "exchange_position_closed"
         exit_price = float(candle.close)
@@ -795,7 +817,7 @@ class TradingEngine:
                 except Exception:
                     remote = {"unknown": True}
                 if remote is None:
-                    self._reconcile_binance_live_position(
+                    self._finalize_binance_live_position_closed(
                         Candle(
                             int(time.time() * 1000),
                             reference_price,

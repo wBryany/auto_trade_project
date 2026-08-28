@@ -432,8 +432,9 @@ class DashboardService:
 
     def _market_snapshot(self, config: dict[str, Any], exchange_name: str) -> dict[str, Any]:
         now = time.time()
+        snapshot_seconds = max(2.0, float(config.get("dashboard_snapshot_seconds", 5)))
         with self._lock:
-            if self._exchange_snapshot and now - self._snapshot_at < 2:
+            if self._exchange_snapshot and now - self._snapshot_at < snapshot_seconds:
                 return self._exchange_snapshot
         adapter = self._adapter(config, exchange_name)
         snapshot = adapter.fetch_dashboard_snapshot()

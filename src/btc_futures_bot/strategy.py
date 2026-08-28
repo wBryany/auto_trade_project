@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
-from .indicators import atr, ema, macd, rsi
+from .indicators import atr, ema, macd, rsi, sma
 from .models import Candle, Signal
 
 
@@ -70,6 +70,14 @@ class StrategyConfig:
     traditional_cross_min_body_ratio: float = 0.0
     traditional_cross_min_close_location: float = 0.0
     traditional_cross_max_extension_atr: float = 0.0
+    traditional_execution_rsi_long_max: float = 0.0
+    traditional_execution_rsi_short_min: float = 0.0
+    traditional_execution_max_extension_atr: float = 0.0
+    traditional_pressure_filter_enabled: bool = False
+    traditional_pressure_timeframes_minutes: tuple[int, ...] = (10, 15)
+    traditional_pressure_ema_period: int = 30
+    traditional_pressure_sma_period: int = 30
+    traditional_pressure_min_room_r: float = 0.8
     traditional_allow_1m_impulse: bool = False
     traditional_1m_impulse_allow_long: bool = True
     traditional_1m_impulse_allow_short: bool = True
@@ -572,13 +580,28 @@ class MultiTimeframeStrategy:
         rsi_long = trigger.rsi is not None and self.config.traditional_rsi_long_min <= trigger.rsi <= self.config.traditional_rsi_long_max
         rsi_short = trigger.rsi is not None and self.config.traditional_rsi_short_min <= trigger.rsi <= self.config.traditional_rsi_short_max
         volume_ready = trigger.volume_ratio is not None and trigger.volume_ratio >= self.config.traditional_min_volume_ratio
-        execution_long = _traditional_execution(execution, "long")
-        execution_short = _traditional_execution(execution, "short")
+        execution_long_alignment = _traditional_execution(execution, "long")
+        execution_short_alignment = _traditional_execution(execution, "short")
         if self.config.traditional_allow_pullback:
-            execution_long = execution_long or _traditional_reclaim(execution, "long")
-            execution_short = execution_short or _traditional_reclaim(execution, "short")
+            execution_long_alignment = execution_long_alignment or _traditional_reclaim(execution, "long")
+            execution_short_alignment = execution_short_alignment or _traditional_reclaim(execution, "short")
+        execution_long_quality = _traditional_execution_quality(execution, "long", self.config)
+        execution_short_quality = _traditional_execution_quality(execution, "short", self.config)
+        execution_long = execution_long_alignment and execution_long_quality
+        execution_short = execution_short_alignment and execution_short_quality
         if not self.config.traditional_require_1m_confirmation:
             execution_long = execution_short = True
+
+        pressure_long, pressure_long_reason = _traditional_pressure_room(
+            trigger_candles,
+            "long",
+            self.config,
+        )
+        pressure_short, pressure_short_reason = _traditional_pressure_room(
+            trigger_candles,
+            "short",
+            self.config,
+        )
 
         countertrend_cross_long = _traditional_countertrend_cross_regime(
             regime,
@@ -644,6 +667,7 @@ class MultiTimeframeStrategy:
             f"{trigger_name}_rsi_long_zone": rsi_long,
             f"{trigger_name}_volume": volume_ready,
             "1m_execution_up": execution_long,
+            "10m_15m_pressure_clear": pressure_long,
         }
         short_checks = {
             f"{regime_name}_trend_down": trend_short,
@@ -652,6 +676,7 @@ class MultiTimeframeStrategy:
             f"{trigger_name}_rsi_short_zone": rsi_short,
             f"{trigger_name}_volume": volume_ready,
             "1m_execution_down": execution_short,
+            "10m_15m_pressure_clear": pressure_short,
         }
         long_score = sum(long_checks.values())
         short_score = sum(short_checks.values())
@@ -723,6 +748,7 @@ class MultiTimeframeStrategy:
         if (
             self.config.traditional_failed_breakout_short_enabled
             and failed_breakout_short.side == "short"
+            and pressure_short
         ):
             return failed_breakout_short
 
@@ -737,6 +763,7 @@ class MultiTimeframeStrategy:
             and strong_trend_long
             and macd_long
             and rsi_long
+            and pressure_long
             and _traditional_one_minute_impulse(
                 one_minute_candles,
                 execution,
@@ -751,6 +778,7 @@ class MultiTimeframeStrategy:
             and strong_trend_short
             and macd_short
             and rsi_short
+            and pressure_short
             and _traditional_one_minute_impulse(
                 one_minute_candles,
                 execution,
@@ -794,6 +822,20 @@ class MultiTimeframeStrategy:
             quality_rejections.append(f"{trigger_name}_long_breakout_quality_rejected")
         if current_setup.breakout_short_raw and not current_setup.breakout_short:
             quality_rejections.append(f"{trigger_name}_short_breakout_quality_rejected")
+        if execution_long_alignment and not execution_long_quality:
+            quality_rejections.append("1m_long_execution_quality_rejected")
+        if execution_short_alignment and not execution_short_quality:
+            quality_rejections.append("1m_short_execution_quality_rejected")
+        if not pressure_long:
+            quality_rejections.append(f"long_pressure_blocked={pressure_long_reason}")
+        if not pressure_short:
+            quality_rejections.append(f"short_pressure_blocked={pressure_short_reason}")
+        if (
+            self.config.traditional_failed_breakout_short_enabled
+            and failed_breakout_short.side == "short"
+            and not pressure_short
+        ):
+            quality_rejections.append("failed_breakout_short_pressure_rejected")
         if (
             self.config.traditional_failed_breakout_short_shadow
             and not self.config.traditional_failed_breakout_short_enabled
@@ -1419,6 +1461,107 @@ def _traditional_neutral_transition_regime(
     return setup.short_ready and not setup.long_ready
 
 
+def _aggregate_five_minute_candles(
+    candles: Sequence[Candle],
+    target_minutes: int,
+) -> list[Candle]:
+    """Build complete higher-timeframe bars from already closed 5m candles."""
+
+    target_minutes = int(target_minutes)
+    if target_minutes < 10 or target_minutes % 5:
+        return []
+    source_ms = 5 * 60_000
+    target_ms = target_minutes * 60_000
+    expected = target_minutes // 5
+    buckets: dict[int, list[Candle]] = {}
+    for candle in candles:
+        timestamp = int(candle.timestamp)
+        bucket = timestamp // target_ms * target_ms
+        buckets.setdefault(bucket, []).append(candle)
+
+    aggregated: list[Candle] = []
+    for bucket, rows in sorted(buckets.items()):
+        ordered = sorted(rows, key=lambda item: item.timestamp)
+        expected_timestamps = [bucket + index * source_ms for index in range(expected)]
+        if [int(item.timestamp) for item in ordered] != expected_timestamps:
+            continue
+        quote_values = [item.quote_volume for item in ordered]
+        quote_volume = (
+            sum(float(value) for value in quote_values if value is not None)
+            if all(value is not None for value in quote_values)
+            else None
+        )
+        aggregated.append(
+            Candle(
+                bucket,
+                float(ordered[0].open),
+                max(float(item.high) for item in ordered),
+                min(float(item.low) for item in ordered),
+                float(ordered[-1].close),
+                sum(float(item.volume) for item in ordered),
+                quote_volume=quote_volume,
+            )
+        )
+    return aggregated
+
+
+def _traditional_pressure_room(
+    trigger_candles: Sequence[Candle],
+    side: str,
+    config: StrategyConfig,
+) -> tuple[bool, str]:
+    """Reject entries with insufficient room to a 10m/15m moving average.
+
+    The higher timeframes are synthesized locally from the closed 5m stream,
+    so this quality gate adds no REST requests. Required room is expressed in
+    R using the strategy's minimum configured stop distance.
+    """
+
+    if not config.traditional_pressure_filter_enabled:
+        return True, "disabled"
+    if config.trigger_timeframe != "5m" or side not in {"long", "short"}:
+        return False, "unsupported_trigger_timeframe"
+    if not trigger_candles:
+        return False, "insufficient_5m_history"
+
+    configured_timeframes = config.traditional_pressure_timeframes_minutes
+    if isinstance(configured_timeframes, (int, float, str)):
+        configured_timeframes = (int(configured_timeframes),)
+    timeframes = tuple(sorted({int(value) for value in configured_timeframes}))
+    ema_period = max(1, int(config.traditional_pressure_ema_period))
+    sma_period = max(1, int(config.traditional_pressure_sma_period))
+    price = float(trigger_candles[-1].close)
+    if price <= 0 or not timeframes:
+        return False, "invalid_pressure_configuration"
+
+    barriers: list[tuple[float, str]] = []
+    for minutes in timeframes:
+        aggregated = _aggregate_five_minute_candles(trigger_candles, minutes)
+        closes = [float(candle.close) for candle in aggregated]
+        if len(closes) < max(ema_period, sma_period):
+            return False, f"{minutes}m_insufficient_history"
+        ema_value = ema(closes, ema_period)[-1]
+        sma_value = sma(closes, sma_period)[-1]
+        if ema_value is None or sma_value is None:
+            return False, f"{minutes}m_average_unavailable"
+        for name, value in ((f"{minutes}m_ema{ema_period}", ema_value), (f"{minutes}m_sma{sma_period}", sma_value)):
+            selected = float(value)
+            if side == "long" and selected > price:
+                barriers.append(((selected - price) / price, name))
+            if side == "short" and selected < price:
+                barriers.append(((price - selected) / price, name))
+
+    if not barriers:
+        return True, "no_overhead_or_underfoot_average"
+    room_pct, barrier_name = min(barriers, key=lambda item: item[0])
+    required_room_pct = max(0.0, float(config.traditional_pressure_min_room_r)) * max(
+        0.0,
+        float(config.min_stop_loss_pct),
+    )
+    detail = f"{barrier_name}_room={room_pct:.6f}_required={required_room_pct:.6f}"
+    return room_pct >= required_room_pct, detail
+
+
 def _traditional_failed_breakout_short_reversal(
     trigger_candles: Sequence[Candle],
     regime: _TraditionalFeatures,
@@ -1471,6 +1614,11 @@ def _traditional_failed_breakout_short_reversal(
     execution_down = _traditional_execution(execution, "short")
     if config.traditional_allow_pullback:
         execution_down = execution_down or _traditional_reclaim(execution, "short")
+    execution_down = execution_down and _traditional_execution_quality(
+        execution,
+        "short",
+        config,
+    )
 
     ready = (
         float(rejection.high) >= max(float(candle.high) for candle in history)
@@ -1693,6 +1841,28 @@ def _traditional_execution(feature: _TraditionalFeatures, side: str) -> bool:
     if side == "long":
         return feature.close >= feature.ema_fast and feature.ema_fast >= feature.ema_slow
     return feature.close <= feature.ema_fast and feature.ema_fast <= feature.ema_slow
+
+
+def _traditional_execution_quality(
+    feature: _TraditionalFeatures,
+    side: str,
+    config: StrategyConfig,
+) -> bool:
+    """Prevent a valid 1m alignment from becoming an overextended chase."""
+
+    if side not in {"long", "short"}:
+        return False
+    extension_cap = max(0.0, float(config.traditional_execution_max_extension_atr))
+    if extension_cap:
+        if feature.ema_fast is None or feature.atr is None or feature.atr <= 0:
+            return False
+        if abs(feature.close - feature.ema_fast) / feature.atr > extension_cap:
+            return False
+    if side == "long":
+        rsi_cap = max(0.0, float(config.traditional_execution_rsi_long_max))
+        return not rsi_cap or (feature.rsi is not None and feature.rsi <= rsi_cap)
+    rsi_floor = max(0.0, float(config.traditional_execution_rsi_short_min))
+    return not rsi_floor or (feature.rsi is not None and feature.rsi >= rsi_floor)
 
 
 def _traditional_reclaim(feature: _TraditionalFeatures, side: str) -> bool:

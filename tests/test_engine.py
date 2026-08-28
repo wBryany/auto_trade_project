@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from btc_futures_bot.engine import EngineConfig, TradingEngine
 from btc_futures_bot.costs import CostConfig
@@ -92,6 +93,35 @@ def test_zero_loss_streak_threshold_never_blocks_entry() -> None:
 
     assert engine._entry_allowed()
     assert engine.consecutive_losses == 100
+
+
+def test_live_position_reconciliation_is_throttled_between_poll_cycles() -> None:
+    class Adapter:
+        name = "binance"
+        settings = SimpleNamespace(symbol="BTCUSDT", environment="production")
+
+        def __init__(self) -> None:
+            self.position_reads = 0
+
+        def fetch_live_position(self) -> None:
+            self.position_reads += 1
+            return None
+
+    adapter = Adapter()
+    engine = TradingEngine(
+        adapter,
+        MultiTimeframeStrategy(StrategyConfig()),
+        RiskManager(),
+        EngineConfig(mode="live", live_reconciliation_seconds=5),
+    )
+    candle = Candle(1, 100.0, 100.0, 100.0, 100.0, 1.0)
+
+    with patch("btc_futures_bot.engine.time.monotonic", side_effect=(100.0, 102.0, 105.1)):
+        engine._reconcile_binance_live_position_if_due(candle)
+        engine._reconcile_binance_live_position_if_due(candle)
+        engine._reconcile_binance_live_position_if_due(candle)
+
+    assert adapter.position_reads == 2
 
 
 def _engine(*, enable_time_exit: bool) -> TradingEngine:
@@ -682,6 +712,51 @@ def test_live_position_checks_mark_price_each_poll_and_closes_at_protected_stop(
     assert adapter.mark_calls == 1
     assert adapter.close_request.reduce_only is True
     assert adapter.close_request.side == "sell"
+    assert engine.position is None
+
+
+def test_live_close_race_reuses_confirmed_flat_position_without_second_query() -> None:
+    class Adapter:
+        name = "binance"
+        settings = SimpleNamespace(symbol="BTCUSDT", environment="production")
+
+        def __init__(self) -> None:
+            self.position_reads = 0
+
+        @staticmethod
+        def place_market_order(request: object) -> dict:
+            raise RuntimeError("reduce-only order rejected because the venue is already flat")
+
+        def fetch_live_position(self) -> None:
+            self.position_reads += 1
+            return None
+
+        @staticmethod
+        def fetch_protection_status(position: Position) -> dict:
+            return {"stop": {"status": "FILLED", "avgPrice": "99.0"}}
+
+        @staticmethod
+        def cancel_protection_orders(position: Position) -> dict:
+            return {"cancelled": [position.stop_client_id], "errors": []}
+
+    adapter = Adapter()
+    engine = TradingEngine(adapter, MultiTimeframeStrategy(), RiskManager(), EngineConfig(mode="live"))
+    engine.position = Position(
+        "long",
+        1.0,
+        100.0,
+        99.0,
+        103.0,
+        int(time.time() * 1000) - 120_000,
+        initial_stop_price=99.0,
+        stop_order_id="1",
+        stop_client_id="stop",
+    )
+
+    result = engine._close_live_position(98.9, "stop_loss")
+
+    assert result["exchange_race_reconciled"] is True
+    assert adapter.position_reads == 1
     assert engine.position is None
 
 
