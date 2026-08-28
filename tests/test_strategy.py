@@ -19,12 +19,14 @@ from btc_futures_bot.strategy import (
     _traditional_countertrend_cross_regime,
     _traditional_countertrend_pullback_regime,
     _traditional_cross_quality,
+    _traditional_failed_breakout_short_reversal,
     _traditional_neutral_transition_regime,
     _traditional_strong_regime_quality,
     _traditional_setup_macd_handoff,
     _traditional_setup_volume_handoff,
     dynamic_stop_loss_pct,
     signal_position_size_multiplier,
+    signal_stop_loss_overrides,
 )
 
 
@@ -172,6 +174,36 @@ def test_dynamic_stop_keeps_legacy_atr_result_when_structure_is_disabled() -> No
     with_side = dynamic_stop_loss_pct(candles, config, 0.05, side="long", entry_price=104.0)
 
     assert without_side == with_side
+
+
+def test_failed_breakout_short_uses_two_bar_structure_and_special_stop_cap() -> None:
+    candles = [
+        Candle(1, 100.0, 110.0, 99.0, 101.0, 10.0),
+        Candle(2, 101.0, 102.0, 95.0, 96.0, 10.0),
+    ]
+    config = StrategyConfig(
+        atr_period=2,
+        atr_stop_multiplier=0.1,
+        min_stop_loss_pct=0.001,
+        max_stop_loss_pct=0.006,
+        structure_stop_lookback_bars=1,
+        traditional_failed_breakout_short_stop_lookback_bars=2,
+        traditional_failed_breakout_short_max_stop_loss_pct=0.01,
+    )
+    signal = Signal("short", 6, 2, ("failed_breakout_short_reversal",))
+
+    normal = dynamic_stop_loss_pct(candles, config, 0.005, side="short", entry_price=101.0)
+    guarded = dynamic_stop_loss_pct(
+        candles,
+        config,
+        0.005,
+        side="short",
+        entry_price=101.0,
+        **signal_stop_loss_overrides(signal, config),
+    )
+
+    assert normal == 0.006
+    assert guarded == 0.01
 
 
 def test_risk_protection_scales_countertrend_position_size() -> None:
@@ -381,6 +413,118 @@ def test_traditional_kline_strategy_accepts_golden_cross_alignment() -> None:
     assert signal.side == "long"
     assert "5m_golden_cross" in signal.reasons
     assert signal.timestamp == trigger[-1].timestamp
+
+
+def test_failed_breakout_short_requires_confirmed_blow_off_top() -> None:
+    history = [
+        Candle(index * 300_000, 99.0, 100.0, 98.0, 99.5, 10.0)
+        for index in range(6)
+    ]
+    rejection = Candle(6 * 300_000, 100.0, 110.0, 99.0, 101.0, 40.0)
+    confirmation = Candle(7 * 300_000, 101.0, 102.0, 95.0, 96.0, 30.0)
+    regime = _TraditionalFeatures(
+        open=104.0,
+        high=106.0,
+        low=103.0,
+        close=105.0,
+        previous_close=104.0,
+        ema_fast=103.0,
+        previous_ema_fast=102.8,
+        ema_slow=100.0,
+        previous_ema_slow=99.8,
+        rsi=62.0,
+        macd_histogram=1.0,
+        previous_macd_histogram=0.8,
+        atr=2.0,
+        volume_ratio=1.0,
+    )
+    previous = replace(
+        regime,
+        open=rejection.open,
+        high=rejection.high,
+        low=rejection.low,
+        close=rejection.close,
+        volume_ratio=3.2,
+        macd_histogram=1.0,
+    )
+    current = replace(
+        previous,
+        open=confirmation.open,
+        high=confirmation.high,
+        low=confirmation.low,
+        close=confirmation.close,
+        volume_ratio=2.2,
+        macd_histogram=0.5,
+        previous_macd_histogram=1.0,
+    )
+    execution = replace(
+        current,
+        close=95.0,
+        ema_fast=96.0,
+        ema_slow=97.0,
+    )
+    config = StrategyConfig(trigger_timeframe="5m", regime_timeframe="1h")
+
+    signal = _traditional_failed_breakout_short_reversal(
+        history + [rejection, confirmation],
+        regime,
+        previous,
+        current,
+        execution,
+        config,
+    )
+
+    assert signal.side == "short"
+    assert "failed_breakout_short_reversal" in signal.reasons
+    assert signal_position_size_multiplier(signal) == 0.5
+    assert _traditional_failed_breakout_short_reversal(
+        history + [rejection, confirmation],
+        regime,
+        previous,
+        replace(current, volume_ratio=1.99),
+        execution,
+        config,
+    ).side == "flat"
+
+
+def test_failed_breakout_short_shadow_logs_candidate_without_trading() -> None:
+    def flat_series(count: int, interval_ms: int) -> list[Candle]:
+        return [
+            Candle(index * interval_ms, 100.0, 100.1, 99.9, 100.0, 10.0)
+            for index in range(count)
+        ]
+
+    market = {
+        "5m": flat_series(40, 300_000),
+        "1m": flat_series(40, 60_000),
+        "1h": flat_series(210, 3_600_000),
+    }
+    candidate = Signal("short", 6, market["5m"][-1].timestamp, ("failed_breakout_short_reversal",))
+    shadow_config = StrategyConfig(
+        mode="traditional_kline",
+        trigger_timeframe="5m",
+        regime_timeframe="1h",
+        traditional_failed_breakout_short_shadow=True,
+    )
+
+    with patch(
+        "btc_futures_bot.strategy._traditional_failed_breakout_short_reversal",
+        return_value=candidate,
+    ):
+        shadow = MultiTimeframeStrategy(shadow_config).evaluate(market)
+        enabled = MultiTimeframeStrategy(
+            replace(
+                shadow_config,
+                traditional_failed_breakout_short_enabled=True,
+                traditional_failed_breakout_short_shadow=False,
+            )
+        ).evaluate(market)
+
+    assert shadow.side == "flat"
+    assert "shadow_candidate=short" in shadow.reasons
+    assert "shadow_failed_breakout_short_reversal" in shadow.reasons
+    assert enabled.side == "short"
+    assert signal_position_size_multiplier(enabled) == 0.5
 
 
 def test_traditional_setup_can_persist_until_confirmation_aligns() -> None:

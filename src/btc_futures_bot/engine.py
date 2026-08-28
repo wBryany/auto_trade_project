@@ -15,7 +15,12 @@ from .models import Candle, OrderRequest, Position, Signal, TradeResult
 from .notifications import EmailNotifier
 from .reporting import TradeRecord, TradeReporter
 from .risk import RiskManager
-from .strategy import MultiTimeframeStrategy, dynamic_stop_loss_pct, signal_position_size_multiplier
+from .strategy import (
+    MultiTimeframeStrategy,
+    dynamic_stop_loss_pct,
+    signal_position_size_multiplier,
+    signal_stop_loss_overrides,
+)
 
 LOG = logging.getLogger(__name__)
 MIN_POLL_SECONDS = 1
@@ -251,6 +256,7 @@ class TradingEngine:
             candles_by_timeframe[trigger_timeframe],
             signal.side,
             current_price,
+            signal=signal,
         )
         protection = self.risk.protection(
             signal.side,
@@ -317,6 +323,7 @@ class TradingEngine:
                 candles_by_timeframe[trigger_timeframe],
                 signal.side,
                 filled_price,
+                signal=signal,
             )
             stop_distance = filled_price * filled_stop_pct
             stop_price = filled_price - stop_distance if signal.side == "long" else filled_price + stop_distance
@@ -1005,13 +1012,17 @@ class TradingEngine:
         candles: list[Any],
         side: str | None = None,
         entry_price: float | None = None,
+        *,
+        signal: Signal | None = None,
     ) -> float:
+        overrides = signal_stop_loss_overrides(signal, self.strategy.config) if signal else {}
         return dynamic_stop_loss_pct(
             candles,
             self.strategy.config,
             float(self.risk.config.stop_loss_pct),
             side=side,
             entry_price=entry_price,
+            **overrides,
         )
 
     def _entry_allowed(self) -> bool:

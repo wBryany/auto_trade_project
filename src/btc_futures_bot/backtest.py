@@ -15,6 +15,7 @@ from .strategy import (
     StrategyConfig,
     dynamic_stop_loss_pct,
     signal_position_size_multiplier,
+    signal_stop_loss_overrides,
 )
 
 
@@ -321,6 +322,7 @@ def run_backtest(
                 risk.config.stop_loss_pct,
                 side=signal.side,
                 entry_price=entry_price,
+                **signal_stop_loss_overrides(signal, strategy.config),
             )
             protection = risk.protection(
                 signal.side,

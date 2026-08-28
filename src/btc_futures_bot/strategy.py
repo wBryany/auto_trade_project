@@ -80,6 +80,16 @@ class StrategyConfig:
     traditional_1m_impulse_min_close_location: float = 0.65
     traditional_1m_impulse_min_range_atr: float = 1.0
     traditional_1m_impulse_max_extension_atr: float = 1.5
+    traditional_failed_breakout_short_enabled: bool = False
+    traditional_failed_breakout_short_shadow: bool = False
+    traditional_failed_breakout_short_lookback: int = 6
+    traditional_failed_breakout_short_prior_volume_ratio: float = 3.0
+    traditional_failed_breakout_short_prior_wick_ratio: float = 0.6
+    traditional_failed_breakout_short_confirm_volume_ratio: float = 2.0
+    traditional_failed_breakout_short_confirm_body_ratio: float = 0.5
+    traditional_failed_breakout_short_confirm_close_location: float = 0.6
+    traditional_failed_breakout_short_stop_lookback_bars: int = 2
+    traditional_failed_breakout_short_max_stop_loss_pct: float = 0.01
     traditional_allow_early_regime: bool = True
     traditional_early_regime_max_gap_pct: float = 0.005
     traditional_early_regime_rsi_long_min: float = 50.0
@@ -198,6 +208,8 @@ def dynamic_stop_loss_pct(
     *,
     side: str | None = None,
     entry_price: float | None = None,
+    structure_lookback_bars: int | None = None,
+    maximum_stop_loss_pct: float | None = None,
 ) -> float:
     """Return a volatility stop widened to a nearby market structure level.
 
@@ -208,7 +220,11 @@ def dynamic_stop_loss_pct(
     """
     fallback = float(fallback)
     minimum = float(getattr(config, "min_stop_loss_pct", fallback))
-    maximum = float(getattr(config, "max_stop_loss_pct", fallback))
+    maximum = float(
+        maximum_stop_loss_pct
+        if maximum_stop_loss_pct is not None
+        else getattr(config, "max_stop_loss_pct", fallback)
+    )
     if minimum <= 0 or maximum < minimum:
         return fallback
 
@@ -230,7 +246,14 @@ def dynamic_stop_loss_pct(
     atr_pct = (float(current_atr) / close) * float(getattr(config, "atr_stop_multiplier", 1.4))
     selected = max(minimum, min(maximum, atr_pct))
 
-    lookback = max(0, int(getattr(config, "structure_stop_lookback_bars", 0)))
+    lookback = max(
+        0,
+        int(
+            structure_lookback_bars
+            if structure_lookback_bars is not None
+            else getattr(config, "structure_stop_lookback_bars", 0)
+        ),
+    )
     price = float(entry_price or 0.0)
     if lookback <= 0 or side not in {"long", "short"} or price <= 0:
         return selected
@@ -689,6 +712,20 @@ class MultiTimeframeStrategy:
                 reasons += (f"{regime_name}_neutral_transition_down",)
             return Signal("short", short_score, timestamp, reasons)
 
+        failed_breakout_short = _traditional_failed_breakout_short_reversal(
+            trigger_candles,
+            regime,
+            previous_trigger,
+            trigger,
+            execution,
+            self.config,
+        )
+        if (
+            self.config.traditional_failed_breakout_short_enabled
+            and failed_breakout_short.side == "short"
+        ):
+            return failed_breakout_short
+
         # A fast impulse branch closes the timing gap between a quiet completed
         # 5-minute context bar and the next 5-minute bar becoming overextended.
         # It still uses only closed candles: the higher timeframes establish a
@@ -757,6 +794,15 @@ class MultiTimeframeStrategy:
             quality_rejections.append(f"{trigger_name}_long_breakout_quality_rejected")
         if current_setup.breakout_short_raw and not current_setup.breakout_short:
             quality_rejections.append(f"{trigger_name}_short_breakout_quality_rejected")
+        if (
+            self.config.traditional_failed_breakout_short_shadow
+            and not self.config.traditional_failed_breakout_short_enabled
+            and failed_breakout_short.side == "short"
+        ):
+            quality_rejections.append("shadow_candidate=short")
+            quality_rejections.extend(
+                f"shadow_{reason}" for reason in failed_breakout_short.reasons
+            )
         return Signal(
             "flat",
             max(long_score, short_score),
@@ -1373,12 +1419,121 @@ def _traditional_neutral_transition_regime(
     return setup.short_ready and not setup.long_ready
 
 
+def _traditional_failed_breakout_short_reversal(
+    trigger_candles: Sequence[Candle],
+    regime: _TraditionalFeatures,
+    previous: _TraditionalFeatures,
+    current: _TraditionalFeatures,
+    execution: _TraditionalFeatures,
+    config: StrategyConfig,
+) -> Signal:
+    """Detect a confirmed blow-off top without relaxing normal short entries.
+
+    A high-volume upper-wick rejection must set a fresh local high, then the
+    next closed trigger bar must break its low with strong bearish body and
+    volume quality. MACD must be decelerating and the closed 1-minute stream
+    must confirm execution down. This separate branch handles fast intrahour
+    reversals while the normal 1-hour regime is still bullish.
+    """
+
+    lookback = max(2, int(config.traditional_failed_breakout_short_lookback))
+    timestamp = trigger_candles[-1].timestamp if trigger_candles else 0
+    if (
+        len(trigger_candles) < lookback + 2
+        or regime.close <= 0
+        or regime.ema_fast is None
+        or regime.ema_slow is None
+        or not (regime.close > regime.ema_fast > regime.ema_slow)
+        or previous.volume_ratio is None
+        or previous.macd_histogram is None
+        or current.volume_ratio is None
+        or current.macd_histogram is None
+    ):
+        return Signal("flat", 0, timestamp, ("no_failed_breakout_short_reversal",))
+
+    rejection = trigger_candles[-2]
+    confirmation = trigger_candles[-1]
+    history = trigger_candles[-lookback - 2 : -2]
+    rejection_range = float(rejection.high) - float(rejection.low)
+    confirmation_range = float(confirmation.high) - float(confirmation.low)
+    if rejection_range <= 0 or confirmation_range <= 0 or not history:
+        return Signal("flat", 0, timestamp, ("no_failed_breakout_short_reversal",))
+
+    rejection_upper_wick_ratio = (
+        float(rejection.high) - max(float(rejection.open), float(rejection.close))
+    ) / rejection_range
+    confirmation_body_ratio = (
+        abs(float(confirmation.close) - float(confirmation.open)) / confirmation_range
+    )
+    confirmation_close_location = (
+        float(confirmation.high) - float(confirmation.close)
+    ) / confirmation_range
+    execution_down = _traditional_execution(execution, "short")
+    if config.traditional_allow_pullback:
+        execution_down = execution_down or _traditional_reclaim(execution, "short")
+
+    ready = (
+        float(rejection.high) >= max(float(candle.high) for candle in history)
+        and previous.volume_ratio
+        >= max(0.0, float(config.traditional_failed_breakout_short_prior_volume_ratio))
+        and rejection_upper_wick_ratio
+        >= max(0.0, float(config.traditional_failed_breakout_short_prior_wick_ratio))
+        and float(confirmation.close) < float(confirmation.open)
+        and float(confirmation.close) < float(rejection.low)
+        and current.volume_ratio
+        >= max(0.0, float(config.traditional_failed_breakout_short_confirm_volume_ratio))
+        and confirmation_body_ratio
+        >= max(0.0, float(config.traditional_failed_breakout_short_confirm_body_ratio))
+        and confirmation_close_location
+        >= max(0.0, float(config.traditional_failed_breakout_short_confirm_close_location))
+        and current.macd_histogram < previous.macd_histogram
+        and execution_down
+    )
+    if not ready:
+        return Signal("flat", 0, timestamp, ("no_failed_breakout_short_reversal",))
+
+    return Signal(
+        "short",
+        6,
+        timestamp,
+        (
+            f"{config.regime_timeframe}_bull_regime_reversal",
+            f"{config.trigger_timeframe}_volume_spike_upper_wick",
+            f"{config.trigger_timeframe}_failed_breakout_confirmed",
+            f"{config.trigger_timeframe}_macd_decelerating",
+            "1m_execution_down",
+            "failed_breakout_short_reversal",
+        ),
+    )
+
+
+def signal_stop_loss_overrides(
+    signal: Signal,
+    config: StrategyConfig,
+) -> dict[str, int | float]:
+    """Return branch-specific stop settings without weakening normal entries."""
+
+    if "failed_breakout_short_reversal" not in signal.reasons:
+        return {}
+    return {
+        "structure_lookback_bars": max(
+            2,
+            int(config.traditional_failed_breakout_short_stop_lookback_bars),
+        ),
+        "maximum_stop_loss_pct": max(
+            float(config.max_stop_loss_pct),
+            float(config.traditional_failed_breakout_short_max_stop_loss_pct),
+        ),
+    }
+
+
 def signal_position_size_multiplier(signal: Signal) -> float:
     """Use half size for guarded countertrend, transition and fast signals."""
     if any(
         "_countertrend_pullback_" in reason
         or "_neutral_transition_" in reason
         or reason.startswith("1m_impulse_")
+        or reason == "failed_breakout_short_reversal"
         for reason in signal.reasons
     ):
         return 0.5

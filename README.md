@@ -72,6 +72,8 @@ CSV 使用 UTF-8 BOM，Excel 可以直接打开。当前纸面/回测会完整�
 
 另有默认关闭的 `traditional_allow_1m_impulse` 实验分支，用于弥补强势 5m K 线收盘后已经过度扩张的问题。该分支只使用已收盘的 1m K 线，要求 1h 强趋势、5m MACD/RSI 同向、首次 1m 区间突破、放量、实体/收盘位置合格，并继续使用相对 5m EMA/ATR 的扩张上限；信号按半仓处理。建议至少使用两根 1m K 线确认，并在扣除成本的走步样本外测试通过前保持关闭。
 
+`traditional_failed_breakout_short_shadow` 用于观察“高周期仍偏多，但 5m 出现放量长上影见顶并由下一根放量实体确认下破”的快速反转候选。影子模式只把 `shadow_candidate=short` 和判定原因写入信号日志，不会下单；`traditional_failed_breakout_short_enabled` 才会把它转成真实空头信号。真实分支固定使用半风险，并通过 `traditional_failed_breakout_short_stop_lookback_bars` 和 `traditional_failed_breakout_short_max_stop_loss_pct` 使用更宽的摆动高点保护。该分支属于实验功能，默认保持真实交易关闭。
+
 风险配置支持 `loss_streak_pause_minutes`。当 `max_consecutive_losses` 大于 0 且连续亏损达到该值时，引擎进入有期限的长暂停；正式交易重启后会从持久化交易报表恢复最近连亏次数与剩余暂停时间。将 `max_consecutive_losses` 设为 `0` 会完全禁用连亏入场阈值，但单笔亏损后的 `cooldown_minutes` 短冷却仍然生效。
 
 这是一套可验证的基线，不代表收益保证。实盘前必须做历史回测、走样本外测试、测试网运行，并检查手续费、资金费率、滑点、最小下单量、合约面值和强平价格。
