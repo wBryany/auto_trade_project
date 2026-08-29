@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .costs import CostConfig
-from .models import Candle, Position
+from .models import Candle, Position, Signal
 from .reporting import TradeRecord, TradeReporter
 from .risk import RiskConfig, RiskManager
 from .strategy import (
@@ -17,6 +17,7 @@ from .strategy import (
     signal_position_size_multiplier,
     signal_stop_loss_overrides,
     signal_stop_timeframe,
+    signal_trade_management_overrides,
 )
 
 
@@ -232,7 +233,13 @@ def run_backtest(
                 peak_equity = max(peak_equity, equity)
                 max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity)
             else:
-                position = _tighten_position_stop(position, exit_candle, strategy, risk)
+                position = _tighten_position_stop(
+                    position,
+                    exit_candle,
+                    strategy,
+                    risk,
+                    position_signal,
+                )
 
         # Production evaluates the newly closed candles after position
         # management and may close (then reverse) when a fresh, sufficiently
@@ -396,6 +403,7 @@ def _tighten_position_stop(
     candle: Candle,
     strategy: MultiTimeframeStrategy,
     risk: RiskManager,
+    signal: Signal | None = None,
 ) -> Position:
     initial_stop = position.initial_stop_price or position.stop_price
     risk_distance = abs(position.entry_price - initial_stop)
@@ -411,7 +419,16 @@ def _tighten_position_stop(
         favorable_r = (position.entry_price - best_price) / risk_distance
     candidate = position.stop_price
     candidate_reason = position.stop_reason
-    break_even_trigger = max(0.0, float(getattr(strategy.config, "break_even_trigger_r", 1.25)))
+    management = signal_trade_management_overrides(signal, strategy.config)
+    break_even_trigger = max(
+        0.0,
+        float(
+            management.get(
+                "break_even_trigger_r",
+                getattr(strategy.config, "break_even_trigger_r", 1.25),
+            )
+        ),
+    )
     if break_even_trigger and favorable_r >= break_even_trigger:
         holding_hours = max(0.0, (candle.timestamp - position.opened_at) / 3_600_000)
         cost_break_even = risk.break_even_price(
@@ -419,15 +436,39 @@ def _tighten_position_stop(
             position.entry_price,
             holding_hours=holding_hours,
         )
-        lock_distance = risk_distance * max(0.0, float(getattr(strategy.config, "break_even_lock_r", 0.5)))
+        lock_distance = risk_distance * max(
+            0.0,
+            float(
+                management.get(
+                    "break_even_lock_r",
+                    getattr(strategy.config, "break_even_lock_r", 0.5),
+                )
+            ),
+        )
         protected_stop = cost_break_even + lock_distance if position.side == "long" else cost_break_even - lock_distance
         protection_improved = protected_stop > candidate if position.side == "long" else protected_stop < candidate
         if protection_improved:
             candidate = protected_stop
             candidate_reason = "break_even_stop"
-    trailing_trigger = max(0.0, float(getattr(strategy.config, "trailing_trigger_r", 2.0)))
+    trailing_trigger = max(
+        0.0,
+        float(
+            management.get(
+                "trailing_trigger_r",
+                getattr(strategy.config, "trailing_trigger_r", 2.0),
+            )
+        ),
+    )
     if trailing_trigger and favorable_r >= trailing_trigger:
-        trailing_distance = risk_distance * max(0.1, float(getattr(strategy.config, "trailing_distance_r", 0.75)))
+        trailing_distance = risk_distance * max(
+            0.1,
+            float(
+                management.get(
+                    "trailing_distance_r",
+                    getattr(strategy.config, "trailing_distance_r", 0.75),
+                )
+            ),
+        )
         trailing_stop = best_price - trailing_distance if position.side == "long" else best_price + trailing_distance
         trailing_improved = trailing_stop > candidate if position.side == "long" else trailing_stop < candidate
         if trailing_improved:

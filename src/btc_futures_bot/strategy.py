@@ -78,6 +78,19 @@ class StrategyConfig:
     traditional_pressure_ema_period: int = 30
     traditional_pressure_sma_period: int = 30
     traditional_pressure_min_room_r: float = 0.8
+    traditional_structural_scalp_enabled: bool = False
+    traditional_structural_scalp_max_fast_ema_distance_pct: float = 0.01
+    traditional_structural_scalp_max_regime_gap_pct: float = 0.03
+    traditional_structural_scalp_rsi_long_min: float = 40.0
+    traditional_structural_scalp_rsi_long_max: float = 45.0
+    traditional_structural_scalp_rsi_short_min: float = 55.0
+    traditional_structural_scalp_rsi_short_max: float = 60.0
+    traditional_structural_scalp_stop_lookback_bars: int = 2
+    traditional_structural_scalp_max_stop_loss_pct: float = 0.006
+    traditional_structural_scalp_break_even_trigger_r: float = 1.0
+    traditional_structural_scalp_break_even_lock_r: float = 0.15
+    traditional_structural_scalp_trailing_trigger_r: float = 1.5
+    traditional_structural_scalp_trailing_distance_r: float = 0.5
     traditional_allow_1m_impulse: bool = False
     traditional_1m_impulse_allow_long: bool = True
     traditional_1m_impulse_allow_short: bool = True
@@ -751,6 +764,57 @@ class MultiTimeframeStrategy:
             if neutral_transition_short:
                 reasons += (f"{regime_name}_neutral_transition_down",)
             return Signal("short", short_score, timestamp, reasons)
+
+        # Ultra-short structural recovery: the closed 1h candle is context,
+        # not a universal veto.  This branch only relaxes that single check;
+        # the 5m setup/momentum/volume, 1m execution and synthesized 10m/15m
+        # pressure checks must all be true.  Price also has to remain inside a
+        # correctly ordered 1h EMA50/EMA200 structure and close to EMA50, which
+        # avoids turning the exception into a generic 6-of-7 entry rule.
+        long_lower_timeframes_ready = all(
+            ready
+            for name, ready in long_checks.items()
+            if name != f"{regime_name}_trend_up"
+        )
+        short_lower_timeframes_ready = all(
+            ready
+            for name, ready in short_checks.items()
+            if name != f"{regime_name}_trend_down"
+        )
+        structural_scalp_long = (
+            not trend_long
+            and long_lower_timeframes_ready
+            and _traditional_structural_scalp_regime(
+                regime,
+                "long",
+                self.config,
+            )
+        )
+        structural_scalp_short = (
+            not trend_short
+            and short_lower_timeframes_ready
+            and _traditional_structural_scalp_regime(
+                regime,
+                "short",
+                self.config,
+            )
+        )
+        if structural_scalp_long and not structural_scalp_short:
+            reasons = tuple(name for name, ready in long_checks.items() if ready)
+            return Signal(
+                "long",
+                len(reasons),
+                timestamp,
+                (f"{regime_name}_structural_scalp_recovery_long",) + reasons,
+            )
+        if structural_scalp_short and not structural_scalp_long:
+            reasons = tuple(name for name, ready in short_checks.items() if ready)
+            return Signal(
+                "short",
+                len(reasons),
+                timestamp,
+                (f"{regime_name}_structural_scalp_recovery_short",) + reasons,
+            )
 
         failed_breakout_short = _traditional_failed_breakout_short_reversal(
             trigger_candles,
@@ -1484,6 +1548,63 @@ def _traditional_neutral_transition_regime(
     return setup.short_ready and not setup.long_ready
 
 
+def _traditional_structural_scalp_regime(
+    regime: _TraditionalFeatures,
+    side: str,
+    config: StrategyConfig,
+) -> bool:
+    """Allow a low-timeframe scalp inside a still-valid 1h EMA structure.
+
+    The latest closed 1h price may sit on the recovery side of EMA200 while it
+    has not yet reclaimed EMA50 (and symmetrically for shorts).  Momentum must
+    already point toward the trade and both EMA/price distances are bounded.
+    Lower-timeframe confirmation and pressure clearance remain caller-owned.
+    """
+
+    if (
+        not config.traditional_structural_scalp_enabled
+        or side not in {"long", "short"}
+        or regime.ema_fast is None
+        or regime.ema_slow is None
+        or regime.ema_fast <= 0
+        or regime.ema_slow <= 0
+        or regime.rsi is None
+        or regime.macd_histogram is None
+    ):
+        return False
+    max_fast_distance = max(
+        0.0,
+        float(config.traditional_structural_scalp_max_fast_ema_distance_pct),
+    )
+    max_regime_gap = max(
+        0.0,
+        float(config.traditional_structural_scalp_max_regime_gap_pct),
+    )
+    if max_fast_distance <= 0 or max_regime_gap <= 0:
+        return False
+    regime_gap = abs(regime.ema_fast - regime.ema_slow) / regime.ema_slow
+    fast_distance = abs(regime.close - regime.ema_fast) / regime.ema_fast
+    if regime_gap > max_regime_gap or fast_distance > max_fast_distance:
+        return False
+    if side == "long":
+        return (
+            regime.ema_fast > regime.ema_slow
+            and regime.ema_slow < regime.close < regime.ema_fast
+            and float(config.traditional_structural_scalp_rsi_long_min)
+            <= regime.rsi
+            <= float(config.traditional_structural_scalp_rsi_long_max)
+            and regime.macd_histogram > 0
+        )
+    return (
+        regime.ema_fast < regime.ema_slow
+        and regime.ema_fast < regime.close < regime.ema_slow
+        and float(config.traditional_structural_scalp_rsi_short_min)
+        <= regime.rsi
+        <= float(config.traditional_structural_scalp_rsi_short_max)
+        and regime.macd_histogram < 0
+    )
+
+
 def _aggregate_five_minute_candles(
     candles: Sequence[Candle],
     target_minutes: int,
@@ -1894,6 +2015,20 @@ def signal_stop_loss_overrides(
 ) -> dict[str, int | float]:
     """Return branch-specific stop settings without weakening normal entries."""
 
+    if any("_structural_scalp_recovery_" in reason for reason in signal.reasons):
+        return {
+            "structure_lookback_bars": max(
+                2,
+                int(config.traditional_structural_scalp_stop_lookback_bars),
+            ),
+            "maximum_stop_loss_pct": min(
+                float(config.max_stop_loss_pct),
+                max(
+                    float(config.min_stop_loss_pct),
+                    float(config.traditional_structural_scalp_max_stop_loss_pct),
+                ),
+            ),
+        }
     if "1m_predictive_reversal_short" in signal.reasons:
         return {
             "structure_lookback_bars": max(
@@ -1932,6 +2067,7 @@ def signal_position_size_multiplier(signal: Signal) -> float:
     if any(
         "_countertrend_pullback_" in reason
         or "_neutral_transition_" in reason
+        or "_structural_scalp_recovery_" in reason
         or reason.startswith("1m_impulse_")
         or reason == "1m_predictive_reversal_short"
         or reason == "failed_breakout_short_reversal"
@@ -1939,6 +2075,36 @@ def signal_position_size_multiplier(signal: Signal) -> float:
     ):
         return 0.5
     return 1.0
+
+
+def signal_trade_management_overrides(
+    signal: Signal | None,
+    config: StrategyConfig,
+) -> dict[str, float]:
+    """Tighten profit protection only for the guarded structural scalp."""
+
+    if signal is None or not any(
+        "_structural_scalp_recovery_" in reason for reason in signal.reasons
+    ):
+        return {}
+    return {
+        "break_even_trigger_r": max(
+            0.0,
+            float(config.traditional_structural_scalp_break_even_trigger_r),
+        ),
+        "break_even_lock_r": max(
+            0.0,
+            float(config.traditional_structural_scalp_break_even_lock_r),
+        ),
+        "trailing_trigger_r": max(
+            0.0,
+            float(config.traditional_structural_scalp_trailing_trigger_r),
+        ),
+        "trailing_distance_r": max(
+            0.1,
+            float(config.traditional_structural_scalp_trailing_distance_r),
+        ),
+    }
 
 
 def _traditional_one_minute_impulse(

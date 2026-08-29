@@ -25,6 +25,7 @@ from btc_futures_bot.strategy import (
     _traditional_neutral_transition_regime,
     _traditional_predictive_reversal_short,
     _traditional_pressure_room,
+    _traditional_structural_scalp_regime,
     _traditional_strong_regime_quality,
     _traditional_setup_macd_handoff,
     _traditional_setup_volume_handoff,
@@ -32,7 +33,73 @@ from btc_futures_bot.strategy import (
     signal_position_size_multiplier,
     signal_stop_loss_overrides,
     signal_stop_timeframe,
+    signal_trade_management_overrides,
 )
+
+
+def test_structural_scalp_uses_hourly_context_without_waiving_safety_gates() -> None:
+    long_regime = _TraditionalFeatures(
+        open=100.0,
+        high=101.0,
+        low=98.0,
+        close=99.2,
+        previous_close=98.9,
+        ema_fast=100.0,
+        previous_ema_fast=100.1,
+        ema_slow=97.5,
+        previous_ema_slow=97.4,
+        rsi=42.0,
+        macd_histogram=0.2,
+        previous_macd_histogram=0.1,
+        atr=1.0,
+        volume_ratio=1.0,
+    )
+    config = StrategyConfig(traditional_structural_scalp_enabled=True)
+
+    assert _traditional_structural_scalp_regime(long_regime, "long", config)
+    assert not _traditional_structural_scalp_regime(
+        replace(long_regime, close=98.9, ema_fast=100.0),
+        "long",
+        replace(config, traditional_structural_scalp_max_fast_ema_distance_pct=0.01),
+    )
+    assert not _traditional_structural_scalp_regime(
+        replace(long_regime, macd_histogram=-0.1),
+        "long",
+        config,
+    )
+    assert not _traditional_structural_scalp_regime(
+        long_regime,
+        "long",
+        replace(config, traditional_structural_scalp_enabled=False),
+    )
+
+    short_regime = replace(
+        long_regime,
+        close=100.8,
+        ema_fast=100.0,
+        ema_slow=102.5,
+        rsi=58.0,
+        macd_histogram=-0.2,
+    )
+    assert _traditional_structural_scalp_regime(short_regime, "short", config)
+    assert not _traditional_structural_scalp_regime(
+        replace(short_regime, rsi=51.27),
+        "short",
+        config,
+    )
+
+    signal = Signal("long", 6, 1, ("1h_structural_scalp_recovery_long",))
+    assert signal_position_size_multiplier(signal) == 0.5
+    assert signal_stop_loss_overrides(signal, config) == {
+        "structure_lookback_bars": 2,
+        "maximum_stop_loss_pct": 0.006,
+    }
+    assert signal_trade_management_overrides(signal, config) == {
+        "break_even_trigger_r": 1.0,
+        "break_even_lock_r": 0.15,
+        "trailing_trigger_r": 1.5,
+        "trailing_distance_r": 0.5,
+    }
 
 
 def test_traditional_strong_regime_quality_rejects_stale_ema_ordering() -> None:

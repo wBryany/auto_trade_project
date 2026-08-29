@@ -21,6 +21,7 @@ from .strategy import (
     signal_position_size_multiplier,
     signal_stop_loss_overrides,
     signal_stop_timeframe,
+    signal_trade_management_overrides,
 )
 
 LOG = logging.getLogger(__name__)
@@ -1257,7 +1258,19 @@ class TradingEngine:
 
         candidate = position.stop_price
         candidate_reason = position.stop_reason
-        break_even_trigger = max(0.0, float(getattr(self.strategy.config, "break_even_trigger_r", 1.25)))
+        management = signal_trade_management_overrides(
+            self.position_signal,
+            self.strategy.config,
+        )
+        break_even_trigger = max(
+            0.0,
+            float(
+                management.get(
+                    "break_even_trigger_r",
+                    getattr(self.strategy.config, "break_even_trigger_r", 1.25),
+                )
+            ),
+        )
         if break_even_trigger and favorable_r >= break_even_trigger:
             holding_hours = max(0.0, (time.time() * 1000 - position.opened_at) / 3_600_000)
             cost_break_even = self.risk.break_even_price(
@@ -1265,16 +1278,40 @@ class TradingEngine:
                 position.entry_price,
                 holding_hours=holding_hours,
             )
-            lock_distance = risk_distance * max(0.0, float(getattr(self.strategy.config, "break_even_lock_r", 0.5)))
+            lock_distance = risk_distance * max(
+                0.0,
+                float(
+                    management.get(
+                        "break_even_lock_r",
+                        getattr(self.strategy.config, "break_even_lock_r", 0.5),
+                    )
+                ),
+            )
             protected_stop = cost_break_even + lock_distance if position.side == "long" else cost_break_even - lock_distance
             protection_improved = protected_stop > candidate if position.side == "long" else protected_stop < candidate
             if protection_improved:
                 candidate = protected_stop
                 candidate_reason = "break_even_stop"
 
-        trailing_trigger = max(0.0, float(getattr(self.strategy.config, "trailing_trigger_r", 2.0)))
+        trailing_trigger = max(
+            0.0,
+            float(
+                management.get(
+                    "trailing_trigger_r",
+                    getattr(self.strategy.config, "trailing_trigger_r", 2.0),
+                )
+            ),
+        )
         if trailing_trigger and favorable_r >= trailing_trigger:
-            trailing_distance = risk_distance * max(0.1, float(getattr(self.strategy.config, "trailing_distance_r", 0.75)))
+            trailing_distance = risk_distance * max(
+                0.1,
+                float(
+                    management.get(
+                        "trailing_distance_r",
+                        getattr(self.strategy.config, "trailing_distance_r", 0.75),
+                    )
+                ),
+            )
             trailing_stop = best_price - trailing_distance if position.side == "long" else best_price + trailing_distance
             trailing_improved = trailing_stop > candidate if position.side == "long" else trailing_stop < candidate
             if trailing_improved:
