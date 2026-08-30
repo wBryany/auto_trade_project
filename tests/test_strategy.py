@@ -27,6 +27,7 @@ from btc_futures_bot.strategy import (
     _traditional_pressure_room,
     _traditional_structural_scalp_regime,
     _traditional_strong_regime_quality,
+    _traditional_ultra_short_one_minute_trigger,
     _traditional_setup_macd_handoff,
     _traditional_setup_volume_handoff,
     dynamic_stop_loss_pct,
@@ -35,6 +36,67 @@ from btc_futures_bot.strategy import (
     signal_stop_timeframe,
     signal_trade_management_overrides,
 )
+
+
+def test_ultra_short_one_minute_trigger_requires_fresh_volume_break() -> None:
+    candles = [
+        Candle(index * 60_000, 99.95, 100.10, 99.90, 100.0, 10.0)
+        for index in range(30)
+    ]
+    candles[-1] = Candle(candles[-1].timestamp, 100.20, 101.10, 100.10, 101.0, 25.0)
+    execution = _TraditionalFeatures(
+        open=100.20,
+        high=101.10,
+        low=100.10,
+        close=101.0,
+        previous_close=100.0,
+        ema_fast=100.8,
+        previous_ema_fast=100.0,
+        ema_slow=100.5,
+        previous_ema_slow=100.0,
+        rsi=60.0,
+        macd_histogram=1.0,
+        previous_macd_histogram=0.2,
+        atr=0.5,
+        volume_ratio=1.5,
+    )
+    trigger = replace(execution, close=100.8, ema_fast=100.5, atr=1.0)
+    config = StrategyConfig(
+        traditional_signal_fast=3,
+        traditional_signal_slow=5,
+        traditional_rsi_period=3,
+        traditional_macd_fast=3,
+        traditional_macd_slow=6,
+        traditional_macd_signal=2,
+        traditional_atr_period=3,
+        traditional_volume_sma_period=5,
+        traditional_ultra_short_1m_lookback=5,
+        traditional_ultra_short_1m_min_volume_ratio=1.2,
+        traditional_ultra_short_1m_max_extension_atr=1.0,
+    )
+
+    assert _traditional_ultra_short_one_minute_trigger(
+        candles,
+        execution,
+        trigger,
+        "long",
+        config,
+    )
+    assert not _traditional_ultra_short_one_minute_trigger(
+        candles,
+        replace(execution, volume_ratio=1.19),
+        trigger,
+        "long",
+        config,
+    )
+    signal = Signal("long", 6, 1, ("1m_ultra_short_trigger_long",))
+    assert signal_position_size_multiplier(signal) == 0.5
+    assert signal_trade_management_overrides(signal, config) == {
+        "break_even_trigger_r": 0.7,
+        "break_even_lock_r": 0.15,
+        "trailing_trigger_r": 0.9,
+        "trailing_distance_r": 0.35,
+    }
 
 
 def test_structural_scalp_uses_hourly_context_without_waiving_safety_gates() -> None:
@@ -665,6 +727,59 @@ def test_traditional_kline_strategy_accepts_golden_cross_alignment() -> None:
     assert signal.timestamp == trigger[-1].timestamp
 
 
+def test_traditional_ultra_short_uses_neutral_hourly_context_at_half_size() -> None:
+    def candles(values: list[float], interval_ms: int, volume: float = 10.0) -> list[Candle]:
+        return [
+            Candle(index * interval_ms, value - 0.1, value + 0.2, value - 0.2, value, volume)
+            for index, value in enumerate(values)
+        ]
+
+    neutral_regime = candles([100.0] * 40, 3_600_000)
+    trigger_values = [100.0 + (index**2) * 0.001 for index in range(48)]
+    trigger = candles(trigger_values, 300_000)
+    execution_base = trigger_values[-1] - 0.4
+    execution = candles([execution_base + index * 0.005 for index in range(39)], 60_000)
+    execution.append(
+        Candle(
+            39 * 60_000,
+            execution[-1].close,
+            trigger_values[-1] + 0.12,
+            execution[-1].close - 0.02,
+            trigger_values[-1] + 0.1,
+            40.0,
+        )
+    )
+    base = StrategyConfig(
+        mode="traditional_kline",
+        trigger_timeframe="5m",
+        regime_timeframe="1h",
+        traditional_trend_fast=5,
+        traditional_trend_slow=20,
+        traditional_signal_fast=3,
+        traditional_signal_slow=5,
+        traditional_rsi_period=3,
+        traditional_macd_fast=3,
+        traditional_macd_slow=6,
+        traditional_macd_signal=2,
+        traditional_volume_sma_period=3,
+        traditional_min_volume_ratio=1.1,
+        traditional_rsi_long_min=0,
+        traditional_rsi_long_max=100,
+        traditional_ultra_short_1m_max_extension_atr=10.0,
+    )
+    market = {"5m": trigger, "1m": execution, "1h": neutral_regime}
+
+    blocked = MultiTimeframeStrategy(base).evaluate(market)
+    enabled = MultiTimeframeStrategy(
+        replace(base, traditional_ultra_short_enabled=True)
+    ).evaluate(market)
+
+    assert blocked.side == "flat"
+    assert enabled.side == "long"
+    assert "1h_ultra_short_context_long" in enabled.reasons
+    assert signal_position_size_multiplier(enabled) == 0.5
+
+
 def test_failed_breakout_short_requires_confirmed_blow_off_top() -> None:
     history = [
         Candle(index * 300_000, 99.0, 100.0, 98.0, 99.5, 10.0)
@@ -820,6 +935,13 @@ def test_traditional_setup_can_persist_until_confirmation_aligns() -> None:
     assert "5m_golden_cross" in persisted.reasons
     assert "5m_setup_persisted_1_bars" in persisted.reasons
     assert "macro_blocked_signal_revalidated" in persisted.reasons
+
+    main_strategy_persisted = MultiTimeframeStrategy(
+        replace(base, traditional_setup_valid_bars=2)
+    ).evaluate(market)
+    assert main_strategy_persisted.side == "long"
+    assert "5m_setup_persisted_1_bars" in main_strategy_persisted.reasons
+    assert "macro_blocked_signal_revalidated" not in main_strategy_persisted.reasons
 
 
 def test_traditional_setup_macd_handoff_is_one_bar_and_extension_capped() -> None:
@@ -1272,6 +1394,16 @@ def test_traditional_one_minute_impulse_enters_early_once_at_half_size() -> None
     assert continuation.side == "flat"
     assert confirmed.side == "long"
     assert confirmed.timestamp == execution[-1].timestamp
+
+    neutral_regime = candles([100.0] * 40, 3_600_000)
+    neutral_context = MultiTimeframeStrategy(
+        replace(
+            config,
+            traditional_ultra_short_enabled=True,
+            traditional_1m_impulse_confirmation_bars=1,
+        )
+    ).evaluate({"5m": trigger, "1m": execution[:-1], "1h": neutral_regime})
+    assert neutral_context.side == "flat"
 
 
 def test_traditional_one_minute_impulse_respects_5m_extension_cap() -> None:
