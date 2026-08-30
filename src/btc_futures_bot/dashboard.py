@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .engine import normalized_poll_seconds
+from .http_client import ApiError
 from .main import (
     build_engine,
     credential_values,
@@ -143,6 +144,8 @@ class DashboardService:
         self.started_at = 0.0
         self._exchange_snapshot: dict[str, Any] = {}
         self._snapshot_at = 0.0
+        self._snapshot_refreshing = False
+        self._snapshot_condition = threading.Condition(self._lock)
         self._dashboard_adapter: Any = None
         self._dashboard_adapter_key: tuple[str, str, str, str] | None = None
         self.operation_logger = OperationLogger(Path(self.config_path).parent / "logs" / "operation_log.jsonl")
@@ -283,6 +286,13 @@ class DashboardService:
                     if mode == "live"
                     else {"prepared": False, "mode": mode}
                 )
+                dashboard_adapter = self._dashboard_adapter
+                if dashboard_adapter is not None and dashboard_adapter is not self.engine.adapter:
+                    close_dashboard_adapter = getattr(dashboard_adapter, "close", None)
+                    if close_dashboard_adapter is not None:
+                        close_dashboard_adapter()
+                    self._dashboard_adapter = None
+                    self._dashboard_adapter_key = None
             except Exception:
                 if self.engine is not None:
                     self.engine.close()
@@ -354,6 +364,7 @@ class DashboardService:
     def _run_loop(self) -> None:
         stop_event = self._stop_event
         while stop_event and not stop_event.is_set():
+            rate_limit_wait = 0.0
             try:
                 result = self.engine.evaluate_once()
                 with self._lock:
@@ -392,6 +403,8 @@ class DashboardService:
                     )
             except Exception as error:  # Do not terminate the dashboard on a transient venue error.
                 LOG.exception("dashboard engine cycle failed")
+                if isinstance(error, ApiError) and error.rate_limited:
+                    rate_limit_wait = error.retry_after_seconds
                 with self._lock:
                     self.last_error = str(error)
                     self.last_cycle_at = time.time()
@@ -399,7 +412,7 @@ class DashboardService:
                     self._last_logged_error = str(error)
                     self.operation_logger.record("engine_cycle", "cycle", status="error", summary="行情周期执行失败，引擎保持运行", result={"error": str(error)})
             poll = normalized_poll_seconds(self.engine.config.poll_seconds) if self.engine else 15
-            stop_event.wait(poll)
+            stop_event.wait(max(float(poll), rate_limit_wait))
 
     def _adapter(self, config: dict[str, Any], exchange_name: str) -> Any:
         expected = config.get("exchanges", {}).get(exchange_name, {})
@@ -431,17 +444,38 @@ class DashboardService:
         return adapter
 
     def _market_snapshot(self, config: dict[str, Any], exchange_name: str) -> dict[str, Any]:
-        now = time.time()
-        snapshot_seconds = max(2.0, float(config.get("dashboard_snapshot_seconds", 5)))
-        with self._lock:
+        snapshot_seconds = max(5.0, float(config.get("dashboard_snapshot_seconds", 15)))
+        with self._snapshot_condition:
+            now = time.time()
             if self._exchange_snapshot and now - self._snapshot_at < snapshot_seconds:
                 return self._exchange_snapshot
-        adapter = self._adapter(config, exchange_name)
-        snapshot = adapter.fetch_dashboard_snapshot()
-        with self._lock:
-            self._exchange_snapshot = snapshot
-            self._snapshot_at = now
-        return snapshot
+            if self._snapshot_refreshing:
+                self._snapshot_condition.wait(timeout=10)
+                if self._exchange_snapshot:
+                    return self._exchange_snapshot
+            self._snapshot_refreshing = True
+        try:
+            adapter = self._adapter(config, exchange_name)
+            snapshot = adapter.fetch_dashboard_snapshot()
+            with self._snapshot_condition:
+                self._exchange_snapshot = snapshot
+                self._snapshot_at = time.time()
+            return snapshot
+        except Exception as error:
+            with self._snapshot_condition:
+                if not self._exchange_snapshot:
+                    raise
+                stale = dict(self._exchange_snapshot)
+                stale["market"] = dict(stale.get("market") or {})
+                stale["market"]["stale"] = True
+                stale["private_available"] = False
+                stale["private_error"] = str(error)
+                stale["snapshot_error"] = str(error)
+                return stale
+        finally:
+            with self._snapshot_condition:
+                self._snapshot_refreshing = False
+                self._snapshot_condition.notify_all()
 
     def private_check(self) -> dict[str, Any]:
         config = self._config()
@@ -849,7 +883,7 @@ async function loadStatus(){try{renderStatus(await api('/api/status'))}catch(e){
 async function startEngine(){try{await api('/api/start',{method:'POST',body:JSON.stringify({exchange:$('runExchange').value})});toast('引擎已启动');loadStatus()}catch(e){toast(e.message)}}async function stopEngine(){try{await api('/api/stop',{method:'POST',body:'{}'});toast('引擎已停止');loadStatus()}catch(e){toast(e.message)}}async function privateCheck(){try{const d=await api('/api/private-check',{method:'POST',body:'{}'});toast(`私有 API 成功，权益 ${exact(d.equity_raw??d.equity)}`);loadStatus()}catch(e){toast(e.message)}}
 function summaryRows(rows){return rows.length?rows.map(r=>`<tr><td>${esc(r.period)}</td><td>${r.trades}</td><td>${pct(r.win_rate)}</td><td>${pnl(r.gross_pnl)}</td><td>${num(r.trading_fee)}</td><td>${num(r.total_cost)}</td><td>${pnl(r.net_pnl)}</td></tr>`).join(''):'<tr><td colspan="7" class="empty">暂无数据</td></tr>'}
 async function loadReports(){try{const q=new URLSearchParams();if($('fromDate').value)q.set('from',$('fromDate').value);if($('toDate').value)q.set('to',$('toDate').value);if($('reportExchange').value)q.set('exchange',$('reportExchange').value);const d=await api('/api/reports?'+q.toString()),s=d.stats;$('statTrades').textContent=s.trades;$('statWinRate').textContent=s.trades?`${(s.wins/s.trades*100).toFixed(2)}%`:'0%';$('statGross').innerHTML=pnl(s.gross_pnl);$('statCost').innerHTML=num(s.total_cost);$('statNet').innerHTML=pnl(s.net_pnl);$('tradesBody').innerHTML=d.trades.length?d.trades.map(r=>`<tr><td>${esc(r.exit_time)}</td><td>${esc(r.exchange)}</td><td>${esc(r.side)}</td><td>${num(r.entry_price,2)}</td><td>${num(r.exit_price,2)}</td><td>${num(r.quantity,5)}</td><td>${pnl(r.gross_pnl)}</td><td>${num(r.trading_fee)}</td><td>${num(r.total_cost)}</td><td>${pnl(r.net_pnl)}</td><td>${pct(r.net_pnl_pct)}</td><td>${pct(r.fee_ratio_pct)}</td><td>${esc(r.exit_reason)}</td></tr>`).join(''):'<tr><td colspan="13" class="empty">暂无交易记录</td></tr>';$('dailyBody').innerHTML=summaryRows(d.daily);$('monthlyBody').innerHTML=summaryRows(d.monthly)}catch(e){toast(e.message)}}
-$('saveBtn').onclick=saveConfig;$('configCheckBtn').onclick=privateCheck;$('startBtn').onclick=startEngine;$('stopBtn').onclick=stopEngine;$('privateBtn').onclick=privateCheck;$('reportBtn').onclick=loadReports;$('cfgExchange').onchange=()=>{$('runExchange').value=$('cfgExchange').value;if($('cfgExchange').value==='binance'&&/[-_]/.test($('symbol').value))$('symbol').value='BTCUSDT';syncEnvironmentUi()};$('cfgEnvironment').onchange=syncEnvironmentUi;$('cfgMode').onchange=syncEnvironmentUi;loadConfig();loadStatus();setInterval(loadStatus,1000);
+$('saveBtn').onclick=saveConfig;$('configCheckBtn').onclick=privateCheck;$('startBtn').onclick=startEngine;$('stopBtn').onclick=stopEngine;$('privateBtn').onclick=privateCheck;$('reportBtn').onclick=loadReports;$('cfgExchange').onchange=()=>{$('runExchange').value=$('cfgExchange').value;if($('cfgExchange').value==='binance'&&/[-_]/.test($('symbol').value))$('symbol').value='BTCUSDT';syncEnvironmentUi()};$('cfgEnvironment').onchange=syncEnvironmentUi;$('cfgMode').onchange=syncEnvironmentUi;loadConfig();loadStatus();setInterval(loadStatus,2000);
 </script>
 <script>
 async function loadOperations(){try{const q=new URLSearchParams();if($('operationsFrom').value)q.set('from',$('operationsFrom').value);if($('operationsTo').value)q.set('to',$('operationsTo').value);if($('operationsType').value)q.set('type',$('operationsType').value);if($('operationsQuery').value)q.set('q',$('operationsQuery').value);const d=await api('/api/operations?'+q.toString());$('operationPath').textContent=d.path;$('operationsBody').innerHTML=d.rows.length?d.rows.map(r=>{const detail=JSON.stringify({details:r.details||{},result:r.result||{}});return `<tr><td>${esc(r.local_time||r.timestamp)}</td><td>${esc(r.event_type)}</td><td>${esc(r.action)}</td><td>${esc(r.status)}</td><td>${esc(r.summary)}</td><td>${esc((r.changed_files||[]).join(', '))}</td><td title="${esc(detail)}">${esc(detail)}</td><td>${esc(r.source)}</td></tr>`}).join(''):'<tr><td colspan="8" class="empty">暂无操作日志</td></tr>'}catch(e){toast(e.message)}}

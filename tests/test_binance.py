@@ -7,7 +7,7 @@ import pytest
 from btc_futures_bot.exchanges.base import ExchangeSettings
 from btc_futures_bot.exchanges.binance import BinanceAdapter
 from btc_futures_bot.http_client import ApiError
-from btc_futures_bot.models import OrderRequest, Position
+from btc_futures_bot.models import Candle, OrderRequest, Position
 
 
 def _adapter() -> BinanceAdapter:
@@ -21,6 +21,69 @@ def _adapter() -> BinanceAdapter:
             api_secret_env="TEST_BINANCE_SECRET",
         )
     )
+
+
+def test_binance_websocket_cache_bootstraps_rest_only_once(monkeypatch) -> None:
+    adapter = _adapter()
+
+    class FakeStream:
+        def __init__(self) -> None:
+            self.rows: list[Candle] = []
+
+        def start(self) -> bool:
+            return True
+
+        def has_history(self, _interval: str, minimum: int) -> bool:
+            return len(self.rows) >= minimum
+
+        def candles(self, _interval: str, limit: int) -> list[Candle]:
+            return self.rows[-limit:]
+
+        def seed_candles(self, _interval: str, candles: list[Candle]) -> None:
+            self.rows = list(candles)
+
+        def healthy(self) -> bool:
+            return True
+
+    stream = FakeStream()
+    adapter._market_stream = stream
+    rest_rows = [
+        Candle(index, 100.0, 101.0, 99.0, 100.5, 1.0)
+        for index in range(300)
+    ]
+    reads = []
+
+    def fetch_rest(interval: str, limit: int) -> list[Candle]:
+        reads.append((interval, limit))
+        return rest_rows
+
+    monkeypatch.setattr(adapter, "_fetch_candles_rest", fetch_rest)
+
+    first = adapter.fetch_candles("1m", 300)
+    second = adapter.fetch_candles("1m", 300)
+
+    assert first == rest_rows
+    assert second == rest_rows
+    assert reads == [("1m", 300)]
+
+
+def test_binance_mark_price_prefers_websocket_without_rest(monkeypatch) -> None:
+    adapter = _adapter()
+
+    class FakeStream:
+        def start(self) -> bool:
+            return True
+
+        def mark_price(self):
+            return 65_001.25, 65_000.5, 1_700_000_000_000
+
+    adapter._market_stream = FakeStream()
+    monkeypatch.setattr(
+        "btc_futures_bot.exchanges.binance.request_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("REST must not be called")),
+    )
+
+    assert adapter.fetch_mark_price() == 65_001.25
 
 
 def _exchange_info() -> dict:

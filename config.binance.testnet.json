@@ -20,7 +20,7 @@
   },
   "poll_seconds": 15,
   "live_reconciliation_seconds": 5,
-  "dashboard_snapshot_seconds": 5,
+  "dashboard_snapshot_seconds": 15,
   "candle_refresh_seconds": {"1m": 1, "5m": 3, "1h": 15},
   "paper_equity": 10000.0,
   "candle_limit": 300,
@@ -185,6 +185,8 @@
       "base_url": "https://demo-fapi.binance.com",
       "symbol": "BTCUSDT",
       "contract_size": 1,
+      "websocket_enabled": true,
+      "websocket_stale_seconds": 15,
       "api_key_env": "BINANCE_TESTNET_API_KEY",
       "api_secret_env": "BINANCE_TESTNET_API_SECRET"
     },

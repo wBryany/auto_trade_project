@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 import math
+import threading
+import time
 
-from btc_futures_bot.dashboard import DASHBOARD_HTML, _json_safe, _order_sizing_view, _position_dict
+from btc_futures_bot.dashboard import (
+    DASHBOARD_HTML,
+    DashboardService,
+    _json_safe,
+    _order_sizing_view,
+    _position_dict,
+)
 from btc_futures_bot.models import Position
 
 
@@ -88,3 +96,45 @@ def test_dashboard_marks_live_take_profit_as_dynamic() -> None:
 
     assert live is not None and live["take_profit_mode"] == "dynamic"
     assert paper is not None and paper["take_profit_mode"] == "fixed"
+
+
+def test_dashboard_market_snapshot_is_single_flight_across_tabs() -> None:
+    service = DashboardService.__new__(DashboardService)
+    service._lock = threading.RLock()
+    service._snapshot_condition = threading.Condition(service._lock)
+    service._snapshot_refreshing = False
+    service._exchange_snapshot = {}
+    service._snapshot_at = 0.0
+
+    class Adapter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def fetch_dashboard_snapshot(self):
+            self.calls += 1
+            time.sleep(0.05)
+            return {"market": {"mark_price": 100.0}, "private_available": True}
+
+    adapter = Adapter()
+    service._adapter = lambda _config, _exchange: adapter
+    barrier = threading.Barrier(8)
+    results = []
+
+    def read_snapshot() -> None:
+        barrier.wait()
+        results.append(
+            service._market_snapshot(
+                {"dashboard_snapshot_seconds": 15},
+                "binance",
+            )
+        )
+
+    workers = [threading.Thread(target=read_snapshot) for _ in range(8)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=2)
+
+    assert adapter.calls == 1
+    assert len(results) == 8
+    assert all(result["market"]["mark_price"] == 100.0 for result in results)

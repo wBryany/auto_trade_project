@@ -22,6 +22,8 @@ class ExchangeSettings:
     margin_mode: str = "isolated"
     position_mode: str = "net"
     contract_size: float = 1.0
+    websocket_enabled: bool = False
+    websocket_stale_seconds: float = 15.0
 
 
 class ExchangeAdapter(ABC):
@@ -66,6 +68,11 @@ class ExchangeAdapter(ABC):
         if price <= 0:
             raise RuntimeError(f"{self.name}: mark price is unavailable for {self.settings.symbol}")
         return price
+
+    def close(self) -> None:
+        """Release optional exchange-specific background resources."""
+
+        return None
 
     def prepare_live(self, *, max_leverage: float) -> dict[str, Any]:
         """Validate credentials/account state before order-capable mode starts."""

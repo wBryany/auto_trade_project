@@ -167,7 +167,7 @@ def load_config(path: str) -> dict[str, Any]:
     with selected_path.open("r", encoding="utf-8") as file:
         config = json.load(file)
     config.setdefault("live_reconciliation_seconds", 5)
-    config.setdefault("dashboard_snapshot_seconds", 5)
+    config.setdefault("dashboard_snapshot_seconds", 15)
     config.setdefault("candle_refresh_seconds", {"1m": 1, "5m": 3, "1h": 15})
     for name in config.get("exchanges", {}):
         ensure_exchange_defaults(config, name)

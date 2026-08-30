@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .exchanges.base import ExchangeAdapter
+from .http_client import ApiError
 from .macro_risk import MacroRiskController, MacroRiskDecision
 from .models import Candle, OrderRequest, Position, Signal, TradeResult
 from .notifications import EmailNotifier
@@ -1426,19 +1427,25 @@ class TradingEngine:
                 LOG.exception("close email notification failed; position remains closed")
 
     def close(self) -> None:
+        close_adapter = getattr(self.adapter, "close", None)
+        if close_adapter is not None:
+            close_adapter()
         if self.notifier is not None:
             self.notifier.close()
 
     def run_forever(self) -> None:
         LOG.info("starting %s mode for %s; poll=%ss", self.config.mode, self.adapter.name, self.config.poll_seconds)
         while True:
+            retry_after = 0.0
             try:
                 result = self.evaluate_once()
                 if result.status not in {"no_action", "position_held"}:
                     LOG.warning("%s", result)
-            except Exception:
+            except Exception as error:
                 LOG.exception("cycle failed for %s; no new order submitted", self.adapter.name)
-            time.sleep(normalized_poll_seconds(self.config.poll_seconds))
+                if isinstance(error, ApiError) and error.rate_limited:
+                    retry_after = error.retry_after_seconds
+            time.sleep(max(float(normalized_poll_seconds(self.config.poll_seconds)), retry_after))
 
     @staticmethod
     def _opposite_side(side: str) -> str:

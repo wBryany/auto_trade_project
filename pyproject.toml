@@ -7,7 +7,10 @@ name = "btc-futures-bot"
 version = "0.1.0"
 description = "A dry-run-first multi-exchange BTC perpetual futures trading system"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "tzdata>=2025.2; platform_system == 'Windows'",
+    "websocket-client>=1.8,<2",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

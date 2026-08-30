@@ -9,6 +9,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any
 from urllib.parse import urlencode
 
+from ..binance_stream import BinanceMarketStream
 from ..http_client import ApiError, format_number, request_json
 from ..models import Candle, OrderRequest, Position
 from .base import ExchangeAdapter, ExchangeSettings, candle_limit_for
@@ -36,15 +37,57 @@ class BinanceAdapter(ExchangeAdapter):
             raise ValueError("Binance USD-M symbol must use exchange format, for example BTCUSDT")
         self._symbol_rules: dict[str, Decimal] | None = None
         self._server_time_offset_ms = 0
+        self._market_stream = (
+            BinanceMarketStream(
+                settings.symbol,
+                environment,
+                stale_seconds=settings.websocket_stale_seconds,
+            )
+            if settings.websocket_enabled
+            else None
+        )
+        self._rest_candle_refresh_at: dict[str, float] = {}
+        self._rest_mark_price: tuple[float, float, int] | None = None
+        self._rest_mark_price_at = 0.0
 
     def fetch_candles(self, interval: str, limit: int) -> list[Candle]:
+        requested_limit = candle_limit_for(interval, limit)
+        stream = self._market_stream
+        if stream is not None:
+            stream.start()
+            if stream.has_history(interval, requested_limit):
+                cached = stream.candles(interval, requested_limit)
+                if stream.healthy():
+                    return cached
+                refresh_at = self._rest_candle_refresh_at.get(interval, 0.0)
+                if time.monotonic() < refresh_at:
+                    return cached
+        candles = self._fetch_candles_rest(interval, requested_limit)
+        if stream is not None:
+            stream.seed_candles(interval, candles)
+            self._rest_candle_refresh_at[interval] = time.monotonic() + max(
+                30.0,
+                float(self.settings.websocket_stale_seconds),
+            )
+            return stream.candles(interval, requested_limit)
+        return candles
+
+    def _fetch_candles_rest(self, interval: str, limit: int) -> list[Candle]:
         payload = request_json(
             "GET",
             f"{self.base_url}/fapi/v1/klines",
-            params={"symbol": self.settings.symbol, "interval": interval, "limit": candle_limit_for(interval, limit)},
+            params={"symbol": self.settings.symbol, "interval": interval, "limit": limit},
         )
         return [
-            Candle(int(row[0]), float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5]))
+            Candle(
+                int(row[0]),
+                float(row[1]),
+                float(row[2]),
+                float(row[3]),
+                float(row[4]),
+                float(row[5]),
+                quote_volume=float(row[7]) if len(row) > 7 else None,
+            )
             for row in payload
         ]
 
@@ -53,6 +96,20 @@ class BinanceAdapter(ExchangeAdapter):
         return float(payload.get("totalWalletBalance") or payload.get("totalMarginBalance") or 0)
 
     def fetch_mark_price(self) -> float:
+        mark_price_raw, _index_price_raw, _timestamp, _source = self._market_prices()
+        return float(mark_price_raw)
+
+    def _market_prices(self) -> tuple[str, str, int, str]:
+        stream = self._market_stream
+        if stream is not None:
+            stream.start()
+            streamed = stream.mark_price()
+            if streamed is not None:
+                mark_price, index_price, timestamp = streamed
+                return str(mark_price), str(index_price), timestamp, "websocket"
+        if self._rest_mark_price is not None and time.monotonic() - self._rest_mark_price_at < 5.0:
+            mark_price, index_price, timestamp = self._rest_mark_price
+            return str(mark_price), str(index_price), timestamp, "rest_cache"
         premium_index = request_json(
             "GET",
             f"{self.base_url}/fapi/v1/premiumIndex",
@@ -61,18 +118,16 @@ class BinanceAdapter(ExchangeAdapter):
         mark_price = Decimal(str(premium_index.get("markPrice") or "0"))
         if mark_price <= 0:
             raise RuntimeError(f"Binance returned no mark price for {self.settings.symbol}")
-        return float(mark_price)
+        index_price = Decimal(str(premium_index.get("indexPrice") or "0"))
+        timestamp = int(premium_index.get("time") or self.now_ms())
+        self._rest_mark_price = (float(mark_price), float(index_price), timestamp)
+        self._rest_mark_price_at = time.monotonic()
+        return str(mark_price), str(index_price), timestamp, "rest"
 
     def fetch_dashboard_snapshot(self) -> dict[str, Any]:
-        premium_index = request_json(
-            "GET",
-            f"{self.base_url}/fapi/v1/premiumIndex",
-            params={"symbol": self.settings.symbol},
-        )
-        mark_price_raw = str(premium_index.get("markPrice") or "0")
+        mark_price_raw, index_price_raw, market_timestamp, price_source = self._market_prices()
         if Decimal(mark_price_raw) <= 0:
             raise RuntimeError(f"Binance returned no mark price for {self.settings.symbol}")
-        index_price_raw = str(premium_index.get("indexPrice") or "0")
         snapshot: dict[str, Any] = {
             "market": {
                 "symbol": self.settings.symbol,
@@ -83,14 +138,22 @@ class BinanceAdapter(ExchangeAdapter):
                 "last_price_raw": mark_price_raw,
                 "index_price": float(index_price_raw),
                 "index_price_raw": index_price_raw,
-                "price_source": "Binance USDⓈ-M 永续合约标记价格",
-                "price_endpoint": "/fapi/v1/premiumIndex",
-                "timestamp": int(premium_index.get("time") or self.now_ms()),
+                "price_source": (
+                    "Binance USDⓈ-M WebSocket 标记价格"
+                    if price_source == "websocket"
+                    else "Binance USDⓈ-M REST 标记价格"
+                ),
+                "price_endpoint": (
+                    "@markPrice@1s" if price_source == "websocket" else "/fapi/v1/premiumIndex"
+                ),
+                "timestamp": market_timestamp,
             },
             "positions": [],
             "open_orders": [],
             "private_available": False,
         }
+        if self._market_stream is not None:
+            snapshot["market"]["stream"] = self._market_stream.status()
         try:
             snapshot["order_limits"] = self.order_limits(mark_price_raw)
         except Exception as error:
@@ -219,6 +282,10 @@ class BinanceAdapter(ExchangeAdapter):
             snapshot["private_available"] = False
             snapshot["private_error"] = str(error)
         return snapshot
+
+    def close(self) -> None:
+        if self._market_stream is not None:
+            self._market_stream.close()
 
     def symbol_rules(self) -> dict[str, Decimal]:
         if self._symbol_rules is not None:
@@ -858,7 +925,11 @@ class BinanceAdapter(ExchangeAdapter):
                 if attempt == 0 and "-1021" in safe_message:
                     self._sync_server_time()
                     continue
-                raise ApiError(safe_message) from error
+                raise ApiError(
+                    safe_message,
+                    status_code=error.status_code,
+                    retry_at=error.retry_at,
+                ) from error
         raise ApiError("Binance signed request failed after server-time synchronization")
 
     def _sync_server_time(self) -> int:

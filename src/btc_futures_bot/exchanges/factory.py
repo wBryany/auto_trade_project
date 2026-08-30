@@ -21,6 +21,8 @@ def make_adapter(name: str, raw: dict[str, Any], account: dict[str, Any]) -> Exc
         margin_mode=str(account.get("margin_mode", "isolated")),
         position_mode=str(account.get("position_mode", "net")),
         contract_size=float(raw.get("contract_size", account.get("contract_size", 1.0))),
+        websocket_enabled=bool(raw.get("websocket_enabled", name == "binance")),
+        websocket_stale_seconds=float(raw.get("websocket_stale_seconds", 15.0)),
     )
     adapters = {"okx": OkxAdapter, "binance": BinanceAdapter, "gate": GateAdapter}
     try:
