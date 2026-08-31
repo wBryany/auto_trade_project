@@ -83,12 +83,29 @@ class StrategyConfig:
     traditional_pressure_sma_period: int = 30
     traditional_pressure_min_room_r: float = 0.8
     traditional_ultra_short_enabled: bool = False
+    traditional_ultra_short_countertrend_enabled: bool = False
+    traditional_ultra_short_countertrend_size_multiplier: float = 0.25
+    traditional_ultra_short_pressure_min_room_r: float = 0.15
     traditional_ultra_short_1m_lookback: int = 5
     traditional_ultra_short_1m_min_volume_ratio: float = 1.2
     traditional_ultra_short_1m_min_body_ratio: float = 0.35
     traditional_ultra_short_1m_min_close_location: float = 0.55
     traditional_ultra_short_1m_min_range_atr: float = 0.8
     traditional_ultra_short_1m_max_extension_atr: float = 1.0
+    traditional_ultra_short_1m_execution_max_extension_atr: float = 1.5
+    traditional_ultra_short_reversal_enabled: bool = False
+    traditional_ultra_short_reversal_pivot_bars: int = 3
+    traditional_ultra_short_reversal_rsi_long_max: float = 50.0
+    traditional_ultra_short_reversal_rsi_short_min: float = 50.0
+    traditional_ultra_short_reversal_1m_rsi_long_max: float = 36.0
+    traditional_ultra_short_reversal_1m_rsi_short_min: float = 64.0
+    traditional_ultra_short_reversal_min_body_ratio: float = 0.4
+    traditional_ultra_short_reversal_min_close_location: float = 0.6
+    traditional_ultra_short_reversal_min_range_atr: float = 0.75
+    traditional_ultra_short_reversal_max_extension_atr: float = 1.25
+    traditional_ultra_short_reversal_5m_min_volume_ratio: float = 0.9
+    traditional_ultra_short_reversal_1m_strong_volume_ratio: float = 1.25
+    traditional_ultra_short_reversal_1m_strong_range_atr: float = 1.5
     traditional_ultra_short_break_even_trigger_r: float = 0.7
     traditional_ultra_short_break_even_lock_r: float = 0.15
     traditional_ultra_short_trailing_trigger_r: float = 0.9
@@ -651,6 +668,20 @@ class MultiTimeframeStrategy:
             "short",
             self.config,
         )
+        ultra_pressure_long, _ = _traditional_pressure_room(
+            trigger_candles,
+            "long",
+            self.config,
+            minimum_room_r=self.config.traditional_ultra_short_pressure_min_room_r,
+            reference_price=execution.close,
+        )
+        ultra_pressure_short, _ = _traditional_pressure_room(
+            trigger_candles,
+            "short",
+            self.config,
+            minimum_room_r=self.config.traditional_ultra_short_pressure_min_room_r,
+            reference_price=execution.close,
+        )
 
         countertrend_cross_long = _traditional_countertrend_cross_regime(
             regime,
@@ -714,11 +745,17 @@ class MultiTimeframeStrategy:
         # setup and materially increases fee-heavy churn.
         ultra_short_context_long = (
             self.config.traditional_ultra_short_enabled
-            and not base_strong_trend_short
+            and (
+                self.config.traditional_ultra_short_countertrend_enabled
+                or not base_strong_trend_short
+            )
         )
         ultra_short_context_short = (
             self.config.traditional_ultra_short_enabled
-            and not base_strong_trend_long
+            and (
+                self.config.traditional_ultra_short_countertrend_enabled
+                or not base_strong_trend_long
+            )
         )
 
         long_checks = {
@@ -872,6 +909,115 @@ class MultiTimeframeStrategy:
         if predictive_reversal_short.side == "short":
             return predictive_reversal_short
 
+        # A reversal scalp is deliberately separate from the continuation
+        # branch below.  At a local turning point the completed 5m MACD is
+        # normally still on the old side of zero, so requiring a zero-line
+        # confirmation guarantees a late entry.  A fresh closed 1m swing
+        # reclaim supplies the timing instead.  The 1h trend changes sizing,
+        # while current 10m/15m averages still have to leave executable room.
+        reversal_long_context = (
+            trigger.macd_histogram is not None
+            and trigger.previous_macd_histogram is not None
+            and trigger.macd_histogram < 0
+            and trigger.rsi is not None
+            and trigger.rsi
+            <= float(self.config.traditional_ultra_short_reversal_rsi_long_max)
+            and (
+                trigger.macd_histogram >= trigger.previous_macd_histogram
+                or trigger.rsi
+                <= float(self.config.traditional_rsi_long_min) - 4.0
+                or (
+                    execution.rsi is not None
+                    and execution.rsi
+                    <= float(self.config.traditional_ultra_short_reversal_1m_rsi_long_max)
+                )
+            )
+        )
+        reversal_short_context = (
+            trigger.macd_histogram is not None
+            and trigger.previous_macd_histogram is not None
+            and trigger.macd_histogram > 0
+            and trigger.rsi is not None
+            and trigger.rsi
+            >= float(self.config.traditional_ultra_short_reversal_rsi_short_min)
+            and (
+                trigger.macd_histogram <= trigger.previous_macd_histogram
+                or trigger.rsi
+                >= float(self.config.traditional_rsi_short_max) + 6.0
+                or (
+                    execution.rsi is not None
+                    and execution.rsi
+                    >= float(self.config.traditional_ultra_short_reversal_1m_rsi_short_min)
+                )
+            )
+        )
+        reversal_long = (
+            self.config.traditional_ultra_short_enabled
+            and self.config.traditional_ultra_short_reversal_enabled
+            and (trend_long or ultra_short_context_long)
+            and reversal_long_context
+            and ultra_pressure_long
+            and _traditional_ultra_short_reversal_one_minute_trigger(
+                one_minute_candles,
+                execution,
+                trigger,
+                "long",
+                self.config,
+            )
+        )
+        reversal_short = (
+            self.config.traditional_ultra_short_enabled
+            and self.config.traditional_ultra_short_reversal_enabled
+            and (trend_short or ultra_short_context_short)
+            and reversal_short_context
+            and ultra_pressure_short
+            and _traditional_ultra_short_reversal_one_minute_trigger(
+                one_minute_candles,
+                execution,
+                trigger,
+                "short",
+                self.config,
+            )
+        )
+        if reversal_long and not reversal_short:
+            regime_reason = (
+                f"{regime_name}_ultra_short_countertrend_long"
+                if base_strong_trend_short
+                else f"{regime_name}_ultra_short_reversal_context_long"
+            )
+            return Signal(
+                "long",
+                6,
+                one_minute_candles[-1].timestamp,
+                (
+                    regime_reason,
+                    f"{trigger_name}_macd_reversal_context_long",
+                    f"{trigger_name}_rsi_reversal_zone",
+                    "10m_15m_reversal_room_clear",
+                    "1m_ultra_short_reversal_long",
+                    "1m_swing_low_reclaimed",
+                ),
+            )
+        if reversal_short and not reversal_long:
+            regime_reason = (
+                f"{regime_name}_ultra_short_countertrend_short"
+                if base_strong_trend_long
+                else f"{regime_name}_ultra_short_reversal_context_short"
+            )
+            return Signal(
+                "short",
+                6,
+                one_minute_candles[-1].timestamp,
+                (
+                    regime_reason,
+                    f"{trigger_name}_macd_reversal_context_short",
+                    f"{trigger_name}_rsi_reversal_zone",
+                    "10m_15m_reversal_room_clear",
+                    "1m_ultra_short_reversal_short",
+                    "1m_swing_high_rejected",
+                ),
+            )
+
         # A fast impulse branch closes the timing gap between a quiet completed
         # 5-minute context bar and the next 5-minute bar becoming overextended.
         # It still uses only closed candles: the higher timeframes establish a
@@ -946,7 +1092,7 @@ class MultiTimeframeStrategy:
             and trigger.previous_macd_histogram is not None
             and trigger.macd_histogram >= trigger.previous_macd_histogram
             and rsi_long
-            and pressure_long
+            and ultra_pressure_long
             and _traditional_ultra_short_higher_timeframe_alignment(
                 trigger_candles,
                 "long",
@@ -967,7 +1113,7 @@ class MultiTimeframeStrategy:
             and trigger.previous_macd_histogram is not None
             and trigger.macd_histogram <= trigger.previous_macd_histogram
             and rsi_short
-            and pressure_short
+            and ultra_pressure_short
             and _traditional_ultra_short_higher_timeframe_alignment(
                 trigger_candles,
                 "short",
@@ -983,9 +1129,13 @@ class MultiTimeframeStrategy:
         )
         if ultra_short_long and not ultra_short_short:
             regime_reason = (
-                f"{regime_name}_strong_trend_up"
-                if strong_trend_long
-                else f"{regime_name}_ultra_short_context_long"
+                f"{regime_name}_ultra_short_countertrend_long"
+                if base_strong_trend_short
+                else (
+                    f"{regime_name}_strong_trend_up"
+                    if strong_trend_long
+                    else f"{regime_name}_ultra_short_context_long"
+                )
             )
             return Signal(
                 "long",
@@ -1002,9 +1152,13 @@ class MultiTimeframeStrategy:
             )
         if ultra_short_short and not ultra_short_long:
             regime_reason = (
-                f"{regime_name}_strong_trend_down"
-                if strong_trend_short
-                else f"{regime_name}_ultra_short_context_short"
+                f"{regime_name}_ultra_short_countertrend_short"
+                if base_strong_trend_long
+                else (
+                    f"{regime_name}_strong_trend_down"
+                    if strong_trend_short
+                    else f"{regime_name}_ultra_short_context_short"
+                )
             )
             return Signal(
                 "short",
@@ -1790,6 +1944,9 @@ def _traditional_pressure_room(
     trigger_candles: Sequence[Candle],
     side: str,
     config: StrategyConfig,
+    *,
+    minimum_room_r: float | None = None,
+    reference_price: float | None = None,
 ) -> tuple[bool, str]:
     """Reject entries with insufficient room to a 10m/15m moving average.
 
@@ -1805,7 +1962,11 @@ def _traditional_pressure_room(
     if not trigger_candles:
         return False, "insufficient_5m_history"
 
-    price = float(trigger_candles[-1].close)
+    price = float(
+        trigger_candles[-1].close
+        if reference_price is None
+        else reference_price
+    )
     levels, error = _traditional_higher_timeframe_average_levels(trigger_candles, config)
     if price <= 0:
         return False, "invalid_pressure_price"
@@ -1822,7 +1983,12 @@ def _traditional_pressure_room(
     if not barriers:
         return True, "no_overhead_or_underfoot_average"
     room_pct, barrier_name = min(barriers, key=lambda item: item[0])
-    required_room_pct = max(0.0, float(config.traditional_pressure_min_room_r)) * max(
+    selected_room_r = (
+        config.traditional_pressure_min_room_r
+        if minimum_room_r is None
+        else minimum_room_r
+    )
+    required_room_pct = max(0.0, float(selected_room_r)) * max(
         0.0,
         float(config.min_stop_loss_pct),
     )
@@ -2194,20 +2360,34 @@ def signal_stop_loss_overrides(
 def signal_stop_timeframe(signal: Signal, config: StrategyConfig) -> str:
     """Use the timeframe that contains the structure which armed the signal."""
 
-    if "1m_predictive_reversal_short" in signal.reasons:
+    if "1m_predictive_reversal_short" in signal.reasons or any(
+        reason.startswith("1m_ultra_short_") for reason in signal.reasons
+    ):
         return "1m"
     return config.trigger_timeframe
 
 
-def signal_position_size_multiplier(signal: Signal) -> float:
+def signal_position_size_multiplier(
+    signal: Signal,
+    config: StrategyConfig | None = None,
+) -> float:
     """Use half size for guarded countertrend, transition and fast signals."""
+    if any("_ultra_short_countertrend_" in reason for reason in signal.reasons):
+        selected = (
+            0.25
+            if config is None
+            else float(config.traditional_ultra_short_countertrend_size_multiplier)
+        )
+        return max(0.05, min(0.5, selected))
     if any(
         "_countertrend_pullback_" in reason
         or "_neutral_transition_" in reason
         or "_ultra_short_context_" in reason
+        or "_ultra_short_reversal_context_" in reason
         or "_structural_scalp_recovery_" in reason
         or reason.startswith("1m_impulse_")
         or reason.startswith("1m_ultra_short_trigger_")
+        or reason.startswith("1m_ultra_short_reversal_")
         or reason == "1m_predictive_reversal_short"
         or reason == "failed_breakout_short_reversal"
         for reason in signal.reasons
@@ -2422,7 +2602,7 @@ def _traditional_ultra_short_one_minute_trigger(
         return False
     if not _traditional_execution(execution, side):
         return False
-    if not _traditional_execution_quality(execution, side, config):
+    if not _traditional_ultra_short_execution_quality(execution, side, config):
         return False
     previous = _traditional_features(
         candles[:-1],
@@ -2493,17 +2673,192 @@ def _traditional_ultra_short_one_minute_trigger(
     return context_ready and (range_break or fast_reclaim or ema_cross or momentum_kick)
 
 
+def _traditional_ultra_short_execution_quality(
+    feature: _TraditionalFeatures,
+    side: str,
+    config: StrategyConfig,
+) -> bool:
+    """Apply a dedicated anti-chase cap to a fresh ultra-short trigger."""
+
+    if (
+        side not in {"long", "short"}
+        or feature.ema_fast is None
+        or feature.atr is None
+        or feature.atr <= 0
+        or feature.rsi is None
+    ):
+        return False
+    extension_cap = max(
+        0.0,
+        float(config.traditional_ultra_short_1m_execution_max_extension_atr),
+    )
+    if extension_cap and abs(feature.close - feature.ema_fast) / feature.atr > extension_cap:
+        return False
+    if side == "long":
+        rsi_cap = max(0.0, float(config.traditional_execution_rsi_long_max))
+        return not rsi_cap or feature.rsi <= rsi_cap
+    rsi_floor = max(0.0, float(config.traditional_execution_rsi_short_min))
+    return not rsi_floor or feature.rsi >= rsi_floor
+
+
+def _traditional_ultra_short_reversal_one_minute_trigger(
+    candles: Sequence[Candle],
+    execution: _TraditionalFeatures,
+    trigger: _TraditionalFeatures,
+    side: str,
+    config: StrategyConfig,
+) -> bool:
+    """Confirm a fresh 1m swing rejection before the completed 5m MACD flips.
+
+    The preceding one-to-three candles must print a new local extreme.  The
+    current candle then has to reclaim the previous candle's full range with
+    improving 1m MACD.  Either the reclaim or the pivot must show sufficient
+    volume/range effort, which accepts exhaustion reversals without allowing a
+    quiet EMA wiggle to become a trade.
+    """
+
+    lookback = max(4, int(config.traditional_ultra_short_1m_lookback))
+    pivot_bars = max(
+        1,
+        min(5, int(config.traditional_ultra_short_reversal_pivot_bars)),
+    )
+    if (
+        side not in {"long", "short"}
+        or len(candles) < lookback + pivot_bars + 2
+        or execution.macd_histogram is None
+        or execution.previous_macd_histogram is None
+        or execution.atr is None
+        or execution.atr <= 0
+        or execution.volume_ratio is None
+        or trigger.ema_fast is None
+        or trigger.atr is None
+        or trigger.atr <= 0
+    ):
+        return False
+
+    current_index = len(candles) - 1
+    pivot_start = current_index - pivot_bars
+    pivot_window = candles[pivot_start:current_index]
+    prior_window = candles[max(0, pivot_start - lookback):pivot_start]
+    if not pivot_window or not prior_window:
+        return False
+
+    if side == "long":
+        pivot_index = min(
+            range(pivot_start, current_index),
+            key=lambda index: float(candles[index].low),
+        )
+    else:
+        pivot_index = max(
+            range(pivot_start, current_index),
+            key=lambda index: float(candles[index].high),
+        )
+    pivot = candles[pivot_index]
+    pivot_feature = _traditional_features(
+        candles[:pivot_index + 1],
+        config.traditional_signal_fast,
+        config.traditional_signal_slow,
+        config.traditional_rsi_period,
+        config.traditional_macd_fast,
+        config.traditional_macd_slow,
+        config.traditional_macd_signal,
+        config.traditional_atr_period,
+        config.traditional_volume_sma_period,
+    )
+    if pivot_feature.atr is None or pivot_feature.atr <= 0:
+        return False
+
+    current = candles[-1]
+    current_range = float(current.high) - float(current.low)
+    pivot_range = float(pivot.high) - float(pivot.low)
+    if current_range <= 0 or pivot_range <= 0:
+        return False
+    body_ratio = abs(float(current.close) - float(current.open)) / current_range
+    close_location = (
+        (float(current.close) - float(current.low)) / current_range
+        if side == "long"
+        else (float(current.high) - float(current.close)) / current_range
+    )
+    range_atr = current_range / execution.atr
+    extension_atr = abs(execution.close - trigger.ema_fast) / trigger.atr
+    effort_ready = (
+        execution.volume_ratio
+        >= max(0.0, float(config.traditional_ultra_short_1m_min_volume_ratio))
+        or (
+            pivot_feature.volume_ratio is not None
+            and pivot_feature.volume_ratio
+            >= max(0.0, float(config.traditional_ultra_short_1m_min_volume_ratio))
+        )
+        or pivot_range / pivot_feature.atr
+        >= max(
+            0.0,
+            float(config.traditional_ultra_short_reversal_min_range_atr) * 1.5,
+        )
+    )
+    wave_effort_ready = (
+        (
+            trigger.volume_ratio is not None
+            and trigger.volume_ratio
+            >= max(
+                0.0,
+                float(config.traditional_ultra_short_reversal_5m_min_volume_ratio),
+            )
+        )
+        or execution.volume_ratio
+        >= max(
+            0.0,
+            float(config.traditional_ultra_short_reversal_1m_strong_volume_ratio),
+        )
+        or range_atr
+        >= max(
+            0.0,
+            float(config.traditional_ultra_short_reversal_1m_strong_range_atr),
+        )
+    )
+    if (
+        not effort_ready
+        or not wave_effort_ready
+        or body_ratio
+        < max(0.0, float(config.traditional_ultra_short_reversal_min_body_ratio))
+        or close_location
+        < max(0.0, float(config.traditional_ultra_short_reversal_min_close_location))
+        or range_atr
+        < max(0.0, float(config.traditional_ultra_short_reversal_min_range_atr))
+        or extension_atr
+        > max(0.0, float(config.traditional_ultra_short_reversal_max_extension_atr))
+    ):
+        return False
+
+    previous = candles[-2]
+    if side == "long":
+        fresh_extreme = float(pivot.low) <= min(float(candle.low) for candle in prior_window)
+        confirmed = (
+            float(current.close) > float(current.open)
+            and float(current.close) > float(previous.high)
+            and execution.macd_histogram > execution.previous_macd_histogram
+        )
+    else:
+        fresh_extreme = float(pivot.high) >= max(float(candle.high) for candle in prior_window)
+        confirmed = (
+            float(current.close) < float(current.open)
+            and float(current.close) < float(previous.low)
+            and execution.macd_histogram < execution.previous_macd_histogram
+        )
+    return fresh_extreme and confirmed
+
+
 def _traditional_ultra_short_higher_timeframe_alignment(
     trigger_candles: Sequence[Candle],
     side: str,
     config: StrategyConfig,
 ) -> bool:
-    """Require synthesized 10m/15m trend to agree before a fast entry.
+    """Require one supportive 10m/15m structure and no opposing structure.
 
-    The slower EMA30/SMA30 cluster remains the pressure barrier.  This gate
-    uses the strategy EMA9/EMA21 pair and MACD acceleration to make sure the
-    nearer 10m and 15m structure has actually turned, rather than entering on
-    an isolated 1m bounce inside a broader decline (or the inverse for shorts).
+    Requiring both synthesized timeframes to complete EMA9/EMA21 ordering made
+    the fast path confirm only after most of a short wave had elapsed. One
+    timeframe may now be in a MACD/EMA transition while the other remains
+    neutral. A genuinely opposing structure on either timeframe still vetoes
+    the entry.
     """
 
     configured = config.traditional_pressure_timeframes_minutes
@@ -2512,6 +2867,7 @@ def _traditional_ultra_short_higher_timeframe_alignment(
     timeframes = tuple(sorted({int(value) for value in configured}))
     if side not in {"long", "short"} or not timeframes:
         return False
+    supportive_timeframes = 0
     for minutes in timeframes:
         aggregated = _aggregate_five_minute_candles(trigger_candles, minutes)
         minimum = max(
@@ -2531,29 +2887,62 @@ def _traditional_ultra_short_higher_timeframe_alignment(
             config.traditional_atr_period,
             config.traditional_volume_sma_period,
         )
-        if (
-            feature.ema_fast is None
-            or feature.ema_slow is None
-            or feature.previous_ema_fast is None
-            or feature.macd_histogram is None
-            or feature.previous_macd_histogram is None
-        ):
+        supportive, opposing = _traditional_ultra_short_timeframe_support(
+            feature,
+            side,
+        )
+        if opposing:
             return False
-        if side == "long" and not (
+        supportive_timeframes += int(supportive)
+    return supportive_timeframes >= 1
+
+
+def _traditional_ultra_short_timeframe_support(
+    feature: _TraditionalFeatures,
+    side: str,
+) -> tuple[bool, bool]:
+    """Return ``(supportive, opposing)`` for one synthesized timeframe."""
+
+    if (
+        side not in {"long", "short"}
+        or feature.ema_fast is None
+        or feature.ema_slow is None
+        or feature.previous_ema_fast is None
+        or feature.macd_histogram is None
+        or feature.previous_macd_histogram is None
+    ):
+        return False, False
+    if side == "long":
+        opposing = (
+            feature.close <= feature.ema_fast <= feature.ema_slow
+            and feature.macd_histogram < 0
+        )
+        ordered = (
             feature.close >= feature.ema_fast >= feature.ema_slow
+            and feature.macd_histogram > 0
+        )
+        transitioning = (
+            feature.close >= feature.ema_fast
             and feature.ema_fast >= feature.previous_ema_fast
             and feature.macd_histogram > 0
             and feature.macd_histogram >= feature.previous_macd_histogram
-        ):
-            return False
-        if side == "short" and not (
-            feature.close <= feature.ema_fast <= feature.ema_slow
-            and feature.ema_fast <= feature.previous_ema_fast
-            and feature.macd_histogram < 0
-            and feature.macd_histogram <= feature.previous_macd_histogram
-        ):
-            return False
-    return True
+        )
+        return ordered or transitioning, opposing
+    opposing = (
+        feature.close >= feature.ema_fast >= feature.ema_slow
+        and feature.macd_histogram > 0
+    )
+    ordered = (
+        feature.close <= feature.ema_fast <= feature.ema_slow
+        and feature.macd_histogram < 0
+    )
+    transitioning = (
+        feature.close <= feature.ema_fast
+        and feature.ema_fast <= feature.previous_ema_fast
+        and feature.macd_histogram < 0
+        and feature.macd_histogram <= feature.previous_macd_histogram
+    )
+    return ordered or transitioning, opposing
 
 
 def _traditional_breakout_quality(feature: _TraditionalFeatures, side: str, config: StrategyConfig) -> bool:

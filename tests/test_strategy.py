@@ -28,7 +28,9 @@ from btc_futures_bot.strategy import (
     _traditional_reclaim_quality,
     _traditional_structural_scalp_regime,
     _traditional_strong_regime_quality,
+    _traditional_ultra_short_timeframe_support,
     _traditional_ultra_short_one_minute_trigger,
+    _traditional_ultra_short_reversal_one_minute_trigger,
     _traditional_setup_macd_handoff,
     _traditional_setup_volume_handoff,
     dynamic_stop_loss_pct,
@@ -98,6 +100,151 @@ def test_ultra_short_one_minute_trigger_requires_fresh_volume_break() -> None:
         "trailing_trigger_r": 0.9,
         "trailing_distance_r": 0.35,
     }
+
+
+def test_ultra_short_timeframe_accepts_transition_but_vetoes_opposition() -> None:
+    transitioning_long = _TraditionalFeatures(
+        open=100.0,
+        high=101.2,
+        low=99.8,
+        close=101.0,
+        previous_close=100.2,
+        ema_fast=100.5,
+        previous_ema_fast=100.3,
+        ema_slow=101.2,
+        previous_ema_slow=101.3,
+        rsi=55.0,
+        macd_histogram=0.4,
+        previous_macd_histogram=0.2,
+        atr=1.0,
+        volume_ratio=1.2,
+    )
+
+    assert _traditional_ultra_short_timeframe_support(
+        transitioning_long,
+        "long",
+    ) == (True, False)
+    assert _traditional_ultra_short_timeframe_support(
+        replace(
+            transitioning_long,
+            close=99.0,
+            ema_fast=100.0,
+            ema_slow=101.0,
+            macd_histogram=-0.4,
+            previous_macd_histogram=-0.2,
+        ),
+        "long",
+    ) == (False, True)
+    assert _traditional_ultra_short_timeframe_support(
+        replace(
+            transitioning_long,
+            close=99.0,
+            ema_fast=100.0,
+            previous_ema_fast=100.2,
+            ema_slow=101.0,
+            macd_histogram=-0.4,
+            previous_macd_histogram=-0.2,
+        ),
+        "short",
+    ) == (True, False)
+
+
+def test_ultra_short_reversal_reclaims_a_fresh_one_minute_extreme() -> None:
+    candles = [
+        Candle(index * 60_000, 100.0, 100.2, 99.8, 100.0, 10.0)
+        for index in range(30)
+    ]
+    candles[-2] = Candle(candles[-2].timestamp, 100.0, 100.1, 98.8, 99.2, 25.0)
+    candles[-1] = Candle(candles[-1].timestamp, 99.2, 100.5, 99.1, 100.4, 25.0)
+    execution = _TraditionalFeatures(
+        open=99.2,
+        high=100.5,
+        low=99.1,
+        close=100.4,
+        previous_close=99.2,
+        ema_fast=99.8,
+        previous_ema_fast=99.7,
+        ema_slow=100.0,
+        previous_ema_slow=100.0,
+        rsi=45.0,
+        macd_histogram=0.4,
+        previous_macd_histogram=-0.2,
+        atr=1.0,
+        volume_ratio=2.0,
+    )
+    trigger = replace(execution, close=99.5, ema_fast=100.0, atr=1.0, volume_ratio=1.0)
+    config = StrategyConfig(
+        traditional_signal_fast=3,
+        traditional_signal_slow=5,
+        traditional_rsi_period=3,
+        traditional_macd_fast=3,
+        traditional_macd_slow=6,
+        traditional_macd_signal=2,
+        traditional_atr_period=3,
+        traditional_volume_sma_period=5,
+        traditional_ultra_short_1m_lookback=8,
+        traditional_ultra_short_1m_min_volume_ratio=0.9,
+        traditional_ultra_short_reversal_pivot_bars=3,
+        traditional_ultra_short_reversal_max_extension_atr=1.25,
+    )
+
+    assert _traditional_ultra_short_reversal_one_minute_trigger(
+        candles,
+        execution,
+        trigger,
+        "long",
+        config,
+    )
+    assert not _traditional_ultra_short_reversal_one_minute_trigger(
+        candles,
+        replace(execution, volume_ratio=0.5, atr=1.1),
+        replace(trigger, volume_ratio=0.5),
+        "long",
+        config,
+    )
+
+    short_candles = [
+        Candle(candle.timestamp, 200.0 - candle.open, 200.0 - candle.low, 200.0 - candle.high, 200.0 - candle.close, candle.volume)
+        for candle in candles
+    ]
+    short_execution = replace(
+        execution,
+        open=100.8,
+        high=100.9,
+        low=99.5,
+        close=99.6,
+        previous_close=100.8,
+        ema_fast=100.2,
+        previous_ema_fast=100.3,
+        macd_histogram=-0.4,
+        previous_macd_histogram=0.2,
+        rsi=55.0,
+    )
+    assert _traditional_ultra_short_reversal_one_minute_trigger(
+        short_candles,
+        short_execution,
+        replace(trigger, close=100.5, ema_fast=100.0),
+        "short",
+        config,
+    )
+
+
+def test_ultra_short_countertrend_uses_smaller_size_and_one_minute_stop() -> None:
+    config = StrategyConfig(
+        traditional_ultra_short_countertrend_size_multiplier=0.3,
+    )
+    signal = Signal(
+        "short",
+        6,
+        1,
+        (
+            "1h_ultra_short_countertrend_short",
+            "1m_ultra_short_reversal_short",
+        ),
+    )
+
+    assert signal_position_size_multiplier(signal, config) == 0.3
+    assert signal_stop_timeframe(signal, config) == "1m"
 
 
 def test_pullback_quality_rejects_a_large_extended_volume_spike() -> None:
@@ -349,6 +496,12 @@ def test_pressure_filter_aggregates_10m_and_15m_without_extra_market_data() -> N
     assert clear is False
     assert "room=" in reason
     assert "required=" in reason
+    assert _traditional_pressure_room(
+        candles,
+        "long",
+        config,
+        minimum_room_r=0.0,
+    )[0] is True
 
     far_resistance = [
         Candle(index * 300_000, 101.0, 101.1, 99.9, 101.0, 10.0)

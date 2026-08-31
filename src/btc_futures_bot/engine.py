@@ -277,7 +277,10 @@ class TradingEngine:
             current_price,
             self.config.take_profit_r,
             stop_loss_pct=dynamic_stop_pct,
-            size_multiplier=signal_position_size_multiplier(signal),
+            size_multiplier=signal_position_size_multiplier(
+                signal,
+                self.strategy.config,
+            ),
         )
         if not self.risk.is_cost_effective(signal.side, current_price, protection.take_profit_price, protection.quantity):
             return TradeResult(self.adapter.name, "cost_blocked", signal=signal, position=self.position)

@@ -342,7 +342,10 @@ def run_backtest(
                 entry_price,
                 strategy.config.take_profit_r,
                 stop_loss_pct=stop_loss_pct,
-                size_multiplier=signal_position_size_multiplier(signal),
+                size_multiplier=signal_position_size_multiplier(
+                    signal,
+                    strategy.config,
+                ),
             )
             if not risk.is_cost_effective(signal.side, entry_price, protection.take_profit_price, protection.quantity):
                 continue
