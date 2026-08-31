@@ -106,8 +106,18 @@ class StrategyConfig:
     traditional_ultra_short_reversal_5m_min_volume_ratio: float = 0.9
     traditional_ultra_short_reversal_1m_strong_volume_ratio: float = 1.25
     traditional_ultra_short_reversal_1m_strong_range_atr: float = 1.5
+    traditional_ultra_short_pullback_reversal_enabled: bool = False
+    traditional_ultra_short_pullback_reversal_rsi_long_max: float = 55.0
+    traditional_ultra_short_pullback_reversal_rsi_short_min: float = 45.0
+    traditional_ultra_short_pullback_reversal_1m_rsi_long_max: float = 50.0
+    traditional_ultra_short_pullback_reversal_1m_rsi_short_min: float = 50.0
+    traditional_ultra_short_pullback_resumption_enabled: bool = False
+    traditional_ultra_short_pullback_resumption_1m_rsi_long_max: float = 55.0
+    traditional_ultra_short_pullback_resumption_1m_rsi_short_min: float = 45.0
+    traditional_ultra_short_pullback_resumption_max_volume_ratio: float = 3.0
     traditional_ultra_short_break_even_trigger_r: float = 0.7
     traditional_ultra_short_break_even_lock_r: float = 0.15
+    traditional_ultra_short_break_even_activation_buffer_r: float = 0.05
     traditional_ultra_short_trailing_trigger_r: float = 0.9
     traditional_ultra_short_trailing_distance_r: float = 0.35
     traditional_structural_scalp_enabled: bool = False
@@ -170,6 +180,7 @@ class StrategyConfig:
     time_exit_min_r: float = 0.5
     break_even_trigger_r: float = 1.25
     break_even_lock_r: float = 0.5
+    break_even_activation_buffer_r: float = 0.05
     trailing_trigger_r: float = 2.0
     trailing_distance_r: float = 0.75
     enable_profit_trend_exit: bool = True
@@ -951,6 +962,22 @@ class MultiTimeframeStrategy:
                 )
             )
         )
+        pullback_reversal_long_context = _traditional_ultra_short_pullback_reversal_context(
+            trigger,
+            execution,
+            "long",
+            strong_trend_long,
+            self.config,
+        )
+        pullback_reversal_short_context = _traditional_ultra_short_pullback_reversal_context(
+            trigger,
+            execution,
+            "short",
+            strong_trend_short,
+            self.config,
+        )
+        reversal_long_context = reversal_long_context or pullback_reversal_long_context
+        reversal_short_context = reversal_short_context or pullback_reversal_short_context
         reversal_long = (
             self.config.traditional_ultra_short_enabled
             and self.config.traditional_ultra_short_reversal_enabled
@@ -991,7 +1018,11 @@ class MultiTimeframeStrategy:
                 one_minute_candles[-1].timestamp,
                 (
                     regime_reason,
-                    f"{trigger_name}_macd_reversal_context_long",
+                    (
+                        f"{trigger_name}_pullback_reversal_context_long"
+                        if pullback_reversal_long_context
+                        else f"{trigger_name}_macd_reversal_context_long"
+                    ),
                     f"{trigger_name}_rsi_reversal_zone",
                     "10m_15m_reversal_room_clear",
                     "1m_ultra_short_reversal_long",
@@ -1010,7 +1041,11 @@ class MultiTimeframeStrategy:
                 one_minute_candles[-1].timestamp,
                 (
                     regime_reason,
-                    f"{trigger_name}_macd_reversal_context_short",
+                    (
+                        f"{trigger_name}_pullback_reversal_context_short"
+                        if pullback_reversal_short_context
+                        else f"{trigger_name}_macd_reversal_context_short"
+                    ),
                     f"{trigger_name}_rsi_reversal_zone",
                     "10m_15m_reversal_room_clear",
                     "1m_ultra_short_reversal_short",
@@ -1085,12 +1120,49 @@ class MultiTimeframeStrategy:
         # context and a fresh completed 1m reclaim/break as the actual trigger.
         # It deliberately does not require a second 5m setup or 5m volume
         # confirmation; the 1m trigger provides both freshness and volume.
+        pullback_resumption_long = (
+            self.config.traditional_ultra_short_pullback_resumption_enabled
+            and strong_trend_long
+            and macd_long
+            and trigger.previous_macd_histogram is not None
+            and trigger.macd_histogram < trigger.previous_macd_histogram
+            and execution.rsi is not None
+            and execution.volume_ratio is not None
+            and execution.volume_ratio
+            <= float(
+                self.config.traditional_ultra_short_pullback_resumption_max_volume_ratio
+            )
+            and execution.rsi
+            <= float(
+                self.config.traditional_ultra_short_pullback_resumption_1m_rsi_long_max
+            )
+        )
+        pullback_resumption_short = (
+            self.config.traditional_ultra_short_pullback_resumption_enabled
+            and strong_trend_short
+            and macd_short
+            and trigger.previous_macd_histogram is not None
+            and trigger.macd_histogram > trigger.previous_macd_histogram
+            and execution.rsi is not None
+            and execution.volume_ratio is not None
+            and execution.volume_ratio
+            <= float(
+                self.config.traditional_ultra_short_pullback_resumption_max_volume_ratio
+            )
+            and execution.rsi
+            >= float(
+                self.config.traditional_ultra_short_pullback_resumption_1m_rsi_short_min
+            )
+        )
         ultra_short_long = (
             self.config.traditional_ultra_short_enabled
             and (trend_long or ultra_short_context_long)
             and macd_long
             and trigger.previous_macd_histogram is not None
-            and trigger.macd_histogram >= trigger.previous_macd_histogram
+            and (
+                trigger.macd_histogram >= trigger.previous_macd_histogram
+                or pullback_resumption_long
+            )
             and rsi_long
             and ultra_pressure_long
             and _traditional_ultra_short_higher_timeframe_alignment(
@@ -1111,7 +1183,10 @@ class MultiTimeframeStrategy:
             and (trend_short or ultra_short_context_short)
             and macd_short
             and trigger.previous_macd_histogram is not None
-            and trigger.macd_histogram <= trigger.previous_macd_histogram
+            and (
+                trigger.macd_histogram <= trigger.previous_macd_histogram
+                or pullback_resumption_short
+            )
             and rsi_short
             and ultra_pressure_short
             and _traditional_ultra_short_higher_timeframe_alignment(
@@ -1143,7 +1218,11 @@ class MultiTimeframeStrategy:
                 one_minute_candles[-1].timestamp,
                 (
                     regime_reason,
-                    f"{trigger_name}_macd_positive",
+                    (
+                        f"{trigger_name}_macd_pullback_resumption_long"
+                        if pullback_resumption_long
+                        else f"{trigger_name}_macd_positive"
+                    ),
                     f"{trigger_name}_rsi_long_zone",
                     "10m_15m_pressure_clear",
                     "1m_ultra_short_trigger_long",
@@ -1166,7 +1245,11 @@ class MultiTimeframeStrategy:
                 one_minute_candles[-1].timestamp,
                 (
                     regime_reason,
-                    f"{trigger_name}_macd_negative",
+                    (
+                        f"{trigger_name}_macd_pullback_resumption_short"
+                        if pullback_resumption_short
+                        else f"{trigger_name}_macd_negative"
+                    ),
                     f"{trigger_name}_rsi_short_zone",
                     "10m_15m_pressure_clear",
                     "1m_ultra_short_trigger_short",
@@ -2420,6 +2503,10 @@ def signal_trade_management_overrides(
                 0.0,
                 float(config.traditional_ultra_short_break_even_lock_r),
             ),
+            "break_even_activation_buffer_r": max(
+                0.0,
+                float(config.traditional_ultra_short_break_even_activation_buffer_r),
+            ),
             "trailing_trigger_r": max(
                 0.0,
                 float(config.traditional_ultra_short_trailing_trigger_r),
@@ -2441,6 +2528,10 @@ def signal_trade_management_overrides(
         "break_even_lock_r": max(
             0.0,
             float(config.traditional_structural_scalp_break_even_lock_r),
+        ),
+        "break_even_activation_buffer_r": max(
+            0.0,
+            float(config.break_even_activation_buffer_r),
         ),
         "trailing_trigger_r": max(
             0.0,
@@ -2781,19 +2872,44 @@ def _traditional_ultra_short_reversal_one_minute_trigger(
     )
     range_atr = current_range / execution.atr
     extension_atr = abs(execution.close - trigger.ema_fast) / trigger.atr
+    pivot_effort_ready = False
+    for index in range(pivot_start, pivot_index + 1):
+        effort_feature = _traditional_features(
+            candles[: index + 1],
+            config.traditional_signal_fast,
+            config.traditional_signal_slow,
+            config.traditional_rsi_period,
+            config.traditional_macd_fast,
+            config.traditional_macd_slow,
+            config.traditional_macd_signal,
+            config.traditional_atr_period,
+            config.traditional_volume_sma_period,
+        )
+        effort_candle = candles[index]
+        effort_range = float(effort_candle.high) - float(effort_candle.low)
+        if effort_feature.atr is None or effort_feature.atr <= 0:
+            continue
+        effort_matches_wave = (
+            float(effort_candle.close) < float(effort_candle.open)
+            if side == "long"
+            else float(effort_candle.close) > float(effort_candle.open)
+        )
+        if not effort_matches_wave:
+            continue
+        if (
+            effort_feature.volume_ratio is not None
+            and effort_feature.volume_ratio
+            >= max(0.0, float(config.traditional_ultra_short_1m_min_volume_ratio))
+        ) or effort_range / effort_feature.atr >= max(
+            0.0,
+            float(config.traditional_ultra_short_reversal_min_range_atr) * 1.5,
+        ):
+            pivot_effort_ready = True
+            break
     effort_ready = (
         execution.volume_ratio
         >= max(0.0, float(config.traditional_ultra_short_1m_min_volume_ratio))
-        or (
-            pivot_feature.volume_ratio is not None
-            and pivot_feature.volume_ratio
-            >= max(0.0, float(config.traditional_ultra_short_1m_min_volume_ratio))
-        )
-        or pivot_range / pivot_feature.atr
-        >= max(
-            0.0,
-            float(config.traditional_ultra_short_reversal_min_range_atr) * 1.5,
-        )
+        or pivot_effort_ready
     )
     wave_effort_ready = (
         (
@@ -2845,6 +2961,66 @@ def _traditional_ultra_short_reversal_one_minute_trigger(
             and execution.macd_histogram < execution.previous_macd_histogram
         )
     return fresh_extreme and confirmed
+
+
+def _traditional_ultra_short_pullback_reversal_context(
+    trigger: _TraditionalFeatures,
+    execution: _TraditionalFeatures,
+    side: str,
+    trend_aligned: bool,
+    config: StrategyConfig,
+) -> bool:
+    """Allow an early, trend-aligned dip/rally reversal before 5m MACD crosses zero."""
+
+    if (
+        not config.traditional_ultra_short_pullback_reversal_enabled
+        or not trend_aligned
+        or side not in {"long", "short"}
+        or trigger.macd_histogram is None
+        or trigger.previous_macd_histogram is None
+        or trigger.rsi is None
+        or execution.rsi is None
+    ):
+        return False
+    if side == "long":
+        return (
+            trigger.macd_histogram > 0
+            and trigger.macd_histogram < trigger.previous_macd_histogram
+            and trigger.rsi
+            <= float(config.traditional_ultra_short_pullback_reversal_rsi_long_max)
+            and execution.rsi
+            <= float(config.traditional_ultra_short_pullback_reversal_1m_rsi_long_max)
+        )
+    return (
+        trigger.macd_histogram < 0
+        and trigger.macd_histogram > trigger.previous_macd_histogram
+        and trigger.rsi
+        >= float(config.traditional_ultra_short_pullback_reversal_rsi_short_min)
+        and execution.rsi
+        >= float(config.traditional_ultra_short_pullback_reversal_1m_rsi_short_min)
+    )
+
+
+def effective_break_even_trigger_r(
+    configured_trigger_r: float,
+    entry_price: float,
+    cost_break_even_price: float,
+    risk_distance: float,
+    lock_r: float,
+    activation_buffer_r: float = 0.05,
+) -> float:
+    """Do not arm a protective stop until costs, locked profit and a buffer fit."""
+
+    configured_trigger = max(0.0, float(configured_trigger_r))
+    if configured_trigger == 0:
+        return 0.0
+    if risk_distance <= 0:
+        return float("inf")
+    cost_r = abs(float(cost_break_even_price) - float(entry_price)) / risk_distance
+    return max(
+        configured_trigger,
+        cost_r + max(0.0, float(lock_r)) + max(0.0, float(activation_buffer_r)),
+    )
 
 
 def _traditional_ultra_short_higher_timeframe_alignment(

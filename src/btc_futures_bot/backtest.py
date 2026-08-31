@@ -14,6 +14,7 @@ from .strategy import (
     MultiTimeframeStrategy,
     StrategyConfig,
     dynamic_stop_loss_pct,
+    effective_break_even_trigger_r,
     signal_position_size_multiplier,
     signal_stop_loss_overrides,
     signal_stop_timeframe,
@@ -423,7 +424,7 @@ def _tighten_position_stop(
     candidate = position.stop_price
     candidate_reason = position.stop_reason
     management = signal_trade_management_overrides(signal, strategy.config)
-    break_even_trigger = max(
+    configured_break_even_trigger = max(
         0.0,
         float(
             management.get(
@@ -432,25 +433,49 @@ def _tighten_position_stop(
             )
         ),
     )
+    lock_r = max(
+        0.0,
+        float(
+            management.get(
+                "break_even_lock_r",
+                getattr(strategy.config, "break_even_lock_r", 0.5),
+            )
+        ),
+    )
+    activation_buffer_r = max(
+        0.0,
+        float(
+            management.get(
+                "break_even_activation_buffer_r",
+                getattr(strategy.config, "break_even_activation_buffer_r", 0.05),
+            )
+        ),
+    )
+    holding_hours = max(0.0, (candle.timestamp - position.opened_at) / 3_600_000)
+    cost_break_even = risk.break_even_price(
+        position.side,
+        position.entry_price,
+        holding_hours=holding_hours,
+    )
+    break_even_trigger = effective_break_even_trigger_r(
+        configured_break_even_trigger,
+        position.entry_price,
+        cost_break_even,
+        risk_distance,
+        lock_r,
+        activation_buffer_r,
+    )
     if break_even_trigger and favorable_r >= break_even_trigger:
-        holding_hours = max(0.0, (candle.timestamp - position.opened_at) / 3_600_000)
-        cost_break_even = risk.break_even_price(
-            position.side,
-            position.entry_price,
-            holding_hours=holding_hours,
-        )
-        lock_distance = risk_distance * max(
-            0.0,
-            float(
-                management.get(
-                    "break_even_lock_r",
-                    getattr(strategy.config, "break_even_lock_r", 0.5),
-                )
-            ),
-        )
+        lock_distance = risk_distance * lock_r
         protected_stop = cost_break_even + lock_distance if position.side == "long" else cost_break_even - lock_distance
         protection_improved = protected_stop > candidate if position.side == "long" else protected_stop < candidate
-        if protection_improved:
+        execution_buffer = risk_distance * activation_buffer_r
+        protection_executable = (
+            candle.close - protected_stop > execution_buffer
+            if position.side == "long"
+            else protected_stop - candle.close > execution_buffer
+        )
+        if protection_improved and protection_executable:
             candidate = protected_stop
             candidate_reason = "break_even_stop"
     trailing_trigger = max(
@@ -474,10 +499,15 @@ def _tighten_position_stop(
         )
         trailing_stop = best_price - trailing_distance if position.side == "long" else best_price + trailing_distance
         trailing_improved = trailing_stop > candidate if position.side == "long" else trailing_stop < candidate
-        if trailing_improved:
+        execution_buffer = risk_distance * activation_buffer_r
+        trailing_executable = (
+            candle.close - trailing_stop > execution_buffer
+            if position.side == "long"
+            else trailing_stop - candle.close > execution_buffer
+        )
+        if trailing_improved and trailing_executable:
             candidate = trailing_stop
             candidate_reason = "trailing_stop"
-    candidate = min(candidate, candle.close) if position.side == "long" else max(candidate, candle.close)
     stop_improved = candidate > position.stop_price if position.side == "long" else candidate < position.stop_price
     return replace(
         position,

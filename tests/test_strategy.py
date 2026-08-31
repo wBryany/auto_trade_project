@@ -30,10 +30,12 @@ from btc_futures_bot.strategy import (
     _traditional_strong_regime_quality,
     _traditional_ultra_short_timeframe_support,
     _traditional_ultra_short_one_minute_trigger,
+    _traditional_ultra_short_pullback_reversal_context,
     _traditional_ultra_short_reversal_one_minute_trigger,
     _traditional_setup_macd_handoff,
     _traditional_setup_volume_handoff,
     dynamic_stop_loss_pct,
+    effective_break_even_trigger_r,
     signal_position_size_multiplier,
     signal_stop_loss_overrides,
     signal_stop_timeframe,
@@ -97,6 +99,7 @@ def test_ultra_short_one_minute_trigger_requires_fresh_volume_break() -> None:
     assert signal_trade_management_overrides(signal, config) == {
         "break_even_trigger_r": 0.7,
         "break_even_lock_r": 0.15,
+        "break_even_activation_buffer_r": 0.05,
         "trailing_trigger_r": 0.9,
         "trailing_distance_r": 0.35,
     }
@@ -229,6 +232,202 @@ def test_ultra_short_reversal_reclaims_a_fresh_one_minute_extreme() -> None:
     )
 
 
+def test_ultra_short_reversal_accepts_effort_before_a_quiet_final_undercut() -> None:
+    candles = [
+        Candle(index * 60_000, 100.0, 100.2, 99.8, 100.0, 10.0)
+        for index in range(30)
+    ]
+    candles[-3] = Candle(candles[-3].timestamp, 100.0, 100.1, 99.0, 99.2, 30.0)
+    candles[-2] = Candle(candles[-2].timestamp, 99.2, 99.4, 98.8, 99.1, 5.0)
+    candles[-1] = Candle(candles[-1].timestamp, 99.1, 100.5, 99.0, 100.4, 8.0)
+    execution = _TraditionalFeatures(
+        open=99.1,
+        high=100.5,
+        low=99.0,
+        close=100.4,
+        previous_close=99.1,
+        ema_fast=99.8,
+        previous_ema_fast=99.6,
+        ema_slow=100.0,
+        previous_ema_slow=100.0,
+        rsi=48.0,
+        macd_histogram=0.3,
+        previous_macd_histogram=-0.2,
+        atr=1.0,
+        volume_ratio=0.7,
+    )
+    trigger = replace(execution, close=99.5, ema_fast=100.0, volume_ratio=0.9)
+    config = StrategyConfig(
+        traditional_signal_fast=3,
+        traditional_signal_slow=5,
+        traditional_rsi_period=3,
+        traditional_macd_fast=3,
+        traditional_macd_slow=6,
+        traditional_macd_signal=2,
+        traditional_atr_period=3,
+        traditional_volume_sma_period=5,
+        traditional_ultra_short_1m_lookback=8,
+        traditional_ultra_short_1m_min_volume_ratio=0.9,
+        traditional_ultra_short_reversal_pivot_bars=3,
+    )
+
+    assert _traditional_ultra_short_reversal_one_minute_trigger(
+        candles,
+        execution,
+        trigger,
+        "long",
+        config,
+    )
+
+    post_pivot_effort = list(candles)
+    post_pivot_effort[-3] = Candle(
+        post_pivot_effort[-3].timestamp, 99.8, 99.9, 99.7, 99.75, 5.0
+    )
+    post_pivot_effort[-2] = Candle(
+        post_pivot_effort[-2].timestamp, 99.75, 100.2, 99.72, 99.9, 30.0
+    )
+    post_pivot_effort[-1] = Candle(
+        post_pivot_effort[-1].timestamp, 99.9, 100.5, 99.7, 100.4, 8.0
+    )
+    assert not _traditional_ultra_short_reversal_one_minute_trigger(
+        post_pivot_effort,
+        execution,
+        trigger,
+        "long",
+        config,
+    )
+
+    opposite_effort = list(candles)
+    opposite_effort[-3] = Candle(
+        opposite_effort[-3].timestamp, 99.0, 100.2, 98.9, 100.0, 30.0
+    )
+    opposite_effort[-2] = Candle(
+        opposite_effort[-2].timestamp, 98.95, 99.0, 98.8, 98.9, 5.0
+    )
+    assert not _traditional_ultra_short_reversal_one_minute_trigger(
+        opposite_effort,
+        execution,
+        trigger,
+        "long",
+        config,
+    )
+
+
+def test_ultra_short_pullback_reversal_context_is_trend_aligned() -> None:
+    trigger = _TraditionalFeatures(
+        open=100.0,
+        high=101.0,
+        low=99.0,
+        close=100.0,
+        previous_close=100.0,
+        ema_fast=100.0,
+        previous_ema_fast=100.0,
+        ema_slow=100.0,
+        previous_ema_slow=100.0,
+        rsi=52.0,
+        macd_histogram=10.0,
+        previous_macd_histogram=20.0,
+        atr=1.0,
+        volume_ratio=1.0,
+    )
+    execution = replace(trigger, rsi=48.0)
+    config = StrategyConfig(traditional_ultra_short_pullback_reversal_enabled=True)
+
+    assert _traditional_ultra_short_pullback_reversal_context(
+        trigger,
+        execution,
+        "long",
+        True,
+        config,
+    )
+    assert not _traditional_ultra_short_pullback_reversal_context(
+        trigger,
+        execution,
+        "long",
+        False,
+        config,
+    )
+    assert _traditional_ultra_short_pullback_reversal_context(
+        replace(trigger, rsi=48.0, macd_histogram=-10.0, previous_macd_histogram=-20.0),
+        replace(execution, rsi=52.0),
+        "short",
+        True,
+        config,
+    )
+
+
+def test_ultra_short_pullback_resumption_accepts_quiet_break_and_caps_volume() -> None:
+    def candles(values: list[float], interval_ms: int, volume: float = 10.0) -> list[Candle]:
+        return [
+            Candle(index * interval_ms, value - 0.05, value + 0.1, value - 0.1, value, volume)
+            for index, value in enumerate(values)
+        ]
+
+    regime = candles([100 + index * 0.1 for index in range(40)], 3_600_000)
+    trend = [100 + (index**1.1) * 0.01 for index in range(40)]
+    trigger_values = trend + [trend[-1] + 0.02 * (index + 1) for index in range(8)]
+    trigger = candles(trigger_values, 300_000)
+    base = trigger_values[-1] - 0.4
+    execution = candles([base + (index % 5) * 0.005 for index in range(39)], 60_000)
+    execution.append(
+        Candle(
+            39 * 60_000,
+            execution[-1].close,
+            trigger_values[-1] + 0.12,
+            execution[-1].close - 0.02,
+            trigger_values[-1] + 0.1,
+            25.0,
+        )
+    )
+    config = StrategyConfig(
+        mode="traditional_kline",
+        trigger_timeframe="5m",
+        regime_timeframe="1h",
+        traditional_trend_fast=5,
+        traditional_trend_slow=20,
+        traditional_signal_fast=3,
+        traditional_signal_slow=5,
+        traditional_rsi_period=3,
+        traditional_macd_fast=3,
+        traditional_macd_slow=6,
+        traditional_macd_signal=2,
+        traditional_atr_period=3,
+        traditional_volume_sma_period=5,
+        traditional_min_volume_ratio=1.1,
+        traditional_rsi_long_min=0,
+        traditional_rsi_long_max=100,
+        traditional_allow_pullback=False,
+        traditional_allow_breakout=False,
+        traditional_ultra_short_enabled=True,
+        traditional_ultra_short_pullback_resumption_enabled=True,
+        traditional_ultra_short_pullback_resumption_1m_rsi_long_max=100,
+        traditional_ultra_short_pullback_resumption_max_volume_ratio=3.0,
+        traditional_ultra_short_1m_lookback=5,
+        traditional_ultra_short_1m_min_volume_ratio=0.9,
+        traditional_ultra_short_1m_min_body_ratio=0,
+        traditional_ultra_short_1m_min_close_location=0,
+        traditional_ultra_short_1m_min_range_atr=0,
+        traditional_ultra_short_1m_max_extension_atr=10,
+        traditional_ultra_short_1m_execution_max_extension_atr=10,
+        traditional_pressure_filter_enabled=False,
+    )
+    market = {"5m": trigger, "1m": execution, "1h": regime}
+
+    disabled = MultiTimeframeStrategy(
+        replace(config, traditional_ultra_short_pullback_resumption_enabled=False)
+    ).evaluate(market)
+    accepted = MultiTimeframeStrategy(config).evaluate(market)
+    loud_execution = execution[:-1] + [replace(execution[-1], volume=31.0)]
+    rejected = MultiTimeframeStrategy(config).evaluate(
+        {**market, "1m": loud_execution}
+    )
+
+    assert disabled.side == "flat"
+    assert accepted.side == "long"
+    assert "5m_macd_pullback_resumption_long" in accepted.reasons
+    assert rejected.side == "flat"
+
+
 def test_ultra_short_countertrend_uses_smaller_size_and_one_minute_stop() -> None:
     config = StrategyConfig(
         traditional_ultra_short_countertrend_size_multiplier=0.3,
@@ -299,6 +498,7 @@ def test_ultra_short_mode_manages_normal_traditional_entries_quickly() -> None:
     assert signal_trade_management_overrides(signal, config) == {
         "break_even_trigger_r": 0.7,
         "break_even_lock_r": 0.15,
+        "break_even_activation_buffer_r": 0.05,
         "trailing_trigger_r": 1.1,
         "trailing_distance_r": 0.45,
     }
@@ -364,6 +564,7 @@ def test_structural_scalp_uses_hourly_context_without_waiving_safety_gates() -> 
     assert signal_trade_management_overrides(signal, config) == {
         "break_even_trigger_r": 1.0,
         "break_even_lock_r": 0.15,
+        "break_even_activation_buffer_r": 0.05,
         "trailing_trigger_r": 1.5,
         "trailing_distance_r": 0.5,
     }
@@ -744,6 +945,146 @@ def test_cost_aware_break_even_price_covers_estimated_costs() -> None:
     for side in ("long", "short"):
         exit_price = risk.break_even_price(side, 100.0)
         assert abs(risk.estimate_net_pnl(side, 100.0, exit_price, 1.0)) < 1e-9
+
+
+def test_break_even_trigger_includes_cost_lock_and_execution_buffer() -> None:
+    risk = RiskManager()
+    cost_break_even = risk.break_even_price("long", 100.0)
+
+    trigger = effective_break_even_trigger_r(0.1, 100.0, cost_break_even, 1.0, 0.1, 0.05)
+
+    assert trigger >= abs(cost_break_even - 100.0) + 0.15
+
+
+def test_zero_break_even_trigger_keeps_profit_protection_disabled() -> None:
+    assert effective_break_even_trigger_r(0.0, 100.0, 100.1, 1.0, 0.1, 0.05) == 0.0
+
+
+def test_profit_protection_does_not_clamp_an_unexecutable_stop_to_market() -> None:
+    risk = RiskManager()
+    strategy = MultiTimeframeStrategy(
+        StrategyConfig(
+            break_even_trigger_r=0.1,
+            break_even_lock_r=0.5,
+            break_even_activation_buffer_r=0.0,
+            trailing_trigger_r=0.0,
+        )
+    )
+    position = Position(
+        "long",
+        1.0,
+        100.0,
+        99.0,
+        102.5,
+        1,
+        initial_stop_price=99.0,
+        best_price=100.0,
+    )
+
+    protected = _tighten_position_stop(
+        position,
+        Candle(2, 100.0, 101.0, 99.9, 100.2, 1.0),
+        strategy,
+        risk,
+    )
+
+    assert protected.stop_price == position.stop_price
+
+
+def test_profit_protection_preserves_the_configured_execution_buffer() -> None:
+    risk = RiskManager()
+    strategy = MultiTimeframeStrategy(
+        StrategyConfig(
+            break_even_trigger_r=0.1,
+            break_even_lock_r=0.1,
+            break_even_activation_buffer_r=0.05,
+            trailing_trigger_r=0.0,
+        )
+    )
+    long_position = Position(
+        "long",
+        1.0,
+        100.0,
+        99.0,
+        102.5,
+        1,
+        initial_stop_price=99.0,
+        best_price=100.0,
+    )
+    long_protected_stop = risk.break_even_price("long", 100.0) + 0.1
+    long_result = _tighten_position_stop(
+        long_position,
+        Candle(2, 100.0, 101.0, 99.9, long_protected_stop + 0.01, 1.0),
+        strategy,
+        risk,
+    )
+    short_position = Position(
+        "short",
+        1.0,
+        100.0,
+        101.0,
+        97.5,
+        1,
+        initial_stop_price=101.0,
+        best_price=100.0,
+    )
+    short_protected_stop = risk.break_even_price("short", 100.0) - 0.1
+    short_result = _tighten_position_stop(
+        short_position,
+        Candle(2, 100.0, 100.1, 99.0, short_protected_stop - 0.01, 1.0),
+        strategy,
+        risk,
+    )
+
+    assert long_result.stop_price == long_position.stop_price
+    assert short_result.stop_price == short_position.stop_price
+
+
+def test_trailing_stop_preserves_the_configured_execution_buffer() -> None:
+    risk = RiskManager()
+    strategy = MultiTimeframeStrategy(
+        StrategyConfig(
+            break_even_trigger_r=0.0,
+            break_even_activation_buffer_r=0.05,
+            trailing_trigger_r=0.5,
+            trailing_distance_r=0.3,
+        )
+    )
+    long_position = Position(
+        "long",
+        1.0,
+        100.0,
+        99.0,
+        102.5,
+        1,
+        initial_stop_price=99.0,
+        best_price=100.0,
+    )
+    long_result = _tighten_position_stop(
+        long_position,
+        Candle(2, 100.0, 100.8, 99.9, 100.51, 1.0),
+        strategy,
+        risk,
+    )
+    short_position = Position(
+        "short",
+        1.0,
+        100.0,
+        101.0,
+        97.5,
+        1,
+        initial_stop_price=101.0,
+        best_price=100.0,
+    )
+    short_result = _tighten_position_stop(
+        short_position,
+        Candle(2, 100.0, 100.1, 99.2, 99.49, 1.0),
+        strategy,
+        risk,
+    )
+
+    assert long_result.stop_price == long_position.stop_price
+    assert short_result.stop_price == short_position.stop_price
 
 
 def test_profit_protection_moves_long_and_short_stops_past_costs() -> None:
