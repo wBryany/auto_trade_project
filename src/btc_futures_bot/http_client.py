@@ -34,6 +34,16 @@ class ApiError(RuntimeError):
 
 _RATE_LIMIT_LOCK = threading.Lock()
 _RATE_LIMIT_UNTIL: dict[str, float] = {}
+_SENSITIVE_QUERY_VALUE = re.compile(
+    r"([?&](?:signature|api[_-]?key|api[_-]?secret|token)=)[^&\s]+",
+    re.IGNORECASE,
+)
+
+
+def redact_url_credentials(url: str) -> str:
+    """Remove signed/auth query values before a URL reaches logs or UI."""
+
+    return _SENSITIVE_QUERY_VALUE.sub(r"\1[REDACTED]", str(url))
 
 
 def _rate_limit_key(url: str) -> str:
@@ -96,6 +106,7 @@ def request_json(
     headers: Mapping[str, str] | None = None,
     body: Mapping[str, Any] | str | None = None,
     timeout: float = 10.0,
+    max_attempts: int | None = None,
 ) -> Any:
     query = urlencode([(key, value) for key, value in (params or {}).items() if value is not None])
     if query:
@@ -113,9 +124,14 @@ def request_json(
             data = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         final_headers.setdefault("Content-Type", "application/json")
     request_method = method.upper()
-    max_attempts = 3 if request_method == "GET" else 1
+    attempts = (
+        max(1, int(max_attempts))
+        if max_attempts is not None and request_method == "GET"
+        else (3 if request_method == "GET" else 1)
+    )
+    safe_url = redact_url_credentials(url)
     payload = ""
-    for attempt in range(max_attempts):
+    for attempt in range(attempts):
         blocked_for = rate_limit_remaining(url)
         if blocked_for > 0:
             retry_at = time.time() + blocked_for
@@ -134,35 +150,35 @@ def request_json(
             if error.code in {418, 429}:
                 retry_at = _set_rate_limit(url, _http_retry_at(error, detail))
                 raise ApiError(
-                    f"HTTP {error.code} {method} {url}: {detail[:500]}",
+                    f"HTTP {error.code} {method} {safe_url}: {detail[:500]}",
                     status_code=error.code,
                     retry_at=retry_at,
                 ) from error
             retryable = error.code in {408, 425, 500, 502, 503, 504}
-            if retryable and attempt + 1 < max_attempts:
+            if retryable and attempt + 1 < attempts:
                 time.sleep(0.5 * (2**attempt))
                 continue
             raise ApiError(
-                f"HTTP {error.code} {method} {url}: {detail[:500]}",
+                f"HTTP {error.code} {method} {safe_url}: {detail[:500]}",
                 status_code=error.code,
             ) from error
         except URLError as error:
-            if attempt + 1 < max_attempts:
+            if attempt + 1 < attempts:
                 time.sleep(0.5 * (2**attempt))
                 continue
-            raise ApiError(f"network error {method} {url}: {error.reason}") from error
+            raise ApiError(f"network error {method} {safe_url}: {error.reason}") from error
         except (TimeoutError, ConnectionError, OSError) as error:
             # urllib can surface transient socket/SSL failures directly instead
             # of wrapping them in URLError. Retrying GET is safe and prevents a
             # single market-data disconnect from aborting an engine cycle.
-            if attempt + 1 < max_attempts:
+            if attempt + 1 < attempts:
                 time.sleep(0.5 * (2**attempt))
                 continue
-            raise ApiError(f"network error {method} {url}: {error}") from error
+            raise ApiError(f"network error {method} {safe_url}: {error}") from error
     try:
         return json.loads(payload) if payload else {}
     except json.JSONDecodeError as error:
-        raise ApiError(f"invalid JSON from {method} {url}: {payload[:500]}") from error
+        raise ApiError(f"invalid JSON from {method} {safe_url}: {payload[:500]}") from error
 
 
 def format_number(value: float, decimals: int = 12) -> str:

@@ -65,9 +65,16 @@ def _order_sizing_view(
     account: dict[str, Any],
 ) -> dict[str, Any]:
     limits = dict(snapshot.get("order_limits") or {})
+    account_unavailable = account.get("source") == "unavailable"
     result: dict[str, Any] = {
-        "available": bool(limits) and not bool(limits.get("error")),
-        "error": str(limits.get("error") or ""),
+        "available": bool(limits)
+        and not bool(limits.get("error"))
+        and not account_unavailable,
+        "error": (
+            "私有账户快照暂不可用"
+            if account_unavailable
+            else str(limits.get("error") or "")
+        ),
         **limits,
     }
     if not result["available"]:
@@ -144,6 +151,7 @@ class DashboardService:
         self.started_at = 0.0
         self._exchange_snapshot: dict[str, Any] = {}
         self._snapshot_at = 0.0
+        self._private_snapshot_at = 0.0
         self._snapshot_refreshing = False
         self._snapshot_condition = threading.Condition(self._lock)
         self._dashboard_adapter: Any = None
@@ -247,6 +255,7 @@ class DashboardService:
         with self._lock:
             self._exchange_snapshot = {}
             self._snapshot_at = 0
+            self._private_snapshot_at = 0
             self._dashboard_adapter = None
             self._dashboard_adapter_key = None
         after = self.config_view()
@@ -402,7 +411,10 @@ class DashboardService:
                         result={"exchange": result.exchange, "position": bool(result.position)},
                     )
             except Exception as error:  # Do not terminate the dashboard on a transient venue error.
-                LOG.exception("dashboard engine cycle failed")
+                if isinstance(error, ApiError):
+                    LOG.warning("dashboard engine cycle API failure: %s", error)
+                else:
+                    LOG.exception("dashboard engine cycle failed")
                 if isinstance(error, ApiError) and error.rate_limited:
                     rate_limit_wait = error.retry_after_seconds
                 with self._lock:
@@ -458,21 +470,72 @@ class DashboardService:
             adapter = self._adapter(config, exchange_name)
             snapshot = adapter.fetch_dashboard_snapshot()
             with self._snapshot_condition:
+                now = time.time()
+                private_now = time.monotonic()
+                previous = self._exchange_snapshot
+                stale_limit = max(
+                    0.0,
+                    float(config.get("dashboard_private_stale_seconds", 90)),
+                )
+                last_private_at = float(getattr(self, "_private_snapshot_at", 0.0))
+                preserve_private = (
+                    bool(previous.get("private_available"))
+                    and bool(snapshot.get("private_transient"))
+                    and last_private_at > 0
+                    and private_now - last_private_at <= stale_limit
+                )
+                if snapshot.get("private_available"):
+                    self._private_snapshot_at = private_now
+                elif preserve_private:
+                    error_message = str(snapshot.get("private_error") or "私有 API 暂时不可用")
+                    stale = dict(previous)
+                    if snapshot.get("market"):
+                        stale["market"] = dict(snapshot["market"])
+                    if snapshot.get("order_limits"):
+                        stale["order_limits"] = dict(snapshot["order_limits"])
+                    stale["private_available"] = True
+                    stale["private_stale"] = True
+                    stale["private_error"] = ""
+                    stale["private_warning"] = (
+                        "Binance 私有网络短暂波动，暂时显示最近一次成功账户快照"
+                    )
+                    stale["private_snapshot_at"] = last_private_at
+                    stale["snapshot_error"] = error_message
+                    snapshot = stale
                 self._exchange_snapshot = snapshot
-                self._snapshot_at = time.time()
+                self._snapshot_at = now
             return snapshot
         except Exception as error:
             with self._snapshot_condition:
                 if not self._exchange_snapshot:
                     raise
+                now = time.time()
+                private_now = time.monotonic()
                 stale = dict(self._exchange_snapshot)
                 stale["market"] = dict(stale.get("market") or {})
                 stale["market"]["stale"] = True
-                stale["private_stale"] = bool(stale.get("private_available"))
-                stale["private_warning"] = "Binance 网络短暂波动，暂时显示最近一次成功快照"
-                if stale["private_stale"]:
+                stale_limit = max(
+                    0.0,
+                    float(config.get("dashboard_private_stale_seconds", 90)),
+                )
+                last_private_at = float(getattr(self, "_private_snapshot_at", 0.0))
+                preserve_private = (
+                    bool(stale.get("private_available"))
+                    and last_private_at > 0
+                    and private_now - last_private_at <= stale_limit
+                )
+                stale["private_stale"] = preserve_private
+                if preserve_private:
+                    stale["private_warning"] = (
+                        "Binance 网络短暂波动，暂时显示最近一次成功账户快照"
+                    )
                     stale["private_error"] = ""
                 else:
+                    stale.pop("account", None)
+                    stale["positions"] = []
+                    stale["open_orders"] = []
+                    stale["private_available"] = False
+                    stale["private_warning"] = ""
                     stale["private_error"] = str(error)
                 stale["snapshot_error"] = str(error)
                 # Back off for one normal snapshot interval. Without advancing
@@ -480,7 +543,7 @@ class DashboardService:
                 # another group of signed REST requests while the network is
                 # still down, amplifying a short TLS interruption.
                 self._exchange_snapshot = stale
-                self._snapshot_at = time.time()
+                self._snapshot_at = now
                 return stale
         finally:
             with self._snapshot_condition:
@@ -491,7 +554,7 @@ class DashboardService:
         config = self._config()
         exchange_name = self._exchange(config)
         snapshot = self._market_snapshot(config, exchange_name)
-        if not snapshot.get("private_available"):
+        if not snapshot.get("private_available") or snapshot.get("private_stale"):
             raise RuntimeError(str(snapshot.get("private_error") or "私有 API 未连接"))
         account = snapshot.get("account") or {}
         equity_raw = str(account.get("wallet_balance_raw") or account.get("wallet_balance") or "0")
@@ -566,24 +629,40 @@ class DashboardService:
             quantity = abs(float(position.get("quantity") or 0))
             notional = entry * quantity
             position["unrealized_pnl_pct"] = float(position.get("unrealized_pnl") or 0) / notional if notional else 0.0
+            if snapshot.get("private_stale"):
+                position["source"] = "exchange_stale"
         if paper_position:
             positions = [paper_position]
         account = dict(snapshot.get("account") or {})
         if account:
-            account["source"] = "exchange"
+            account["source"] = (
+                "exchange_stale" if snapshot.get("private_stale") else "exchange"
+            )
             account["environment"] = exchange_config.get("environment", "")
+            if snapshot.get("private_snapshot_at"):
+                account["snapshot_at"] = snapshot["private_snapshot_at"]
         else:
-            closed_pnl = float(self.engine.session_pnl) if self.engine else 0.0
-            paper_unrealized = float(paper_position.get("unrealized_pnl", 0)) if paper_position else 0.0
-            paper_pnl = closed_pnl + paper_unrealized
-            account = {
-                "wallet_balance": float(config.get("paper_equity", 10000)) + paper_pnl,
-                "available_balance": float(config.get("paper_equity", 10000)) + paper_pnl,
-                "unrealized_pnl": paper_unrealized,
-                "margin_balance": float(config.get("paper_equity", 10000)) + paper_pnl,
-                "source": "paper",
-                "environment": "simulation",
-            }
+            if str(config.get("mode", "paper")).strip().lower() == "live":
+                account = {
+                    "wallet_balance_raw": "",
+                    "available_balance_raw": "",
+                    "unrealized_pnl": None,
+                    "margin_balance_raw": "",
+                    "source": "unavailable",
+                    "environment": exchange_config.get("environment", ""),
+                }
+            else:
+                closed_pnl = float(self.engine.session_pnl) if self.engine else 0.0
+                paper_unrealized = float(paper_position.get("unrealized_pnl", 0)) if paper_position else 0.0
+                paper_pnl = closed_pnl + paper_unrealized
+                account = {
+                    "wallet_balance": float(config.get("paper_equity", 10000)) + paper_pnl,
+                    "available_balance": float(config.get("paper_equity", 10000)) + paper_pnl,
+                    "unrealized_pnl": paper_unrealized,
+                    "margin_balance": float(config.get("paper_equity", 10000)) + paper_pnl,
+                    "source": "paper",
+                    "environment": "simulation",
+                }
         result = self.last_result
         signal = None
         result_view = None
@@ -638,7 +717,8 @@ class DashboardService:
             "last_error": last_error,
             "connection": {
                 "market": bool(snapshot.get("market")),
-                "private": bool(snapshot.get("private_available")),
+                "private": bool(snapshot.get("private_available"))
+                and not bool(snapshot.get("private_stale")),
                 "private_error": snapshot.get("private_error", ""),
                 "private_stale": bool(snapshot.get("private_stale")),
                 "private_warning": snapshot.get("private_warning", ""),
@@ -911,7 +991,7 @@ $('saveBtn').onclick=saveConfigWithEmail;$('emailTestBtn').onclick=testEmail;$('
 const beijingFormatter=new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',hour12:false,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});
 const formatBeijing=value=>{if(!value)return '—';const numeric=typeof value==='number'||/^\d+$/.test(String(value));const numericValue=numeric?Number(value):0;const date=numeric?new Date(numericValue<100000000000?numericValue*1000:numericValue):new Date(value);return Number.isNaN(date.getTime())?String(value):beijingFormatter.format(date)};
 const renderPositionMetrics=s=>{const table=document.querySelector('#positionsBody')?.closest('table');const header=table?.querySelector('thead tr');if(header&&!header.querySelector('[data-pnl-pct]'))header.insertAdjacentHTML('beforeend','<th data-pnl-pct>盈亏比例</th>');const rows=[...document.querySelectorAll('#positionsBody tr')];if(!(s.positions||[]).length){const empty=rows[0]?.querySelector('td');if(empty)empty.colSpan=9;return}(s.positions||[]).forEach((position,index)=>{const row=rows[index];if(!row)return;const cell=document.createElement('td');cell.innerHTML=`<span class="${Number(position.unrealized_pnl_pct||0)>=0?'positive':'negative'}">${pct(position.unrealized_pnl_pct)}</span>`;row.appendChild(cell)})};
-const originalRenderStatus=renderStatus;renderStatus=function(s){originalRenderStatus(s);const cycle=formatBeijing(s.last_cycle_at);const accountSource=s.account?.source==='exchange'?'交易所账户':'模拟权益';const venue=s.exchange==='binance'?'币安':String(s.exchange||'').toUpperCase();const network=s.environment==='production'?'正式网络':'测试网';$('lastCycle').textContent=cycle;$('engineSub').textContent=s.running?`最近周期 ${cycle}`:'引擎未启动';$('balanceSub').innerHTML=`<span class="source-badge">${accountSource}</span> · 可用 ${exact(s.account?.available_balance_raw??s.account?.available_balance)} · 保证金 ${exact(s.account?.margin_balance_raw??s.account?.margin_balance)}`;$('pnlSub').textContent=s.account?.source==='exchange'?'交易所实时账户':'模拟盘估算';document.querySelector('.subtitle').textContent=`本地控制台 · ${s.mode} · ${venue}${network}`;if(!s.running&&!s.last_error&&!s.connection.private_error){$('runtimeNotice').textContent=`引擎已停止；${venue}${network}${s.connection.private?'私有 API 已连接':'私有 API 未连接'}。`}renderPositionMetrics(s)};
+const originalRenderStatus=renderStatus;renderStatus=function(s){originalRenderStatus(s);const cycle=formatBeijing(s.last_cycle_at);const source=s.account?.source||'unavailable';const accountSource=source==='exchange'?'交易所账户':source==='exchange_stale'?'交易所账户（最近快照）':source==='paper'?'模拟权益':'账户数据暂不可用';const venue=s.exchange==='binance'?'币安':String(s.exchange||'').toUpperCase();const network=s.environment==='production'?'正式网络':'测试网';$('lastCycle').textContent=cycle;$('engineSub').textContent=s.running?`最近周期 ${cycle}`:'引擎未启动';if(source==='unavailable'){$('equity').textContent='—';$('balanceSub').innerHTML=`<span class="source-badge">${accountSource}</span> · 等待交易所私有接口恢复`;$('unrealized').textContent='—';$('pnlSub').textContent='未使用模拟权益替代'}else{$('balanceSub').innerHTML=`<span class="source-badge">${accountSource}</span> · 可用 ${exact(s.account?.available_balance_raw??s.account?.available_balance)} · 保证金 ${exact(s.account?.margin_balance_raw??s.account?.margin_balance)}`;$('pnlSub').textContent=source==='exchange'?'交易所实时账户':source==='exchange_stale'?'交易所最近成功快照':'模拟盘估算'}document.querySelector('.subtitle').textContent=`本地控制台 · ${s.mode} · ${venue}${network}`;if(s.connection.private_stale){$('connectionBox').insertAdjacentHTML('beforeend',`<br><span class="neutral">${esc(s.connection.private_warning||'私有数据为最近成功快照')}</span>`);if(!s.last_error){$('runtimeNotice').textContent=s.connection.private_warning||'私有数据暂时陈旧，禁止新开仓';$('runtimeNotice').className='notice'}}if(!s.running&&!s.last_error&&!s.connection.private_error){$('runtimeNotice').textContent=`引擎已停止；${venue}${network}${s.connection.private?'私有 API 已连接':'私有 API 未连接'}。`}renderPositionMetrics(s)};
 loadReports=async function(){try{const q=new URLSearchParams();if($('fromDate').value)q.set('from',$('fromDate').value);if($('toDate').value)q.set('to',$('toDate').value);if($('reportExchange').value)q.set('exchange',$('reportExchange').value);q.set('scope',reportScope);const d=await api('/api/reports?'+q.toString()),s=d.stats;$('statTrades').textContent=s.trades;$('statWinRate').textContent=s.trades?`${(s.wins/s.trades*100).toFixed(2)}%`:'0%';$('statGross').innerHTML=pnl(s.gross_pnl);$('statCost').innerHTML=num(s.total_cost);$('statNet').innerHTML=pnl(s.net_pnl);$('tradesBody').innerHTML=d.trades.length?d.trades.map(r=>`<tr><td>${esc(formatBeijing(r.exit_time))}</td><td>${esc(r.exchange)}</td><td>${esc(r.exchange_environment_label)}</td><td>${esc(r.side)}</td><td>${num(r.entry_price,2)}</td><td>${num(r.exit_price,2)}</td><td>${num(r.quantity,5)}</td><td>${pnl(r.gross_pnl)}</td><td>${num(r.trading_fee)}</td><td>${num(r.total_cost)}</td><td>${pnl(r.net_pnl)}</td><td>${pct(r.net_pnl_pct)}</td><td>${pct(r.fee_ratio_pct)}</td><td>${esc(r.exit_reason)}</td></tr>`).join(''):'<tr><td colspan="14" class="empty">暂无交易记录</td></tr>';$('dailyBody').innerHTML=summaryRows(d.daily);$('monthlyBody').innerHTML=summaryRows(d.monthly)}catch(e){toast(e.message)}};
 document.querySelectorAll('#reportScopeButtons button').forEach(button=>{button.onclick=()=>{reportScope=button.dataset.scope;document.querySelectorAll('#reportScopeButtons button').forEach(item=>item.classList.toggle('active',item===button));loadReports()}});$('reportBtn').onclick=loadReports;loadReports();
 if($('stopLoss'))$('stopLoss').insertAdjacentHTML('afterend','<div class="note">动态止损：30秒 ATR × 1.4，自动限制在 0.25%～0.60%；页面上的止损比例是 ATR 不可用时的备用值。</div>');

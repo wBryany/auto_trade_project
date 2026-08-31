@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 from unittest.mock import patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 from btc_futures_bot.http_client import ApiError, clear_rate_limits, request_json
 
@@ -31,6 +31,50 @@ def test_get_retries_direct_timeout_errors() -> None:
     assert result == {"ok": True}
     assert mocked_urlopen.call_count == 2
     mocked_sleep.assert_called_once_with(0.5)
+
+
+def test_get_retry_count_can_be_disabled_for_expiring_signed_requests() -> None:
+    with (
+        patch(
+            "btc_futures_bot.http_client.urlopen",
+            side_effect=TimeoutError("timed out"),
+        ) as mocked_urlopen,
+        patch("btc_futures_bot.http_client.time.sleep") as mocked_sleep,
+    ):
+        try:
+            request_json(
+                "GET",
+                "https://example.test/private",
+                params={"timestamp": 1, "signature": "secret-signature"},
+                max_attempts=1,
+            )
+        except ApiError as error:
+            assert "[REDACTED]" in str(error)
+            assert "secret-signature" not in str(error)
+        else:
+            raise AssertionError("single-attempt timeout must be surfaced")
+
+    assert mocked_urlopen.call_count == 1
+    mocked_sleep.assert_not_called()
+
+
+def test_signed_url_is_redacted_from_urlerror_chain_message() -> None:
+    with patch(
+        "btc_futures_bot.http_client.urlopen",
+        side_effect=URLError("temporary TLS failure"),
+    ):
+        try:
+            request_json(
+                "GET",
+                "https://example.test/private",
+                params={"signature": "must-not-leak"},
+                max_attempts=1,
+            )
+        except ApiError as error:
+            assert "[REDACTED]" in str(error)
+            assert "must-not-leak" not in str(error)
+        else:
+            raise AssertionError("network failure must be surfaced")
 
 
 def test_post_does_not_retry_direct_timeout_errors() -> None:

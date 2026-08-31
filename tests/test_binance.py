@@ -482,6 +482,7 @@ def test_binance_private_failure_is_not_reported_as_connected(monkeypatch) -> No
     assert snapshot["market"]["price_endpoint"] == "/fapi/v1/premiumIndex"
     assert snapshot["private_available"] is False
     assert "invalid credentials" in snapshot["private_error"]
+    assert snapshot["private_transient"] is False
 
 
 def test_binance_dashboard_preserves_balance_precision_and_estimates_order_capacity(monkeypatch) -> None:
@@ -541,11 +542,17 @@ def test_binance_signed_request_resyncs_server_time_on_1021(monkeypatch) -> None
     monkeypatch.setenv("TEST_BINANCE_KEY", "configured")
     monkeypatch.setenv("TEST_BINANCE_SECRET", "configured")
     monkeypatch.setattr(adapter, "now_ms", lambda: 900_000)
+    monotonic_values = iter((10.0, 10.0, 20.0, 20.0))
+    monkeypatch.setattr(
+        "btc_futures_bot.exchanges.binance.time.monotonic",
+        lambda: next(monotonic_values),
+    )
     account_timestamps = []
+    server_times = iter((1_000_000, 1_001_000))
 
     def request(method, url, *, params=None, headers=None, body=None, **kwargs):
         if url.endswith("/fapi/v1/time"):
-            return {"serverTime": 1_000_000}
+            return {"serverTime": next(server_times)}
         account_timestamps.append(params["timestamp"])
         if len(account_timestamps) == 1:
             raise ApiError('HTTP 400: {"code":-1021,"msg":"timestamp outside recvWindow"}')
@@ -554,4 +561,112 @@ def test_binance_signed_request_resyncs_server_time_on_1021(monkeypatch) -> None
     monkeypatch.setattr("btc_futures_bot.exchanges.binance.request_json", request)
 
     assert adapter.fetch_equity() == 123.45
-    assert account_timestamps == [900_000, 1_000_000]
+    assert account_timestamps == [1_000_000, 1_001_000]
+
+
+def test_binance_signed_get_retries_with_a_fresh_signature(monkeypatch) -> None:
+    adapter = _adapter()
+    monkeypatch.setenv("TEST_BINANCE_KEY", "configured")
+    monkeypatch.setenv("TEST_BINANCE_SECRET", "configured")
+    monkeypatch.setattr(adapter, "_ensure_server_time", lambda: None)
+    timestamps = iter((1_000_000, 1_000_001))
+    monkeypatch.setattr(adapter, "_server_timestamp_ms", lambda: next(timestamps))
+    calls = []
+
+    def request(method, url, *, params=None, **kwargs):
+        calls.append((dict(params or {}), kwargs))
+        if len(calls) == 1:
+            raise ApiError("network error: temporary TLS timeout")
+        return {"totalWalletBalance": "123.45"}
+
+    monkeypatch.setattr("btc_futures_bot.exchanges.binance.request_json", request)
+    monkeypatch.setattr("btc_futures_bot.exchanges.binance.time.sleep", lambda _delay: None)
+
+    assert adapter.fetch_equity() == 123.45
+    assert [call[0]["timestamp"] for call in calls] == [1_000_000, 1_000_001]
+    assert calls[0][0]["signature"] != calls[1][0]["signature"]
+    assert all(call[1]["max_attempts"] == 1 for call in calls)
+
+
+def test_binance_signed_post_does_not_retry_an_ambiguous_transport_failure(monkeypatch) -> None:
+    adapter = _adapter()
+    monkeypatch.setenv("TEST_BINANCE_KEY", "configured")
+    monkeypatch.setenv("TEST_BINANCE_SECRET", "configured")
+    monkeypatch.setattr(adapter, "_ensure_server_time", lambda: None)
+    monkeypatch.setattr(adapter, "_server_timestamp_ms", lambda: 1_000_000)
+    calls = []
+
+    def request(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise ApiError("network error: response unknown")
+
+    monkeypatch.setattr("btc_futures_bot.exchanges.binance.request_json", request)
+
+    with pytest.raises(ApiError, match="response unknown"):
+        adapter._signed("POST", "/fapi/v1/order", {"symbol": "BTCUSDT"})
+
+    assert len(calls) == 1
+
+
+def test_binance_time_sync_anchors_to_response_completion(monkeypatch) -> None:
+    adapter = _adapter()
+    monkeypatch.setattr(adapter, "now_ms", lambda: 1_010_000)
+    monotonic_values = iter((50.0, 50.0))
+    monkeypatch.setattr(
+        "btc_futures_bot.exchanges.binance.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+    monkeypatch.setattr(
+        "btc_futures_bot.exchanges.binance.request_json",
+        lambda *args, **kwargs: {"serverTime": 1_000_000},
+    )
+
+    assert adapter._sync_server_time() == -10_000
+    assert adapter._server_timestamp_ms() == 1_000_000
+
+
+def test_binance_signed_get_does_not_retry_rate_limit(monkeypatch) -> None:
+    adapter = _adapter()
+    monkeypatch.setenv("TEST_BINANCE_KEY", "configured")
+    monkeypatch.setenv("TEST_BINANCE_SECRET", "configured")
+    monkeypatch.setattr(adapter, "_ensure_server_time", lambda: None)
+    monkeypatch.setattr(adapter, "_server_timestamp_ms", lambda: 1_000_000)
+    calls = []
+
+    def request(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise ApiError("HTTP 429", status_code=429, retry_at=9_999_999_999)
+
+    monkeypatch.setattr("btc_futures_bot.exchanges.binance.request_json", request)
+
+    with pytest.raises(ApiError, match="429"):
+        adapter.fetch_equity()
+
+    assert len(calls) == 1
+
+
+def test_binance_private_network_failure_is_marked_transient(monkeypatch) -> None:
+    adapter = _adapter()
+    monkeypatch.setenv("TEST_BINANCE_KEY", "configured")
+    monkeypatch.setenv("TEST_BINANCE_SECRET", "configured")
+    monkeypatch.setattr(
+        "btc_futures_bot.exchanges.binance.request_json",
+        lambda *args, **kwargs: {
+            "symbol": "BTCUSDT",
+            "markPrice": "65001.25",
+            "indexPrice": "65002.5",
+            "time": 1_700_000_000_000,
+        },
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_signed",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ApiError("network error: TLS handshake timed out")
+        ),
+    )
+
+    snapshot = adapter.fetch_dashboard_snapshot()
+
+    assert snapshot["private_available"] is False
+    assert snapshot["private_transient"] is True

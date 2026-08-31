@@ -153,6 +153,7 @@ def test_dashboard_snapshot_failure_keeps_private_cache_and_backs_off() -> None:
         "private_error": "",
     }
     service._snapshot_at = 0.0
+    service._private_snapshot_at = 90.0
 
     class Adapter:
         def __init__(self) -> None:
@@ -165,7 +166,10 @@ def test_dashboard_snapshot_failure_keeps_private_cache_and_backs_off() -> None:
     adapter = Adapter()
     service._adapter = lambda _config, _exchange: adapter
     config = {"dashboard_snapshot_seconds": 15}
-    with patch("btc_futures_bot.dashboard.time.time", return_value=100.0):
+    with (
+        patch("btc_futures_bot.dashboard.time.time", return_value=100.0),
+        patch("btc_futures_bot.dashboard.time.monotonic", return_value=100.0),
+    ):
         stale = service._market_snapshot(config, "binance")
 
     assert stale["private_available"] is True
@@ -180,3 +184,186 @@ def test_dashboard_snapshot_failure_keeps_private_cache_and_backs_off() -> None:
 
     assert cached is stale
     assert adapter.calls == 1
+
+
+def test_dashboard_encoded_transient_failure_keeps_recent_private_snapshot() -> None:
+    service = DashboardService.__new__(DashboardService)
+    service._lock = threading.RLock()
+    service._snapshot_condition = threading.Condition(service._lock)
+    service._snapshot_refreshing = False
+    service._exchange_snapshot = {
+        "market": {"mark_price": 100.0},
+        "account": {"wallet_balance": 27.0},
+        "positions": [{"symbol": "BTCUSDT", "quantity": 0.001}],
+        "open_orders": [{"order_id": 1}],
+        "private_available": True,
+        "private_error": "",
+    }
+    service._snapshot_at = 0.0
+    service._private_snapshot_at = 90.0
+
+    class Adapter:
+        def fetch_dashboard_snapshot(self):
+            return {
+                "market": {"mark_price": 101.0},
+                "positions": [],
+                "open_orders": [],
+                "private_available": False,
+                "private_transient": True,
+                "private_error": "temporary TLS timeout",
+            }
+
+    service._adapter = lambda _config, _exchange: Adapter()
+    with (
+        patch("btc_futures_bot.dashboard.time.time", return_value=100.0),
+        patch("btc_futures_bot.dashboard.time.monotonic", return_value=100.0),
+    ):
+        stale = service._market_snapshot(
+            {
+                "dashboard_snapshot_seconds": 15,
+                "dashboard_private_stale_seconds": 90,
+            },
+            "binance",
+        )
+
+    assert stale["market"]["mark_price"] == 101.0
+    assert stale["account"]["wallet_balance"] == 27.0
+    assert stale["positions"][0]["quantity"] == 0.001
+    assert stale["private_available"] is True
+    assert stale["private_stale"] is True
+    assert stale["private_error"] == ""
+    assert "temporary TLS timeout" in stale["snapshot_error"]
+
+
+def test_dashboard_auth_failure_does_not_reuse_private_snapshot() -> None:
+    service = DashboardService.__new__(DashboardService)
+    service._lock = threading.RLock()
+    service._snapshot_condition = threading.Condition(service._lock)
+    service._snapshot_refreshing = False
+    service._exchange_snapshot = {
+        "market": {"mark_price": 100.0},
+        "account": {"wallet_balance": 27.0},
+        "private_available": True,
+    }
+    service._snapshot_at = 0.0
+    service._private_snapshot_at = 90.0
+
+    class Adapter:
+        def fetch_dashboard_snapshot(self):
+            return {
+                "market": {"mark_price": 101.0},
+                "positions": [],
+                "open_orders": [],
+                "private_available": False,
+                "private_transient": False,
+                "private_error": "invalid API key",
+            }
+
+    service._adapter = lambda _config, _exchange: Adapter()
+    with (
+        patch("btc_futures_bot.dashboard.time.time", return_value=100.0),
+        patch("btc_futures_bot.dashboard.time.monotonic", return_value=100.0),
+    ):
+        failed = service._market_snapshot(
+            {"dashboard_snapshot_seconds": 15},
+            "binance",
+        )
+
+    assert failed["private_available"] is False
+    assert "account" not in failed
+    assert failed["private_error"] == "invalid API key"
+
+
+def test_dashboard_transient_failure_does_not_reuse_expired_private_snapshot() -> None:
+    service = DashboardService.__new__(DashboardService)
+    service._lock = threading.RLock()
+    service._snapshot_condition = threading.Condition(service._lock)
+    service._snapshot_refreshing = False
+    service._exchange_snapshot = {
+        "market": {"mark_price": 100.0},
+        "account": {"wallet_balance": 27.0},
+        "private_available": True,
+    }
+    service._snapshot_at = 0.0
+    service._private_snapshot_at = 1.0
+
+    class Adapter:
+        def fetch_dashboard_snapshot(self):
+            return {
+                "market": {"mark_price": 101.0},
+                "private_available": False,
+                "private_transient": True,
+                "private_error": "temporary TLS timeout",
+            }
+
+    service._adapter = lambda _config, _exchange: Adapter()
+    with (
+        patch("btc_futures_bot.dashboard.time.time", return_value=100.0),
+        patch("btc_futures_bot.dashboard.time.monotonic", return_value=100.0),
+    ):
+        failed = service._market_snapshot(
+            {
+                "dashboard_snapshot_seconds": 15,
+                "dashboard_private_stale_seconds": 90,
+            },
+            "binance",
+        )
+
+    assert failed["private_available"] is False
+    assert "account" not in failed
+
+
+def test_dashboard_live_private_failure_never_falls_back_to_paper_equity() -> None:
+    service = DashboardService.__new__(DashboardService)
+    service._thread = None
+    service._lock = threading.RLock()
+    service.engine = None
+    service.last_result = None
+    service.last_error = ""
+    service.last_cycle_at = 0.0
+    service.started_at = 0.0
+    service._config = lambda: {
+        "mode": "live",
+        "paper_equity": 10_000.0,
+        "active_exchange": "binance",
+        "exchanges": {
+            "binance": {
+                "symbol": "BTCUSDT",
+                "environment": "production",
+                "base_url": "https://fapi.binance.com",
+            }
+        },
+    }
+    service._exchange = lambda _config: "binance"
+    service._market_snapshot = lambda _config, _exchange: {
+        "market": {"mark_price": 100.0},
+        "positions": [],
+        "open_orders": [],
+        "private_available": False,
+        "private_error": "temporary TLS timeout",
+    }
+
+    status = service.status()
+
+    assert status["account"]["source"] == "unavailable"
+    assert status["account"]["wallet_balance_raw"] == ""
+    assert status["account"]["wallet_balance_raw"] != "10000"
+    assert status["order_sizing"]["available"] is False
+
+
+def test_private_check_rejects_a_stale_cached_account() -> None:
+    service = DashboardService.__new__(DashboardService)
+    service._config = lambda: {"active_exchange": "binance", "exchanges": {"binance": {}}}
+    service._exchange = lambda _config: "binance"
+    service._market_snapshot = lambda _config, _exchange: {
+        "private_available": True,
+        "private_stale": True,
+        "account": {"wallet_balance": 27.0},
+    }
+
+    try:
+        service.private_check()
+    except RuntimeError as error:
+        assert "私有 API" in str(error)
+    else:
+        raise AssertionError("stale private data must not pass an API check")

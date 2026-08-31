@@ -21,6 +21,7 @@
   "poll_seconds": 15,
   "live_reconciliation_seconds": 5,
   "dashboard_snapshot_seconds": 15,
+  "dashboard_private_stale_seconds": 90,
   "candle_refresh_seconds": {"1m": 1, "5m": 3, "1h": 15},
   "paper_equity": 10000.0,
   "symbol": "BTC-USDT-SWAP",

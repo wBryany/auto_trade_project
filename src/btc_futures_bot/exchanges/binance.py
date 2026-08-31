@@ -3,14 +3,14 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
-import re
+import threading
 import time
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any
 from urllib.parse import urlencode
 
 from ..binance_stream import BinanceMarketStream
-from ..http_client import ApiError, format_number, request_json
+from ..http_client import ApiError, format_number, redact_url_credentials, request_json
 from ..models import Candle, OrderRequest, Position
 from .base import ExchangeAdapter, ExchangeSettings, candle_limit_for
 
@@ -37,6 +37,10 @@ class BinanceAdapter(ExchangeAdapter):
             raise ValueError("Binance USD-M symbol must use exchange format, for example BTCUSDT")
         self._symbol_rules: dict[str, Decimal] | None = None
         self._server_time_offset_ms = 0
+        self._server_time_anchor_ms = 0
+        self._server_time_anchor_monotonic = 0.0
+        self._server_time_synced_at = 0.0
+        self._server_time_lock = threading.RLock()
         self._market_stream = (
             BinanceMarketStream(
                 settings.symbol,
@@ -281,6 +285,7 @@ class BinanceAdapter(ExchangeAdapter):
         except Exception as error:  # Keep public market data visible if private auth fails.
             snapshot["private_available"] = False
             snapshot["private_error"] = str(error)
+            snapshot["private_transient"] = self._private_error_is_transient(error)
         return snapshot
 
     def close(self) -> None:
@@ -854,6 +859,27 @@ class BinanceAdapter(ExchangeAdapter):
         return str(value or "").strip().lower() in {"1", "true", "yes"}
 
     @staticmethod
+    def _private_error_is_transient(error: Exception) -> bool:
+        message = str(error).lower()
+        if isinstance(error, ApiError):
+            if error.status_code in {None, 408, 418, 425, 429, 500, 502, 503, 504}:
+                return True
+            if "-1021" in message:
+                return True
+        return isinstance(error, (TimeoutError, ConnectionError, OSError)) or any(
+            marker in message
+            for marker in (
+                "network error",
+                "timed out",
+                "timeout",
+                "ssl",
+                "connection reset",
+                "connection aborted",
+                "temporary failure",
+            )
+        )
+
+    @staticmethod
     def _decimal_string(value: Decimal) -> str:
         return format(value, "f")
 
@@ -903,42 +929,103 @@ class BinanceAdapter(ExchangeAdapter):
     def _signed(self, method: str, path: str, params: dict[str, Any] | None = None) -> Any:
         key, secret, _ = self.credentials()
         headers = {"X-MBX-APIKEY": key, "Content-Type": "application/x-www-form-urlencoded"}
-        for attempt in range(2):
+        request_method = method.upper()
+        self._ensure_server_time()
+        max_attempts = 3 if request_method == "GET" else 2
+        for attempt in range(max_attempts):
             signed_params = dict(params or {})
-            signed_params["timestamp"] = self.now_ms() + self._server_time_offset_ms
-            signed_params.setdefault("recvWindow", 5000)
+            signed_params["timestamp"] = self._server_timestamp_ms()
+            signed_params.setdefault("recvWindow", 10_000)
             query = urlencode([(name, value) for name, value in signed_params.items() if value is not None])
             signed_params["signature"] = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
             try:
-                if method.upper() in {"GET", "DELETE"}:
-                    return request_json(method, f"{self.base_url}{path}", params=signed_params, headers=headers)
+                if request_method in {"GET", "DELETE"}:
+                    return request_json(
+                        method,
+                        f"{self.base_url}{path}",
+                        params=signed_params,
+                        headers=headers,
+                        timeout=5.0,
+                        max_attempts=1,
+                    )
                 return request_json(
                     method,
                     f"{self.base_url}{path}",
                     headers=headers,
                     body=urlencode(signed_params),
+                    timeout=5.0,
                 )
             except ApiError as error:
-                # Signed GET URLs are included in transport errors. Redact the
-                # request signature before the exception can reach logs/UI.
-                safe_message = re.sub(r"([?&]signature=)[^&\s]+", r"\1[REDACTED]", str(error))
-                if attempt == 0 and "-1021" in safe_message:
-                    self._sync_server_time()
+                safe_message = redact_url_credentials(str(error))
+                has_next_attempt = attempt + 1 < max_attempts
+                if has_next_attempt and "-1021" in safe_message:
+                    self._sync_server_time(force=True)
+                    continue
+                retryable_get = (
+                    request_method == "GET"
+                    and has_next_attempt
+                    and not error.rate_limited
+                    and error.status_code in {None, 408, 425, 500, 502, 503, 504}
+                )
+                if retryable_get:
+                    time.sleep(0.5 * (2**attempt))
                     continue
                 raise ApiError(
                     safe_message,
                     status_code=error.status_code,
                     retry_at=error.retry_at,
-                ) from error
+                ) from None
         raise ApiError("Binance signed request failed after server-time synchronization")
 
-    def _sync_server_time(self) -> int:
-        started_at = self.now_ms()
-        payload = request_json("GET", f"{self.base_url}/fapi/v1/time")
-        finished_at = self.now_ms()
-        server_time = int(payload.get("serverTime") or 0)
-        if server_time <= 0:
-            raise ApiError("Binance server-time response is invalid")
-        local_midpoint = (started_at + finished_at) // 2
-        self._server_time_offset_ms = server_time - local_midpoint
-        return self._server_time_offset_ms
+    def _server_timestamp_ms(self) -> int:
+        with self._server_time_lock:
+            if self._server_time_anchor_ms > 0:
+                elapsed_ms = int(
+                    max(0.0, time.monotonic() - self._server_time_anchor_monotonic)
+                    * 1000
+                )
+                return self._server_time_anchor_ms + elapsed_ms
+            return self.now_ms() + self._server_time_offset_ms
+
+    def _ensure_server_time(self) -> None:
+        with self._server_time_lock:
+            fresh = (
+                self._server_time_anchor_ms > 0
+                and time.monotonic() - self._server_time_synced_at < 900.0
+            )
+        if fresh:
+            return
+        try:
+            self._sync_server_time(force=False)
+        except ApiError:
+            with self._server_time_lock:
+                if self._server_time_anchor_ms <= 0:
+                    raise
+
+    def _sync_server_time(self, *, force: bool = True) -> int:
+        with self._server_time_lock:
+            if (
+                not force
+                and self._server_time_anchor_ms > 0
+                and time.monotonic() - self._server_time_synced_at < 900.0
+            ):
+                return self._server_time_offset_ms
+            payload = request_json(
+                "GET",
+                f"{self.base_url}/fapi/v1/time",
+                timeout=5.0,
+                max_attempts=3,
+            )
+            finished_at = self.now_ms()
+            finished_monotonic = time.monotonic()
+            server_time = int(payload.get("serverTime") or 0)
+            if server_time <= 0:
+                raise ApiError("Binance server-time response is invalid")
+            # Anchor exchange time to monotonic time at response completion.
+            # This is deliberately conservative: asymmetric/slow network paths
+            # can make midpoint estimation run ahead of Binance by >1000 ms.
+            self._server_time_offset_ms = server_time - finished_at
+            self._server_time_anchor_ms = server_time
+            self._server_time_anchor_monotonic = finished_monotonic
+            self._server_time_synced_at = finished_monotonic
+            return self._server_time_offset_ms
