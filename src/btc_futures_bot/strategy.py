@@ -62,6 +62,9 @@ class StrategyConfig:
     traditional_setup_macd_handoff_max_extension_atr: float = 0.0
     traditional_setup_volume_handoff_max_extension_atr: float = 0.0
     traditional_allow_pullback: bool = True
+    traditional_pullback_max_range_atr: float = 0.0
+    traditional_pullback_max_extension_atr: float = 0.0
+    traditional_pullback_max_volume_ratio: float = 0.0
     traditional_allow_breakout: bool = True
     traditional_breakout_lookback: int = 6
     traditional_breakout_min_volume_ratio: float = 1.3
@@ -1023,6 +1026,18 @@ class MultiTimeframeStrategy:
             quality_rejections.append(f"{trigger_name}_long_breakout_quality_rejected")
         if current_setup.breakout_short_raw and not current_setup.breakout_short:
             quality_rejections.append(f"{trigger_name}_short_breakout_quality_rejected")
+        if (
+            self.config.traditional_allow_pullback
+            and _traditional_reclaim(trigger, "long")
+            and not current_setup.pullback_long
+        ):
+            quality_rejections.append(f"{trigger_name}_long_pullback_quality_rejected")
+        if (
+            self.config.traditional_allow_pullback
+            and _traditional_reclaim(trigger, "short")
+            and not current_setup.pullback_short
+        ):
+            quality_rejections.append(f"{trigger_name}_short_pullback_quality_rejected")
         if execution_long_alignment and not execution_long_quality:
             quality_rejections.append("1m_long_execution_quality_rejected")
         if execution_short_alignment and not execution_short_quality:
@@ -1211,8 +1226,16 @@ def _traditional_setup_state(
     )
     golden_cross = golden_cross_raw and _traditional_cross_quality(selected, "long", config)
     death_cross = death_cross_raw and _traditional_cross_quality(selected, "short", config)
-    pullback_long = config.traditional_allow_pullback and _traditional_reclaim(selected, "long")
-    pullback_short = config.traditional_allow_pullback and _traditional_reclaim(selected, "short")
+    pullback_long = (
+        config.traditional_allow_pullback
+        and _traditional_reclaim(selected, "long")
+        and _traditional_reclaim_quality(selected, config)
+    )
+    pullback_short = (
+        config.traditional_allow_pullback
+        and _traditional_reclaim(selected, "short")
+        and _traditional_reclaim_quality(selected, config)
+    )
     breakout_lookback = max(2, int(config.traditional_breakout_lookback))
     breakout_history = candles[max(0, len(candles) - breakout_lookback - 1) : -1]
     breakout_long_raw = (
@@ -2197,12 +2220,16 @@ def signal_trade_management_overrides(
     signal: Signal | None,
     config: StrategyConfig,
 ) -> dict[str, float]:
-    """Tighten profit protection only for the guarded structural scalp."""
+    """Tighten profit protection for every entry in ultra-short mode."""
 
     if signal is None:
         return {}
-    if any(
+    ultra_short_signal = any(
         reason.startswith("1m_ultra_short_trigger_") for reason in signal.reasons
+    )
+    if ultra_short_signal or (
+        config.mode == "traditional_kline"
+        and config.traditional_ultra_short_enabled
     ):
         return {
             "break_even_trigger_r": max(
@@ -2604,3 +2631,33 @@ def _traditional_reclaim(feature: _TraditionalFeatures, side: str) -> bool:
         and feature.close < feature.ema_fast
         and feature.ema_fast <= feature.ema_slow
     )
+
+
+def _traditional_reclaim_quality(
+    feature: _TraditionalFeatures,
+    config: StrategyConfig,
+) -> bool:
+    """Reject a nominal EMA reclaim when the signal candle is already a chase.
+
+    A reclaim describes where a candle closed, not how it travelled there. A
+    very large, highly extended or exceptionally high-volume candle is an
+    impulse rather than a pullback entry and should wait for a fresh setup.
+    Zero-valued limits keep backward compatibility for configurations that do
+    not opt into the guard.
+    """
+
+    if feature.atr is None or feature.atr <= 0 or feature.ema_fast is None:
+        return False
+    candle_range = feature.high - feature.low
+    if candle_range <= 0:
+        return False
+    range_cap = max(0.0, float(config.traditional_pullback_max_range_atr))
+    extension_cap = max(0.0, float(config.traditional_pullback_max_extension_atr))
+    volume_cap = max(0.0, float(config.traditional_pullback_max_volume_ratio))
+    if range_cap and candle_range / feature.atr > range_cap:
+        return False
+    if extension_cap and abs(feature.close - feature.ema_fast) / feature.atr > extension_cap:
+        return False
+    if volume_cap and (feature.volume_ratio is None or feature.volume_ratio > volume_cap):
+        return False
+    return True

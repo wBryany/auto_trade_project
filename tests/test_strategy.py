@@ -25,6 +25,7 @@ from btc_futures_bot.strategy import (
     _traditional_neutral_transition_regime,
     _traditional_predictive_reversal_short,
     _traditional_pressure_room,
+    _traditional_reclaim_quality,
     _traditional_structural_scalp_regime,
     _traditional_strong_regime_quality,
     _traditional_ultra_short_one_minute_trigger,
@@ -96,6 +97,63 @@ def test_ultra_short_one_minute_trigger_requires_fresh_volume_break() -> None:
         "break_even_lock_r": 0.15,
         "trailing_trigger_r": 0.9,
         "trailing_distance_r": 0.35,
+    }
+
+
+def test_pullback_quality_rejects_a_large_extended_volume_spike() -> None:
+    feature = _TraditionalFeatures(
+        open=78_781.7,
+        high=79_176.9,
+        low=78_707.4,
+        close=79_084.9,
+        previous_close=78_781.6,
+        ema_fast=78_855.19,
+        previous_ema_fast=78_790.0,
+        ema_slow=78_795.77,
+        previous_ema_slow=78_780.0,
+        rsi=66.18,
+        macd_histogram=18.805,
+        previous_macd_histogram=2.6,
+        atr=128.16,
+        volume_ratio=7.728,
+    )
+    guarded = StrategyConfig(
+        traditional_pullback_max_range_atr=2.0,
+        traditional_pullback_max_extension_atr=1.2,
+        traditional_pullback_max_volume_ratio=4.0,
+    )
+
+    assert not _traditional_reclaim_quality(feature, guarded)
+    assert not _traditional_reclaim_quality(
+        replace(feature, high=79_020.0, low=78_800.0, close=79_084.9, volume_ratio=2.0),
+        guarded,
+    )
+    assert not _traditional_reclaim_quality(
+        replace(feature, high=78_950.0, low=78_780.0, close=78_930.0, volume_ratio=4.01),
+        guarded,
+    )
+    assert _traditional_reclaim_quality(
+        replace(feature, high=78_950.0, low=78_780.0, close=78_930.0, volume_ratio=2.0),
+        guarded,
+    )
+
+
+def test_ultra_short_mode_manages_normal_traditional_entries_quickly() -> None:
+    signal = Signal("long", 7, 1, ("5m_pullback_reclaim",))
+    config = StrategyConfig(
+        mode="traditional_kline",
+        traditional_ultra_short_enabled=True,
+        traditional_ultra_short_break_even_trigger_r=0.7,
+        traditional_ultra_short_break_even_lock_r=0.15,
+        traditional_ultra_short_trailing_trigger_r=1.1,
+        traditional_ultra_short_trailing_distance_r=0.45,
+    )
+
+    assert signal_trade_management_overrides(signal, config) == {
+        "break_even_trigger_r": 0.7,
+        "break_even_lock_r": 0.15,
+        "trailing_trigger_r": 1.1,
+        "trailing_distance_r": 0.45,
     }
 
 
