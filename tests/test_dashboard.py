@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from unittest.mock import patch
 
 from btc_futures_bot.dashboard import (
     DASHBOARD_HTML,
@@ -138,3 +139,44 @@ def test_dashboard_market_snapshot_is_single_flight_across_tabs() -> None:
     assert adapter.calls == 1
     assert len(results) == 8
     assert all(result["market"]["mark_price"] == 100.0 for result in results)
+
+
+def test_dashboard_snapshot_failure_keeps_private_cache_and_backs_off() -> None:
+    service = DashboardService.__new__(DashboardService)
+    service._lock = threading.RLock()
+    service._snapshot_condition = threading.Condition(service._lock)
+    service._snapshot_refreshing = False
+    service._exchange_snapshot = {
+        "market": {"mark_price": 100.0},
+        "account": {"wallet_balance": 10.0},
+        "private_available": True,
+        "private_error": "",
+    }
+    service._snapshot_at = 0.0
+
+    class Adapter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def fetch_dashboard_snapshot(self):
+            self.calls += 1
+            raise OSError("temporary TLS EOF")
+
+    adapter = Adapter()
+    service._adapter = lambda _config, _exchange: adapter
+    config = {"dashboard_snapshot_seconds": 15}
+    with patch("btc_futures_bot.dashboard.time.time", return_value=100.0):
+        stale = service._market_snapshot(config, "binance")
+
+    assert stale["private_available"] is True
+    assert stale["private_stale"] is True
+    assert stale["private_error"] == ""
+    assert stale["market"]["stale"] is True
+    assert "temporary TLS EOF" in stale["snapshot_error"]
+    assert service._snapshot_at == 100.0
+
+    with patch("btc_futures_bot.dashboard.time.time", return_value=101.0):
+        cached = service._market_snapshot(config, "binance")
+
+    assert cached is stale
+    assert adapter.calls == 1

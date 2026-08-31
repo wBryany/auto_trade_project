@@ -468,9 +468,19 @@ class DashboardService:
                 stale = dict(self._exchange_snapshot)
                 stale["market"] = dict(stale.get("market") or {})
                 stale["market"]["stale"] = True
-                stale["private_available"] = False
-                stale["private_error"] = str(error)
+                stale["private_stale"] = bool(stale.get("private_available"))
+                stale["private_warning"] = "Binance 网络短暂波动，暂时显示最近一次成功快照"
+                if stale["private_stale"]:
+                    stale["private_error"] = ""
+                else:
+                    stale["private_error"] = str(error)
                 stale["snapshot_error"] = str(error)
+                # Back off for one normal snapshot interval. Without advancing
+                # the cache timestamp, every browser refresh immediately sends
+                # another group of signed REST requests while the network is
+                # still down, amplifying a short TLS interruption.
+                self._exchange_snapshot = stale
+                self._snapshot_at = time.time()
                 return stale
         finally:
             with self._snapshot_condition:
@@ -630,6 +640,8 @@ class DashboardService:
                 "market": bool(snapshot.get("market")),
                 "private": bool(snapshot.get("private_available")),
                 "private_error": snapshot.get("private_error", ""),
+                "private_stale": bool(snapshot.get("private_stale")),
+                "private_warning": snapshot.get("private_warning", ""),
             },
             "market": snapshot.get("market", {}),
             "account": account,
