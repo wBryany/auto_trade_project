@@ -508,19 +508,17 @@ def test_binance_dashboard_preserves_balance_precision_and_estimates_order_capac
                 "availableBalance": "27.39737452",
                 "totalUnrealizedProfit": "0.00000000",
                 "totalMarginBalance": "27.39737452",
-                "positions": [],
+                "positions": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "positionSide": "BOTH",
+                        "positionAmt": "0.000",
+                        "markPrice": "77500.0",
+                        "leverage": "20",
+                        "maxNotionalValue": "100000000",
+                    }
+                ],
             }
-        if path == "/fapi/v2/positionRisk":
-            return [
-                {
-                    "symbol": "BTCUSDT",
-                    "positionSide": "BOTH",
-                    "positionAmt": "0.000",
-                    "markPrice": "77500.0",
-                    "leverage": "20",
-                    "maxNotionalValue": "100000000",
-                }
-            ]
         if path in {"/fapi/v1/openOrders", "/fapi/v1/openAlgoOrders"}:
             return []
         raise AssertionError((method, path, params))

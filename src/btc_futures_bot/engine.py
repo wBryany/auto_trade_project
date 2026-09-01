@@ -618,14 +618,14 @@ class TradingEngine:
         return candles
 
     def _reconcile_binance_live_position_if_due(self, candle: Any) -> None:
-        """Throttle signed position polling while retaining exchange-side protection."""
+        """Reconcile the local position from the private WebSocket cache."""
 
         now = time.monotonic()
         interval = max(1.0, float(self.config.live_reconciliation_seconds))
         if self._last_live_reconciliation_at and now - self._last_live_reconciliation_at < interval:
             return
-        # Record the attempt before the signed request so rate-limit failures
-        # are also throttled instead of immediately retried every poll cycle.
+        # Record the attempt first so a temporarily reconnecting private stream
+        # is not queried repeatedly by every evaluation cycle.
         self._last_live_reconciliation_at = now
         self._reconcile_binance_live_position(candle)
 

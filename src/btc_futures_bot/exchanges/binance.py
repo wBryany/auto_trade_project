@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from ..binance_stream import BinanceMarketStream
+from ..binance_user_stream import BinanceUserDataStream
 from ..http_client import ApiError, format_number, redact_url_credentials, request_json
 from ..models import Candle, OrderRequest, Position
 from .base import ExchangeAdapter, ExchangeSettings, candle_limit_for
@@ -46,6 +47,18 @@ class BinanceAdapter(ExchangeAdapter):
                 settings.symbol,
                 environment,
                 stale_seconds=settings.websocket_stale_seconds,
+            )
+            if settings.websocket_enabled
+            else None
+        )
+        self._private_stream = (
+            BinanceUserDataStream(
+                settings.symbol,
+                environment,
+                self.base_url,
+                self._api_key,
+                self._fetch_private_snapshot_rest,
+                stale_seconds=max(75.0, settings.websocket_stale_seconds * 5),
             )
             if settings.websocket_enabled
             else None
@@ -96,8 +109,50 @@ class BinanceAdapter(ExchangeAdapter):
         ]
 
     def fetch_equity(self) -> float:
-        payload = self._signed("GET", "/fapi/v2/account")
+        payload = (
+            self._private_snapshot(wait_seconds=10.0)["account"]
+            if self._private_stream is not None
+            else self._signed("GET", "/fapi/v2/account")
+        )
         return float(payload.get("totalWalletBalance") or payload.get("totalMarginBalance") or 0)
+
+    def _api_key(self) -> str:
+        key, _secret, _passphrase = self.credentials()
+        return key
+
+    def _fetch_private_snapshot_rest(self) -> dict[str, Any]:
+        """Bootstrap the delta-only user stream once per connection."""
+
+        account = self._signed("GET", "/fapi/v2/account")
+        # The account response already contains the complete USD-M position
+        # array.  Reusing it removes the high-frequency /positionRisk endpoint
+        # entirely, including during private-stream reconnects.
+        positions = list(account.get("positions") or [])
+        orders = self._signed(
+            "GET",
+            "/fapi/v1/openOrders",
+            {"symbol": self.settings.symbol},
+        )
+        # Existing conditional orders are state, not deltas.  Refuse to mark
+        # the stream ready until this snapshot succeeds; treating a failed
+        # query as an empty list could hide a live exchange-side stop.
+        algo_orders = self._signed(
+            "GET",
+            "/fapi/v1/openAlgoOrders",
+            {"symbol": self.settings.symbol, "algoType": "CONDITIONAL"},
+        )
+        return {
+            "account": account,
+            "positions": positions,
+            "orders": orders,
+            "algo_orders": algo_orders,
+        }
+
+    def _private_snapshot(self, *, wait_seconds: float = 0.0) -> dict[str, Any]:
+        stream = self._private_stream
+        if stream is None:
+            return self._fetch_private_snapshot_rest()
+        return stream.snapshot(wait_seconds=wait_seconds)
 
     def fetch_mark_price(self) -> float:
         mark_price_raw, _index_price_raw, _timestamp, _source = self._market_prices()
@@ -158,6 +213,8 @@ class BinanceAdapter(ExchangeAdapter):
         }
         if self._market_stream is not None:
             snapshot["market"]["stream"] = self._market_stream.status()
+        if self._private_stream is not None:
+            snapshot["private_stream"] = self._private_stream.status()
         try:
             snapshot["order_limits"] = self.order_limits(mark_price_raw)
         except Exception as error:
@@ -167,22 +224,26 @@ class BinanceAdapter(ExchangeAdapter):
             return snapshot
 
         try:
-            account = self._signed("GET", "/fapi/v2/account")
-            position_rows = self._signed("GET", "/fapi/v2/positionRisk", {"symbol": self.settings.symbol})
-            order_rows = self._signed("GET", "/fapi/v1/openOrders", {"symbol": self.settings.symbol})
-            try:
-                algo_rows = self._signed(
-                    "GET",
-                    "/fapi/v1/openAlgoOrders",
-                    {"symbol": self.settings.symbol, "algoType": "CONDITIONAL"},
-                )
-            except Exception as error:
-                algo_rows = []
-                snapshot["private_warning"] = f"条件单读取失败：{error}"
+            private = self._private_snapshot(wait_seconds=10.0)
+            account = private["account"]
+            position_rows = private["positions"]
+            order_rows = private["orders"]
+            algo_rows = private["algo_orders"]
             wallet_balance_raw = str(account.get("totalWalletBalance") or "0")
             available_balance_raw = str(account.get("availableBalance") or "0")
-            unrealized_pnl_raw = str(account.get("totalUnrealizedProfit") or "0")
-            margin_balance_raw = str(account.get("totalMarginBalance") or "0")
+            active_rows = [
+                row for row in position_rows if abs(float(row.get("positionAmt") or 0)) > 0
+            ]
+            live_unrealized = sum(
+                (float(mark_price_raw) - float(row.get("entryPrice") or 0))
+                * abs(float(row.get("positionAmt") or 0))
+                * (1 if float(row.get("positionAmt") or 0) > 0 else -1)
+                for row in active_rows
+            )
+            unrealized_pnl_raw = self._decimal_string(Decimal(str(live_unrealized)))
+            margin_balance_raw = self._decimal_string(
+                Decimal(wallet_balance_raw) + Decimal(unrealized_pnl_raw)
+            )
             snapshot["account"] = {
                 "wallet_balance": float(wallet_balance_raw),
                 "wallet_balance_raw": wallet_balance_raw,
@@ -199,8 +260,12 @@ class BinanceAdapter(ExchangeAdapter):
                     "side": "long" if float(row.get("positionAmt") or 0) > 0 else "short",
                     "quantity": abs(float(row.get("positionAmt") or 0)),
                     "entry_price": float(row.get("entryPrice") or 0),
-                    "mark_price": float(row.get("markPrice") or 0),
-                    "unrealized_pnl": float(row.get("unRealizedProfit") or 0),
+                    "mark_price": float(mark_price_raw),
+                    "unrealized_pnl": (
+                        (float(mark_price_raw) - float(row.get("entryPrice") or 0))
+                        * abs(float(row.get("positionAmt") or 0))
+                        * (1 if float(row.get("positionAmt") or 0) > 0 else -1)
+                    ),
                     "liquidation_price": float(row.get("liquidationPrice") or 0),
                     "leverage": float(row.get("leverage") or 0),
                     "position_side": row.get("positionSide", "BOTH"),
@@ -282,6 +347,11 @@ class BinanceAdapter(ExchangeAdapter):
                     }
                 )
             snapshot["private_available"] = True
+            snapshot["private_source"] = (
+                "websocket" if self._private_stream is not None else "rest"
+            )
+            if self._private_stream is not None:
+                snapshot["private_stream"] = self._private_stream.status()
         except Exception as error:  # Keep public market data visible if private auth fails.
             snapshot["private_available"] = False
             snapshot["private_error"] = str(error)
@@ -292,6 +362,8 @@ class BinanceAdapter(ExchangeAdapter):
     def close(self) -> None:
         if self._market_stream is not None:
             self._market_stream.close()
+        if self._private_stream is not None:
+            self._private_stream.close()
 
     def symbol_rules(self) -> dict[str, Decimal]:
         if self._symbol_rules is not None:
@@ -375,13 +447,10 @@ class BinanceAdapter(ExchangeAdapter):
         if not self.has_credentials():
             raise RuntimeError("Binance live mode requires credentials for the selected environment")
         self.symbol_rules()
-        positions = self._signed("GET", "/fapi/v2/positionRisk", {"symbol": self.settings.symbol})
-        regular_orders = self._signed("GET", "/fapi/v1/openOrders", {"symbol": self.settings.symbol})
-        algo_orders = self._signed(
-            "GET",
-            "/fapi/v1/openAlgoOrders",
-            {"symbol": self.settings.symbol, "algoType": "CONDITIONAL"},
-        )
+        private = self._private_snapshot(wait_seconds=15.0)
+        positions = private["positions"]
+        regular_orders = private["orders"]
+        algo_orders = private["algo_orders"]
         active_positions = [row for row in positions if abs(float(row.get("positionAmt") or 0)) > 0]
         if active_positions or regular_orders or algo_orders:
             raise RuntimeError(
@@ -416,6 +485,9 @@ class BinanceAdapter(ExchangeAdapter):
             "position_mode": "one-way",
             "leverage": leverage,
             "flat": True,
+            "private_stream": (
+                self._private_stream.status() if self._private_stream is not None else None
+            ),
         }
 
     def place_market_order(self, request: OrderRequest) -> dict[str, Any]:
@@ -431,13 +503,20 @@ class BinanceAdapter(ExchangeAdapter):
         if request.reduce_only:
             params["reduceOnly"] = "true"
         try:
-            return self._signed("POST", "/fapi/v1/order", params)
+            result = self._signed("POST", "/fapi/v1/order", params)
+            if self._private_stream is not None:
+                self._private_stream.record_order_response(result)
+            return result
         except ApiError as error:
             message = str(error)
             ambiguous = "network error" in message or any(f"HTTP {code}" in message for code in range(500, 600))
             if not request.client_id or not ambiguous:
                 raise
             try:
+                if self._private_stream is not None:
+                    streamed = self._private_stream.wait_for_order(request.client_id, timeout=2.0)
+                    if streamed is not None:
+                        return streamed
                 return self._signed(
                     "GET",
                     "/fapi/v1/order",
@@ -616,7 +695,7 @@ class BinanceAdapter(ExchangeAdapter):
         return {"cancelled": cancelled, "errors": errors}
 
     def fetch_live_position(self) -> dict[str, Any] | None:
-        rows = self._signed("GET", "/fapi/v2/positionRisk", {"symbol": self.settings.symbol})
+        rows = self._private_snapshot(wait_seconds=3.0)["positions"]
         active = [row for row in rows if abs(float(row.get("positionAmt") or 0)) > 0]
         if not active:
             return None
@@ -628,7 +707,7 @@ class BinanceAdapter(ExchangeAdapter):
             "side": "long" if amount > 0 else "short",
             "quantity": abs(amount),
             "entry_price": float(row.get("entryPrice") or 0),
-            "mark_price": float(row.get("markPrice") or 0),
+            "mark_price": self.fetch_mark_price(),
         }
 
     def fetch_latest_close_fill(
@@ -703,6 +782,11 @@ class BinanceAdapter(ExchangeAdapter):
         ):
             if not client_id:
                 continue
+            if self._private_stream is not None:
+                streamed = self._private_stream.wait_for_algo_order(client_id, timeout=0.25)
+                if streamed is not None:
+                    result[name] = streamed
+                    continue
             try:
                 result[name] = self._signed(
                     "GET",
@@ -783,6 +867,16 @@ class BinanceAdapter(ExchangeAdapter):
         exit_side: str,
         trigger_price: float,
     ) -> dict[str, Any]:
+        if self._private_stream is not None:
+            streamed = self._private_stream.wait_for_algo_order(client_id, timeout=2.0)
+            if streamed is not None:
+                return self._validate_open_algo_order(
+                    streamed,
+                    client_id=client_id,
+                    order_type=order_type,
+                    exit_side=exit_side,
+                    trigger_price=trigger_price,
+                )
         # The Algo service can be very briefly eventually consistent after a
         # successful POST. GET requests already have transport retries; these
         # short polls only cover the visibility delay.

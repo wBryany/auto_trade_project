@@ -80,7 +80,7 @@ CSV 使用 UTF-8 BOM，Excel 可以直接打开。当前纸面/回测会完整�
 
 传统 K 线模式还支持三层防追价保护：`traditional_cross_max_extension_atr` 限制 5m 金叉/死叉确认时相对快 EMA 的扩张；`traditional_execution_rsi_*` 与 `traditional_execution_max_extension_atr` 拒绝已经过热/过冷的 1m 执行；`traditional_pressure_filter_enabled` 从已收盘 5m K 线本地合成 10m、15m K 线，并要求入场方向到 EMA/SMA 压力或支撑至少保留 `traditional_pressure_min_room_r` 倍的最小止损空间。合成过程不会增加交易所行情请求。
 
-正式环境的签名持仓对账由 `live_reconciliation_seconds` 节流，仪表盘私有快照由 `dashboard_snapshot_seconds` 缓存。默认均为 5 秒；`candle_refresh_seconds` 可分别限制 1m、5m、1h 公共 K 线请求频率，正式配置默认为 1/3/15 秒，降低短时间重复请求引发 HTTP 429 的概率。行情评估仍可按更短的 `poll_seconds` 运行，交易所硬止损不依赖轮询。
+Binance 正式环境的标记价格及 1m/5m/1h K 线使用公共 WebSocket，账户、持仓、普通订单和条件单使用 User Data Stream。私有流在连接或重连时只读取一次完整账户/挂单 REST 快照，持仓直接复用账户快照中的 `positions`，代码不再请求 `/positionRisk`；之后由 `ACCOUNT_UPDATE`、`ORDER_TRADE_UPDATE` 和 `ALGO_UPDATE` 增量维护。`live_reconciliation_seconds` 控制的是本地缓存对账频率，不会触发私有 REST 轮询。listenKey 按 Binance 要求每 30 分钟续期。仪表盘复用同一私有流并由 `dashboard_snapshot_seconds` 控制页面快照缓存。行情评估仍可按更短的 `poll_seconds` 运行，交易所硬止损不依赖本地轮询。
 
 风险配置支持 `loss_streak_pause_minutes`。当 `max_consecutive_losses` 大于 0 且连续亏损达到该值时，引擎进入有期限的长暂停；正式交易重启后会从持久化交易报表恢复最近连亏次数与剩余暂停时间。将 `max_consecutive_losses` 设为 `0` 会完全禁用连亏入场阈值，但单笔亏损后的 `cooldown_minutes` 短冷却仍然生效。
 
@@ -121,7 +121,7 @@ CSV 使用 UTF-8 BOM，Excel 可以直接打开。当前纸面/回测会完整�
 - `stop_loss_pct=0.05` 是价格波动止损，不是账户亏损 5%。在杠杆合约中，5% 价格逆向波动可能对应更大的保证金损失，甚至先于止损发生强平；
 - 欧易和 Gate 的 `contract_size` 必须按平台合约详情接口返回值填写；示例中的 `0` 会阻止误用错误的合约面值。币安 USDⓈ-M 的数量按 BTC 数量传递；
 - `max_leverage` 目前用于仓位上限计算，不会自动修改交易所账户杠杆；在测试网启动前请手动确认三家平台都是逐仓、单向持仓和不高于该值的杠杆；
-- 第一版使用 REST 轮询以便容易审计。真正 24/7 实盘还需要把行情和订单回报切到 WebSocket，并加入断线重连、订单状态对账和进程守护。
+- Binance 行情和订单/账户回报均已切到 WebSocket，并带断线重连、listenKey 续期及重连快照对账。REST 仍用于启动/重连快照、交易写操作和异常结果确认；这些操作是交易所协议的一部分，不进行周期性轮询。
 
 ## 交易所测试环境
 
