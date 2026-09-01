@@ -5,6 +5,7 @@ import json
 from btc_futures_bot.main import (
     credential_values,
     ensure_exchange_defaults,
+    load_config,
     save_dashboard_config,
 )
 
@@ -65,6 +66,71 @@ def test_dashboard_strategy_mode_requires_explicit_valid_field(tmp_path) -> None
         assert "strategy_mode" in str(error)
     else:
         raise AssertionError("invalid strategy_mode was accepted")
+
+
+def _tracked_and_local(tmp_path) -> tuple:
+    tracked = tmp_path / "config.binance.testnet.json"
+    tracked.write_text(
+        json.dumps(
+            {
+                "mode": "paper",
+                "active_exchange": "binance",
+                "exchanges": {"binance": {"enabled": True, "environment": "testnet"}},
+                "strategy": {
+                    "mode": "traditional_kline",
+                    "min_stop_cost_multiple": 3.0,
+                    "traditional_ultra_short_reversal_enabled": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    local = tmp_path / "config.binance.testnet.local.json"
+    local.write_text(
+        json.dumps(
+            {
+                "mode": "live",
+                "active_exchange": "binance",
+                "exchanges": {"binance": {"enabled": True, "environment": "production"}},
+                "strategy": {"mode": "traditional_kline", "min_score": 4},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return tracked, local
+
+
+def test_local_config_inherits_tracked_keys_it_does_not_override(tmp_path) -> None:
+    tracked, _local = _tracked_and_local(tmp_path)
+
+    config = load_config(str(tracked))
+
+    # The local file still wins wherever it sets a value...
+    assert config["mode"] == "live"
+    assert config["exchanges"]["binance"]["environment"] == "production"
+    assert config["strategy"]["min_score"] == 4
+    # ...but keys it never learned about no longer collapse to the code default.
+    assert config["strategy"]["min_stop_cost_multiple"] == 3.0
+    assert config["strategy"]["traditional_ultra_short_reversal_enabled"] is True
+
+
+def test_local_config_path_is_merged_when_passed_directly(tmp_path) -> None:
+    _tracked, local = _tracked_and_local(tmp_path)
+
+    config = load_config(str(local))
+
+    assert config["mode"] == "live"
+    assert config["strategy"]["traditional_ultra_short_reversal_enabled"] is True
+
+
+def test_config_without_a_local_companion_is_unchanged(tmp_path) -> None:
+    tracked, local = _tracked_and_local(tmp_path)
+    local.unlink()
+
+    config = load_config(str(tracked))
+
+    assert config["mode"] == "paper"
+    assert config["exchanges"]["binance"]["environment"] == "testnet"
 
 
 def test_binance_cross_exchange_symbol_and_old_endpoint_are_corrected() -> None:

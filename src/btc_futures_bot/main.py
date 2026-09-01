@@ -159,6 +159,26 @@ def _apply_config_credentials(config: dict[str, Any]) -> None:
                 os.environ[str(env_name)] = str(value)
 
 
+def tracked_config_path(path: str | Path) -> Path:
+    """Return the committed companion of a ``*.local.json`` config."""
+    config_path = Path(path)
+    if not config_path.name.endswith(".local.json"):
+        return config_path
+    return config_path.with_name(f"{config_path.name[: -len('.local.json')]}.json")
+
+
+def _merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Overlay ``override`` on ``base``, recursing into nested objects."""
+    merged = dict(base)
+    for key, value in override.items():
+        current = merged.get(key)
+        if isinstance(value, dict) and isinstance(current, dict):
+            merged[key] = _merge_config(current, value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def load_config(path: str) -> dict[str, Any]:
     requested_path = Path(path)
     selected_path = local_config_path(requested_path)
@@ -166,6 +186,16 @@ def load_config(path: str) -> dict[str, Any]:
         selected_path = requested_path
     with selected_path.open("r", encoding="utf-8") as file:
         config = json.load(file)
+    # The local file carries credentials and machine-specific overrides, but it
+    # is written key-by-key by the dashboard and drifts behind the tracked
+    # config.  Loading it standalone made any newly added strategy key fall
+    # back to its (usually disabled) code default, silently switching off
+    # branches the committed config enables.  Layering it over the tracked
+    # config keeps the override semantics while inheriting new keys.
+    tracked_path = tracked_config_path(selected_path)
+    if tracked_path != selected_path and tracked_path.exists():
+        with tracked_path.open("r", encoding="utf-8") as file:
+            config = _merge_config(json.load(file), config)
     config.setdefault("live_reconciliation_seconds", 5)
     config.setdefault("dashboard_snapshot_seconds", 15)
     config.setdefault("dashboard_private_stale_seconds", 90)

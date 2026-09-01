@@ -1318,6 +1318,7 @@ class TradingEngine:
             float(self.risk.config.stop_loss_pct),
             side=side,
             entry_price=entry_price,
+            cost_round_trip_pct=self.risk.costs.round_trip_pct,
             **overrides,
         )
 

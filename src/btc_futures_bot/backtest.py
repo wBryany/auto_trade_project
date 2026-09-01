@@ -335,6 +335,7 @@ def run_backtest(
                 risk.config.stop_loss_pct,
                 side=signal.side,
                 entry_price=entry_price,
+                cost_round_trip_pct=risk.costs.round_trip_pct,
                 **signal_stop_loss_overrides(signal, strategy.config),
             )
             protection = risk.protection(

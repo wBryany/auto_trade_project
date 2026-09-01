@@ -49,6 +49,17 @@ class CostConfig:
         return self.maker_fee_pct if self.execution == "maker" else self.taker_fee_pct
 
     @property
+    def round_trip_pct(self) -> float:
+        """Entry plus exit fee and slippage, as a share of entry notional.
+
+        Funding is excluded because it depends on the actual hold. This is the
+        price move a position must make before it breaks even, so it is also
+        the numerator of "how much of one risk unit the costs consume":
+        ``round_trip_pct / stop_loss_pct``.
+        """
+        return 2.0 * (self.fee_pct + self.slippage_pct)
+
+    @property
     def funding_intervals(self) -> int:
         return self.funding_intervals_for()
 

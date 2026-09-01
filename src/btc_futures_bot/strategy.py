@@ -32,6 +32,7 @@ class StrategyConfig:
     atr_stop_multiplier: float = 1.4
     min_stop_loss_pct: float = 0.0025
     max_stop_loss_pct: float = 0.006
+    min_stop_cost_multiple: float = 0.0
     structure_stop_lookback_bars: int = 0
     structure_stop_buffer_atr: float = 0.0
     min_hold_seconds: int = 90
@@ -289,6 +290,7 @@ def dynamic_stop_loss_pct(
     entry_price: float | None = None,
     structure_lookback_bars: int | None = None,
     maximum_stop_loss_pct: float | None = None,
+    cost_round_trip_pct: float = 0.0,
 ) -> float:
     """Return a volatility stop widened to a nearby market structure level.
 
@@ -296,6 +298,13 @@ def dynamic_stop_loss_pct(
     sits below the lowest recent trigger-bar low and a short stop above the
     highest recent high, with an optional ATR buffer.  The configured maximum
     still caps the distance so one large wick cannot create unbounded risk.
+
+    ``min_stop_cost_multiple`` additionally keeps the stop far enough away that
+    round-trip costs stay a bounded share of one risk unit.  Because position
+    size is derived from the stop distance, a stop tighter than the costs does
+    not reduce the fees paid; it only shrinks the R that those fees are
+    measured against, so ``round_trip_pct / stop_pct`` is the fraction of every
+    R handed to the exchange before the trade can work.
     """
     fallback = float(fallback)
     minimum = float(getattr(config, "min_stop_loss_pct", fallback))
@@ -304,6 +313,12 @@ def dynamic_stop_loss_pct(
         if maximum_stop_loss_pct is not None
         else getattr(config, "max_stop_loss_pct", fallback)
     )
+    cost_multiple = max(0.0, float(getattr(config, "min_stop_cost_multiple", 0.0)))
+    cost_floor = max(0.0, float(cost_round_trip_pct)) * cost_multiple
+    if cost_floor > 0:
+        # The branch maximum still wins: a cost floor may not widen risk past
+        # the ceiling the caller asked for.
+        minimum = min(max(minimum, cost_floor), maximum) if maximum > 0 else minimum
     if minimum <= 0 or maximum < minimum:
         return fallback
 

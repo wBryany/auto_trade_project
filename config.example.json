@@ -56,6 +56,7 @@
       "atr_stop_multiplier": 1.4,
       "min_stop_loss_pct": 0.0025,
       "max_stop_loss_pct": 0.0045,
+      "min_stop_cost_multiple": 3.0,
       "structure_stop_lookback_bars": 1,
       "structure_stop_buffer_atr": 0.0,
       "min_hold_seconds": 90,

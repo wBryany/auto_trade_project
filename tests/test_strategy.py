@@ -900,6 +900,81 @@ def test_dynamic_stop_keeps_legacy_atr_result_when_structure_is_disabled() -> No
     assert without_side == with_side
 
 
+def test_cost_multiple_widens_a_stop_that_costs_would_dominate() -> None:
+    candles = [
+        Candle(1, 100.0, 100.2, 99.8, 100.0, 10.0),
+        Candle(2, 100.0, 100.2, 99.9, 100.0, 10.0),
+    ]
+    config = StrategyConfig(
+        atr_period=2,
+        atr_stop_multiplier=1.0,
+        min_stop_loss_pct=0.0025,
+        max_stop_loss_pct=0.0045,
+        min_stop_cost_multiple=3.0,
+    )
+
+    # 0.05% fee and 0.02% slippage per side is a 0.14% round trip, so a 0.25%
+    # stop would hand 56% of every R to the exchange before the trade works.
+    widened = dynamic_stop_loss_pct(
+        candles,
+        config,
+        0.05,
+        side="long",
+        entry_price=100.0,
+        cost_round_trip_pct=0.0014,
+    )
+
+    assert abs(widened - 0.0042) < 1e-12
+
+
+def test_cost_multiple_never_widens_past_the_configured_maximum() -> None:
+    candles = [
+        Candle(1, 100.0, 100.2, 99.8, 100.0, 10.0),
+        Candle(2, 100.0, 100.2, 99.9, 100.0, 10.0),
+    ]
+    config = StrategyConfig(
+        atr_period=2,
+        atr_stop_multiplier=1.0,
+        min_stop_loss_pct=0.0025,
+        max_stop_loss_pct=0.0045,
+        min_stop_cost_multiple=10.0,
+    )
+
+    capped = dynamic_stop_loss_pct(
+        candles,
+        config,
+        0.05,
+        side="long",
+        entry_price=100.0,
+        cost_round_trip_pct=0.0014,
+    )
+
+    assert capped == 0.0045
+
+
+def test_cost_multiple_is_inert_when_unset_or_costs_are_unknown() -> None:
+    candles = [
+        Candle(1, 100.0, 100.2, 99.8, 100.0, 10.0),
+        Candle(2, 100.0, 100.2, 99.9, 100.0, 10.0),
+    ]
+    baseline = StrategyConfig(
+        atr_period=2,
+        atr_stop_multiplier=1.0,
+        min_stop_loss_pct=0.0025,
+        max_stop_loss_pct=0.0045,
+    )
+    configured = replace(baseline, min_stop_cost_multiple=3.0)
+
+    atr_only = dynamic_stop_loss_pct(candles, baseline, 0.05, side="long", entry_price=100.0)
+    unset = dynamic_stop_loss_pct(candles, baseline, 0.05, side="long", entry_price=100.0, cost_round_trip_pct=0.0014)
+    no_costs = dynamic_stop_loss_pct(candles, configured, 0.05, side="long", entry_price=100.0)
+
+    # The ATR stop here is 0.35%, between the 0.25% floor and the 0.45% cap.
+    assert 0.0025 < atr_only < 0.0045
+    assert unset == atr_only
+    assert no_costs == atr_only
+
+
 def test_failed_breakout_short_uses_two_bar_structure_and_special_stop_cap() -> None:
     candles = [
         Candle(1, 100.0, 110.0, 99.0, 101.0, 10.0),
