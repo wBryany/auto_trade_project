@@ -343,6 +343,52 @@ def load_dotenv(path: str = ".env") -> None:
             os.environ[key] = value
 
 
+def load_runtime_dotenv(config_path: str) -> list[str]:
+    """Load runtime secrets independently of the process working directory.
+
+    A dashboard deployment can keep its credential-bearing config in a
+    separate worktree.  ``env_file`` is therefore resolved from that config
+    first, followed by safe conventional locations for local development.
+    Earlier files win because ``load_dotenv`` never overwrites an existing
+    process variable.
+    """
+
+    requested = Path(config_path).resolve()
+    selected = local_config_path(requested)
+    if not selected.exists():
+        selected = requested
+    explicit = ""
+    if selected.exists():
+        try:
+            with selected.open("r", encoding="utf-8") as file:
+                explicit = str((json.load(file) or {}).get("env_file") or "").strip()
+        except (OSError, ValueError, TypeError):
+            explicit = ""
+    candidates: list[Path] = []
+    if explicit:
+        explicit_path = Path(explicit).expanduser()
+        if not explicit_path.is_absolute():
+            explicit_path = selected.parent / explicit_path
+        candidates.append(explicit_path)
+    candidates.extend(
+        (
+            Path(__file__).resolve().parents[2] / ".env",
+            selected.parent / ".env",
+            Path.cwd() / ".env",
+        )
+    )
+    loaded: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        identity = str(candidate.resolve())
+        if identity in seen or not candidate.is_file():
+            continue
+        seen.add(identity)
+        load_dotenv(str(candidate))
+        loaded.append(identity)
+    return loaded
+
+
 def build_engine(name: str, raw: dict[str, Any], reporter: TradeReporter | None = None) -> TradingEngine:
     account = raw.get("account", {})
     strategy = MultiTimeframeStrategy(StrategyConfig(**raw.get("strategy", {})))
@@ -425,7 +471,7 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    load_dotenv()
+    load_runtime_dotenv(args.config)
     if args.web:
         from .dashboard import run_dashboard
 

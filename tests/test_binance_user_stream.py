@@ -155,6 +155,46 @@ def test_private_stream_tracks_regular_and_algo_order_lifecycle(monkeypatch) -> 
     assert stream.wait_for_algo_order("btcbot-stop-1", timeout=0)["algoStatus"] == "FINISHED"
 
 
+def test_private_stream_maps_real_binance_algo_trigger_price_field(monkeypatch) -> None:
+    stream = _stream()
+    monkeypatch.setattr(stream, "start", lambda **_kwargs: True)
+
+    stream.process_message(
+        json.dumps(
+            {
+                "e": "ALGO_UPDATE",
+                "T": 1_788_295_142_173,
+                "E": 1_788_295_142_180,
+                "o": {
+                    "caid": "btcbot-stop-live-shape",
+                    "aid": 2_000_001_402_291_671,
+                    "at": "CONDITIONAL",
+                    "o": "STOP_MARKET",
+                    "s": "BTCUSDT",
+                    "S": "BUY",
+                    "ps": "BOTH",
+                    "q": "0",
+                    "X": "NEW",
+                    "tp": "77683.80",
+                    "p": "0",
+                    "wt": "MARK_PRICE",
+                    "cp": True,
+                    "R": True,
+                },
+            }
+        )
+    )
+
+    cached = stream.wait_for_algo_order("btcbot-stop-live-shape", timeout=0)
+
+    assert cached is not None
+    assert cached["triggerPrice"] == "77683.80"
+    assert cached["clientAlgoId"] == "btcbot-stop-live-shape"
+    assert cached["orderType"] == "STOP_MARKET"
+    assert cached["workingType"] == "MARK_PRICE"
+    assert cached["closePosition"] is True
+
+
 def test_listen_key_management_uses_api_key_without_signature(monkeypatch) -> None:
     stream = _stream()
     calls = []

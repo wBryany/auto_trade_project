@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from datetime import datetime
@@ -64,6 +66,32 @@ def test_email_config_rejects_more_than_five_recipients() -> None:
         assert "最多支持 5 个" in str(error)
     else:
         raise AssertionError("six recipients must be rejected")
+
+
+def test_runtime_dotenv_uses_configured_file_outside_working_directory(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runtime = tmp_path / "runtime"
+    secrets = tmp_path / "secrets"
+    other_working_directory = tmp_path / "elsewhere"
+    runtime.mkdir()
+    secrets.mkdir()
+    other_working_directory.mkdir()
+    env_path = secrets / "mail.env"
+    env_path.write_text("TEST_RUNTIME_EMAIL_PASSWORD=loaded-from-config\n", encoding="utf-8")
+    config_path = runtime / "config.local.json"
+    config_path.write_text(
+        json.dumps({"env_file": str(env_path)}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("TEST_RUNTIME_EMAIL_PASSWORD", raising=False)
+    monkeypatch.chdir(other_working_directory)
+
+    loaded = main_module.load_runtime_dotenv(str(config_path))
+
+    assert str(env_path.resolve()) in loaded
+    assert os.environ["TEST_RUNTIME_EMAIL_PASSWORD"] == "loaded-from-config"
 
 
 def test_open_and_close_messages_include_trade_details(tmp_path: Path) -> None:

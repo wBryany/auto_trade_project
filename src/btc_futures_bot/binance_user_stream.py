@@ -481,7 +481,14 @@ class BinanceUserDataStream:
             "symbol": update.get("symbol") or update.get("s") or self.symbol,
             "side": update.get("side") or update.get("S"),
             "positionSide": update.get("positionSide") or update.get("ps") or "BOTH",
-            "triggerPrice": update.get("triggerPrice") or update.get("sp") or "0",
+            # ALGO_UPDATE uses the compact ``tp`` field for trigger price.
+            # ``sp`` belongs to the legacy regular-order event shape.
+            "triggerPrice": (
+                update.get("triggerPrice")
+                or update.get("tp")
+                or update.get("sp")
+                or "0"
+            ),
             "price": update.get("price") or update.get("p") or "0",
             "quantity": update.get("quantity") or update.get("q") or "0",
             "closePosition": update.get("closePosition") or update.get("cp") or False,

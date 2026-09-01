@@ -284,6 +284,17 @@ class DashboardService:
             mode = str(config.get("mode", "paper"))
             exchange_config = config.get("exchanges", {}).get(exchange_name, {})
             self.exchange_name = exchange_name
+            # The dashboard may have opened a read-only adapter while the
+            # engine was stopped. Binance returns the same active listenKey
+            # for the account, so close that stream before creating the engine
+            # stream; closing it afterwards would invalidate the new stream.
+            dashboard_adapter = self._dashboard_adapter
+            if dashboard_adapter is not None:
+                close_dashboard_adapter = getattr(dashboard_adapter, "close", None)
+                if close_dashboard_adapter is not None:
+                    close_dashboard_adapter()
+                self._dashboard_adapter = None
+                self._dashboard_adapter_key = None
             self.reporter = TradeReporter(
                 report_directory(config, exchange_name),
                 config.get("report_timezone", "Asia/Shanghai"),
@@ -295,13 +306,6 @@ class DashboardService:
                     if mode == "live"
                     else {"prepared": False, "mode": mode}
                 )
-                dashboard_adapter = self._dashboard_adapter
-                if dashboard_adapter is not None and dashboard_adapter is not self.engine.adapter:
-                    close_dashboard_adapter = getattr(dashboard_adapter, "close", None)
-                    if close_dashboard_adapter is not None:
-                        close_dashboard_adapter()
-                    self._dashboard_adapter = None
-                    self._dashboard_adapter_key = None
             except Exception:
                 if self.engine is not None:
                     self.engine.close()
