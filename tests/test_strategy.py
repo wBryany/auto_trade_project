@@ -232,6 +232,77 @@ def test_ultra_short_reversal_reclaims_a_fresh_one_minute_extreme() -> None:
     )
 
 
+def test_ultra_short_reversal_rejects_adverse_5m_momentum_and_thin_liquidity() -> None:
+    candles = [
+        Candle(index * 60_000, 100.0, 100.2, 99.8, 100.0, 10.0)
+        for index in range(30)
+    ]
+    candles[-2] = Candle(candles[-2].timestamp, 100.0, 100.1, 98.8, 99.2, 25.0)
+    candles[-1] = Candle(candles[-1].timestamp, 99.2, 100.5, 99.1, 100.4, 25.0)
+    execution = _TraditionalFeatures(
+        open=99.2,
+        high=100.5,
+        low=99.1,
+        close=100.4,
+        previous_close=99.2,
+        ema_fast=99.8,
+        previous_ema_fast=99.7,
+        ema_slow=100.0,
+        previous_ema_slow=100.0,
+        rsi=45.0,
+        macd_histogram=0.4,
+        previous_macd_histogram=-0.2,
+        atr=1.0,
+        volume_ratio=2.0,
+    )
+    trigger = replace(
+        execution,
+        close=99.5,
+        ema_fast=100.0,
+        macd_histogram=-2.0,
+        previous_macd_histogram=-1.0,
+        volume_ratio=1.0,
+    )
+    config = StrategyConfig(
+        traditional_signal_fast=3,
+        traditional_signal_slow=5,
+        traditional_rsi_period=3,
+        traditional_macd_fast=3,
+        traditional_macd_slow=6,
+        traditional_macd_signal=2,
+        traditional_atr_period=3,
+        traditional_volume_sma_period=5,
+        traditional_ultra_short_1m_lookback=8,
+        traditional_ultra_short_1m_min_volume_ratio=0.9,
+        traditional_ultra_short_reversal_pivot_bars=3,
+        traditional_ultra_short_reversal_momentum_guard_enabled=True,
+        traditional_ultra_short_reversal_max_adverse_macd_atr=0.05,
+        traditional_ultra_short_reversal_min_liquidity_volume_ratio=0.65,
+    )
+
+    assert not _traditional_ultra_short_reversal_one_minute_trigger(
+        candles,
+        execution,
+        trigger,
+        "long",
+        config,
+    )
+    assert _traditional_ultra_short_reversal_one_minute_trigger(
+        candles,
+        execution,
+        replace(trigger, macd_histogram=-0.98),
+        "long",
+        config,
+    )
+    assert not _traditional_ultra_short_reversal_one_minute_trigger(
+        candles,
+        replace(execution, volume_ratio=0.4),
+        replace(trigger, macd_histogram=-0.98, volume_ratio=0.5),
+        "long",
+        config,
+    )
+
+
 def test_ultra_short_reversal_accepts_effort_before_a_quiet_final_undercut() -> None:
     candles = [
         Candle(index * 60_000, 100.0, 100.2, 99.8, 100.0, 10.0)

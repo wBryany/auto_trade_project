@@ -107,6 +107,9 @@ class StrategyConfig:
     traditional_ultra_short_reversal_5m_min_volume_ratio: float = 0.9
     traditional_ultra_short_reversal_1m_strong_volume_ratio: float = 1.25
     traditional_ultra_short_reversal_1m_strong_range_atr: float = 1.5
+    traditional_ultra_short_reversal_momentum_guard_enabled: bool = False
+    traditional_ultra_short_reversal_max_adverse_macd_atr: float = 0.05
+    traditional_ultra_short_reversal_min_liquidity_volume_ratio: float = 0.0
     traditional_ultra_short_pullback_reversal_enabled: bool = False
     traditional_ultra_short_pullback_reversal_rsi_long_max: float = 55.0
     traditional_ultra_short_pullback_reversal_rsi_short_min: float = 45.0
@@ -2840,6 +2843,36 @@ def _traditional_ultra_short_reversal_one_minute_trigger(
         or trigger.atr is None
         or trigger.atr <= 0
     ):
+        return False
+
+    # The 1m reclaim is intentionally early, but it must not fight a 5m wave
+    # that is still accelerating in the opposite direction.  The ATR-scaled
+    # tolerance permits anticipation near a turn without requiring the slower
+    # 5m MACD crossover to have completed first.
+    if bool(config.traditional_ultra_short_reversal_momentum_guard_enabled):
+        if trigger.macd_histogram is None or trigger.previous_macd_histogram is None:
+            return False
+        max_adverse_momentum = max(
+            0.0,
+            float(config.traditional_ultra_short_reversal_max_adverse_macd_atr),
+        ) * trigger.atr
+        macd_change = trigger.macd_histogram - trigger.previous_macd_histogram
+        if side == "long" and macd_change < -max_adverse_momentum:
+            return False
+        if side == "short" and macd_change > max_adverse_momentum:
+            return False
+
+    # A wide candle alone is not reliable liquidity.  Requiring modest volume
+    # on either the 5m context or the 1m reclaim filters thin fake turns while
+    # retaining high-effort exhaustion moves.
+    min_liquidity_volume_ratio = max(
+        0.0,
+        float(config.traditional_ultra_short_reversal_min_liquidity_volume_ratio),
+    )
+    if min_liquidity_volume_ratio and max(
+        float(trigger.volume_ratio or 0.0),
+        float(execution.volume_ratio or 0.0),
+    ) < min_liquidity_volume_ratio:
         return False
 
     current_index = len(candles) - 1
