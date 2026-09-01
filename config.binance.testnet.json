@@ -22,6 +22,8 @@
   "live_reconciliation_seconds": 5,
   "dashboard_snapshot_seconds": 15,
   "dashboard_private_stale_seconds": 90,
+  "private_entry_retry_seconds": 45,
+  "private_entry_retry_interval_seconds": 5,
   "candle_refresh_seconds": {"1m": 1, "5m": 3, "1h": 15},
   "paper_equity": 10000.0,
   "candle_limit": 300,

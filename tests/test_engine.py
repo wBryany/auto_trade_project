@@ -939,3 +939,136 @@ def test_live_minimum_order_fallback_emails_and_skips_when_capacity_is_too_low()
     assert result.position is None
     assert len(notifier.messages) == 1
     assert notifier.messages[0]["minimum_notional"] == 100.0
+
+
+def test_transient_private_failure_retries_same_signal_with_fresh_price() -> None:
+    class Adapter:
+        name = "binance"
+        settings = SimpleNamespace(symbol="BTCUSDT", environment="production")
+
+        def __init__(self) -> None:
+            self.snapshot_reads = 0
+            self.mark_reads = 0
+            self.entry_request = None
+
+        @staticmethod
+        def fetch_candles(interval: str, limit: int) -> list[Candle]:
+            return [
+                Candle(1, 100.0, 100.1, 99.9, 100.0, 10.0),
+                Candle(2, 100.0, 100.1, 99.9, 100.0, 1.0),
+            ]
+
+        @staticmethod
+        def fetch_live_position() -> None:
+            return None
+
+        @staticmethod
+        def fetch_equity() -> float:
+            return 1.0
+
+        def fetch_mark_price(self) -> float:
+            self.mark_reads += 1
+            return 101.0
+
+        @staticmethod
+        def normalize_order_quantity(quantity: float, reference_price: float) -> float:
+            if quantity < 1.0:
+                raise ValueError("Binance quantity is below minimum")
+            return 1.0
+
+        def fetch_dashboard_snapshot(self) -> dict:
+            self.snapshot_reads += 1
+            if self.snapshot_reads == 1:
+                return {
+                    "private_available": False,
+                    "private_transient": True,
+                    "private_error": "TLS handshake timed out while reading openOrders",
+                    "order_limits": {
+                        "effective_min_quantity_raw": "1",
+                        "effective_min_notional_raw": "100",
+                        "estimated_max_open_quantity_raw": "0",
+                        "estimated_max_open_notional_raw": "0",
+                    },
+                }
+            return {
+                "private_available": True,
+                "order_limits": {
+                    "effective_min_quantity_raw": "1",
+                    "effective_min_notional_raw": "101",
+                    "estimated_max_open_quantity_raw": "2",
+                    "estimated_max_open_notional_raw": "202",
+                },
+            }
+
+        def place_market_order(self, request: object) -> dict:
+            self.entry_request = request
+            return {"orderId": 11, "status": "FILLED", "executedQty": "1", "avgPrice": "101"}
+
+        @staticmethod
+        def market_fill(payload: dict, *, fallback_price: float) -> tuple[float, float]:
+            return float(payload["executedQty"]), float(payload["avgPrice"])
+
+        @staticmethod
+        def place_protection_orders(position: Position, **kwargs: object) -> dict:
+            return {"stop": {"algoId": 21}, "take_profit": None, "confirmed": True}
+
+    class Strategy:
+        config = StrategyConfig(trigger_timeframe="5m", regime_timeframe="1h")
+
+        @staticmethod
+        def evaluate(candles_by_timeframe: object) -> Signal:
+            return Signal("long", 6, 1, ("fixed",))
+
+    class Notifier:
+        def __init__(self) -> None:
+            self.private_messages = []
+            self.capacity_messages = []
+
+        def notify_private_api_unavailable(self, **payload: object) -> None:
+            self.private_messages.append(payload)
+
+        def notify_order_unavailable(self, **payload: object) -> None:
+            self.capacity_messages.append(payload)
+
+        @staticmethod
+        def notify_open(*args: object, **kwargs: object) -> None:
+            return None
+
+    adapter = Adapter()
+    notifier = Notifier()
+    risk = RiskManager(
+        RiskConfig(risk_per_trade=0.02, stop_loss_pct=0.005, max_notional_pct=0.3),
+        max_leverage=20,
+    )
+    engine = TradingEngine(
+        adapter,
+        Strategy(),
+        risk,
+        EngineConfig(
+            mode="live",
+            private_entry_retry_seconds=45,
+            private_entry_retry_interval_seconds=1,
+        ),
+        notifier=notifier,
+    )
+
+    first = engine.evaluate_once()
+    assert first.status == "private_api_retry_scheduled"
+    assert first.position is None
+    assert first.raw["retry_scheduled"] is True
+    assert len(notifier.private_messages) == 1
+    assert notifier.capacity_messages == []
+
+    # Make the scheduled retry immediately eligible without slowing the test.
+    engine._private_entry_retry_next_at = 0.0
+    second = engine.evaluate_once()
+
+    assert second.status == "live_order_protected"
+    assert second.position is not None
+    assert second.position.entry_price == 101.0
+    assert adapter.mark_reads == 1
+    assert adapter.snapshot_reads == 2
+    assert adapter.entry_request.quantity == 1.0
+    assert len(notifier.private_messages) == 1
+    assert notifier.capacity_messages == []
+    assert engine._private_entry_retry_signal_timestamp == 0

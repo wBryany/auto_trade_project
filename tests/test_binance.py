@@ -483,6 +483,7 @@ def test_binance_private_failure_is_not_reported_as_connected(monkeypatch) -> No
     assert snapshot["private_available"] is False
     assert "invalid credentials" in snapshot["private_error"]
     assert snapshot["private_transient"] is False
+    assert snapshot["private_retryable"] is False
 
 
 def test_binance_dashboard_preserves_balance_precision_and_estimates_order_capacity(monkeypatch) -> None:
@@ -670,3 +671,11 @@ def test_binance_private_network_failure_is_marked_transient(monkeypatch) -> Non
 
     assert snapshot["private_available"] is False
     assert snapshot["private_transient"] is True
+    assert snapshot["private_retryable"] is True
+
+
+def test_binance_rate_limit_is_transient_for_display_but_not_entry_retry() -> None:
+    error = ApiError("HTTP 429 rate limited", status_code=429)
+
+    assert BinanceAdapter._private_error_is_transient(error) is True
+    assert BinanceAdapter._private_error_is_retryable(error) is False

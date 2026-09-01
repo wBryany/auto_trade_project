@@ -230,6 +230,44 @@ class EmailNotifier:
         )
         return self._enqueue(_QueuedEmail("下单金额不足", body, "order_unavailable"))
 
+    def notify_private_api_unavailable(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        mode: str,
+        side: str,
+        current_price: float,
+        reason: str,
+        retryable: bool,
+        retry_seconds: float,
+    ) -> bool:
+        """Notify that entry was blocked by private-API availability, not funds."""
+        now = self._now_fn().astimezone(ZoneInfo(self.config.timezone))
+        direction = "做多" if side == "long" else "做空"
+        if retryable:
+            handling = (
+                f"本次未发送开仓订单；信号将在接下来约 {max(1, int(round(retry_seconds)))} 秒内保留。"
+                "每次重试都会重新校验信号、当前价格和账户状态，条件失效则自动放弃。"
+            )
+        else:
+            handling = "本次未发送开仓订单，信号已放弃；请检查 API 权限或网络连接。"
+        body = "\n".join(
+            (
+                "Binance 私有 API 暂时不可用通知",
+                f"时间：{now:%Y-%m-%d %H:%M:%S %Z}",
+                f"平台/模式：{exchange} / {mode}",
+                f"合约：{symbol}",
+                f"方向：{direction}",
+                f"当前标记价格：{current_price:.4f}",
+                f"未下单原因：{reason}",
+                f"处理结果：{handling}",
+            )
+        )
+        return self._enqueue(
+            _QueuedEmail("私有 API 暂时不可用", body, "private_api_unavailable")
+        )
+
     def notify_close(
         self,
         record: TradeRecord,

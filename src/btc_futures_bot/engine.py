@@ -45,6 +45,8 @@ class EngineConfig:
     reconciliation_state_path: str = ""
     live_reconciliation_seconds: float = 5.0
     candle_refresh_seconds: dict[str, float] = field(default_factory=dict)
+    private_entry_retry_seconds: float = 45.0
+    private_entry_retry_interval_seconds: float = 5.0
 
 
 class TradingEngine:
@@ -80,6 +82,12 @@ class TradingEngine:
         self._last_live_reconciliation_at = 0.0
         self._candle_cache: dict[str, list[Any]] = {}
         self._candle_cache_at: dict[str, float] = {}
+        self._private_entry_retry_signal_timestamp = 0
+        self._private_entry_retry_side = ""
+        self._private_entry_retry_started_at = 0.0
+        self._private_entry_retry_deadline = 0.0
+        self._private_entry_retry_next_at = 0.0
+        self._private_entry_retry_notice_sent = False
 
     def prepare_live(self) -> dict[str, Any]:
         if self.config.mode != "live":
@@ -207,6 +215,25 @@ class TradingEngine:
         ):
             self.pending_macro_signal = None
         LOG.info("%s signal=%s score=%s reasons=%s", self.adapter.name, signal.side, signal.score, ",".join(signal.reasons))
+        retry_pending = self._private_entry_retry_pending(signal)
+        if self.position is not None:
+            self._clear_private_entry_retry()
+            retry_pending = False
+        elif signal.side == "flat":
+            self._clear_private_entry_retry()
+        elif self._private_entry_retry_signal_timestamp and not retry_pending:
+            self._clear_private_entry_retry()
+        if retry_pending and time.monotonic() < self._private_entry_retry_next_at:
+            return TradeResult(
+                self.adapter.name,
+                "private_api_retry_wait",
+                signal=signal,
+                position=self.position,
+                raw={
+                    "retry_deadline_monotonic": self._private_entry_retry_deadline,
+                    "retry_next_at_monotonic": self._private_entry_retry_next_at,
+                },
+            )
         live_mark_price: float | None = None
         if self.config.mode == "live" and self.position is not None:
             # The exchange-side stop and take-profit remain the outage-safe
@@ -221,10 +248,16 @@ class TradingEngine:
             )
             if active_exit is not None:
                 return active_exit
-        if signal.side == "flat" or signal.timestamp == self.last_signal_timestamp:
+        if signal.side == "flat" or (
+            signal.timestamp == self.last_signal_timestamp and not retry_pending
+        ):
             return TradeResult(self.adapter.name, "no_action", signal=signal, position=self.position)
 
         execution_candles = candles_by_timeframe.get("1m") or candles_by_timeframe[trigger_timeframe]
+        if retry_pending and self.config.mode == "live":
+            # A retry must use the current venue price, not the close that was
+            # current when the original private request failed.
+            live_mark_price = self.adapter.fetch_mark_price()
         current_price = live_mark_price or execution_candles[-1].close
         if self.position is not None:
             if self.position.side == signal.side:
@@ -260,7 +293,57 @@ class TradingEngine:
         if not self._entry_allowed():
             return TradeResult(self.adapter.name, "risk_blocked", signal=signal, position=self.position)
 
-        equity = self.config.paper_equity if self.config.mode != "live" else self.adapter.fetch_equity()
+        entry_attempt_started_at = (
+            self._private_entry_retry_started_at
+            if retry_pending
+            else time.monotonic()
+        )
+        if self.config.mode == "live":
+            try:
+                equity = self.adapter.fetch_equity()
+            except Exception as private_error:
+                retryable = self._is_retryable_private_error(private_error)
+                private_raw: dict[str, Any] = {
+                    "blocked": True,
+                    "private_api_unavailable": True,
+                    "private_error": f"无法读取账户权益：{private_error}",
+                    "retryable_private_error": retryable,
+                }
+                if retryable:
+                    retry_scheduled = self._schedule_private_entry_retry(
+                        signal,
+                        current_price,
+                        private_raw,
+                        started_at=entry_attempt_started_at,
+                    )
+                    return TradeResult(
+                        self.adapter.name,
+                        (
+                            "private_api_retry_scheduled"
+                            if retry_scheduled
+                            else "private_api_unavailable"
+                        ),
+                        signal=signal,
+                        position=self.position,
+                        raw=private_raw,
+                    )
+                self._notify_private_api_unavailable(
+                    signal,
+                    current_price,
+                    str(private_raw["private_error"]),
+                    retryable=False,
+                    retry_seconds=0.0,
+                )
+                self._clear_private_entry_retry()
+                return TradeResult(
+                    self.adapter.name,
+                    "private_api_unavailable",
+                    signal=signal,
+                    position=self.position,
+                    raw=private_raw,
+                )
+        else:
+            equity = self.config.paper_equity
         stop_timeframe = signal_stop_timeframe(signal, self.strategy.config)
         stop_candles = candles_by_timeframe.get(
             stop_timeframe,
@@ -292,6 +375,41 @@ class TradingEngine:
                 signal,
             )
             if requested_quantity is None:
+                if sizing_raw.get("private_api_unavailable"):
+                    if sizing_raw.get("retryable_private_error"):
+                        retry_scheduled = self._schedule_private_entry_retry(
+                            signal,
+                            current_price,
+                            sizing_raw,
+                            started_at=entry_attempt_started_at,
+                        )
+                        return TradeResult(
+                            self.adapter.name,
+                            (
+                                "private_api_retry_scheduled"
+                                if retry_scheduled
+                                else "private_api_unavailable"
+                            ),
+                            signal=signal,
+                            position=self.position,
+                            raw=sizing_raw,
+                        )
+                    self._notify_private_api_unavailable(
+                        signal,
+                        current_price,
+                        str(sizing_raw.get("private_error") or "私有 API 不可用"),
+                        retryable=False,
+                        retry_seconds=0.0,
+                    )
+                    self._clear_private_entry_retry()
+                    return TradeResult(
+                        self.adapter.name,
+                        "private_api_unavailable",
+                        signal=signal,
+                        position=self.position,
+                        raw=sizing_raw,
+                    )
+                self._clear_private_entry_retry()
                 return TradeResult(
                     self.adapter.name,
                     "minimum_order_unavailable",
@@ -299,6 +417,7 @@ class TradingEngine:
                     position=self.position,
                     raw=sizing_raw,
                 )
+            self._clear_private_entry_retry()
             if not self.risk.is_cost_effective(
                 signal.side,
                 current_price,
@@ -909,12 +1028,14 @@ class TradingEngine:
         try:
             snapshot = self.adapter.fetch_dashboard_snapshot()
         except Exception as snapshot_error:
-            sizing.update({"blocked": True, "capacity_error": str(snapshot_error)})
-            self._notify_order_unavailable(
-                signal,
-                reference_price,
-                sizing,
-                f"无法确认账户是否足以开交易所最小订单：{snapshot_error}",
+            reason = f"无法读取 Binance 私有账户数据：{snapshot_error}"
+            sizing.update(
+                {
+                    "blocked": True,
+                    "private_api_unavailable": True,
+                    "private_error": reason,
+                    "retryable_private_error": self._is_retryable_private_error(snapshot_error),
+                }
             )
             return None, sizing
 
@@ -931,16 +1052,27 @@ class TradingEngine:
                 "available_notional": available_notional,
             }
         )
+        private_available = bool(snapshot.get("private_available"))
+        if not private_available:
+            reason = str(snapshot.get("private_error") or "Binance 私有 API 不可用")
+            sizing.update(
+                {
+                    "blocked": True,
+                    "private_api_unavailable": True,
+                    "private_error": reason,
+                    "retryable_private_error": bool(
+                        snapshot.get("private_retryable", snapshot.get("private_transient"))
+                    ),
+                }
+            )
+            return None, sizing
         if minimum_quantity <= 0 or desired_quantity + 1e-12 >= minimum_quantity:
             # The original normalization error was not caused by the minimum
             # order threshold, so it must not be silently converted into a
             # different quantity.
             raise original_normalization_error
-
-        private_available = bool(snapshot.get("private_available"))
         capacity_sufficient = (
-            private_available
-            and available_quantity + 1e-12 >= minimum_quantity
+            available_quantity + 1e-12 >= minimum_quantity
             and available_notional + 1e-9 >= minimum_notional
         )
         if not capacity_sufficient:
@@ -979,6 +1111,105 @@ class TradingEngine:
             minimum_notional,
         )
         return selected, sizing
+
+    def _private_entry_retry_pending(self, signal: Signal) -> bool:
+        return bool(
+            self._private_entry_retry_signal_timestamp
+            and signal.timestamp == self._private_entry_retry_signal_timestamp
+            and signal.side == self._private_entry_retry_side
+            and time.monotonic() <= self._private_entry_retry_deadline
+        )
+
+    def _schedule_private_entry_retry(
+        self,
+        signal: Signal,
+        current_price: float,
+        sizing: dict[str, Any],
+        *,
+        started_at: float,
+    ) -> bool:
+        now = time.monotonic()
+        same_signal = bool(
+            self._private_entry_retry_signal_timestamp == signal.timestamp
+            and self._private_entry_retry_side == signal.side
+        )
+        if not same_signal:
+            retry_seconds = max(0.0, float(self.config.private_entry_retry_seconds))
+            self._private_entry_retry_signal_timestamp = signal.timestamp
+            self._private_entry_retry_side = signal.side
+            self._private_entry_retry_started_at = started_at
+            self._private_entry_retry_deadline = started_at + retry_seconds
+            self._private_entry_retry_notice_sent = False
+
+        remaining = max(0.0, self._private_entry_retry_deadline - now)
+        retry_scheduled = remaining > 0
+        interval = max(1.0, float(self.config.private_entry_retry_interval_seconds))
+        self._private_entry_retry_next_at = min(
+            self._private_entry_retry_deadline,
+            now + interval,
+        )
+        sizing.update(
+            {
+                "retry_scheduled": retry_scheduled,
+                "retry_remaining_seconds": remaining,
+                "retry_interval_seconds": interval,
+            }
+        )
+        if not self._private_entry_retry_notice_sent:
+            self._notify_private_api_unavailable(
+                signal,
+                current_price,
+                str(sizing.get("private_error") or "Binance 私有 API 暂时不可用"),
+                retryable=retry_scheduled,
+                retry_seconds=remaining,
+            )
+            self._private_entry_retry_notice_sent = True
+        if not retry_scheduled:
+            self._clear_private_entry_retry()
+        return retry_scheduled
+
+    def _clear_private_entry_retry(self) -> None:
+        self._private_entry_retry_signal_timestamp = 0
+        self._private_entry_retry_side = ""
+        self._private_entry_retry_started_at = 0.0
+        self._private_entry_retry_deadline = 0.0
+        self._private_entry_retry_next_at = 0.0
+        self._private_entry_retry_notice_sent = False
+
+    def _notify_private_api_unavailable(
+        self,
+        signal: Signal,
+        current_price: float,
+        reason: str,
+        *,
+        retryable: bool,
+        retry_seconds: float,
+    ) -> None:
+        if self.notifier is None:
+            return
+        notify = getattr(self.notifier, "notify_private_api_unavailable", None)
+        if not callable(notify):
+            return
+        try:
+            notify(
+                exchange=self.adapter.name,
+                symbol=self.adapter.settings.symbol,
+                mode=self.config.mode,
+                side=signal.side,
+                current_price=current_price,
+                reason=reason,
+                retryable=retryable,
+                retry_seconds=retry_seconds,
+            )
+        except Exception:  # Notification failures must never affect order safety.
+            LOG.exception("private-API email notification failed; entry remains blocked")
+
+    @staticmethod
+    def _is_retryable_private_error(error: Exception) -> bool:
+        if isinstance(error, ApiError):
+            status = error.status_code
+            return status is None or status in {408, 425} or status >= 500
+        return isinstance(error, (TimeoutError, ConnectionError, OSError))
 
     def _notify_order_unavailable(
         self,

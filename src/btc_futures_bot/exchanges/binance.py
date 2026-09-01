@@ -286,6 +286,7 @@ class BinanceAdapter(ExchangeAdapter):
             snapshot["private_available"] = False
             snapshot["private_error"] = str(error)
             snapshot["private_transient"] = self._private_error_is_transient(error)
+            snapshot["private_retryable"] = self._private_error_is_retryable(error)
         return snapshot
 
     def close(self) -> None:
@@ -866,6 +867,30 @@ class BinanceAdapter(ExchangeAdapter):
                 return True
             if "-1021" in message:
                 return True
+        return isinstance(error, (TimeoutError, ConnectionError, OSError)) or any(
+            marker in message
+            for marker in (
+                "network error",
+                "timed out",
+                "timeout",
+                "ssl",
+                "connection reset",
+                "connection aborted",
+                "temporary failure",
+            )
+        )
+
+    @staticmethod
+    def _private_error_is_retryable(error: Exception) -> bool:
+        """Return whether an entry may safely retry after a short backoff."""
+        message = str(error).lower()
+        if isinstance(error, ApiError):
+            status = error.status_code
+            if status is None or status in {408, 425, 500, 502, 503, 504}:
+                return True
+            if "-1021" in message:
+                return True
+            return False
         return isinstance(error, (TimeoutError, ConnectionError, OSError)) or any(
             marker in message
             for marker in (

@@ -148,6 +148,33 @@ def test_minimum_order_unavailable_email_includes_capacity_details(tmp_path: Pat
     assert "没有发送开仓订单" in messages[0].get_content()
 
 
+def test_private_api_unavailable_email_is_not_labeled_as_insufficient_funds(
+    tmp_path: Path,
+) -> None:
+    messages = []
+    notifier = EmailNotifier(_email_config(tmp_path), send_fn=messages.append)
+
+    notifier.notify_private_api_unavailable(
+        exchange="binance",
+        symbol="BTCUSDT",
+        mode="live",
+        side="long",
+        current_price=78_524.5,
+        reason="network error GET /fapi/v1/openOrders: TLS handshake timed out",
+        retryable=True,
+        retry_seconds=32.4,
+    )
+    assert notifier.flush()
+    notifier.close()
+
+    assert len(messages) == 1
+    assert messages[0]["Subject"] == "私有 API 暂时不可用"
+    content = messages[0].get_content()
+    assert "下单金额不足" not in content
+    assert "接下来约 32 秒内保留" in content
+    assert "重新校验信号、当前价格和账户状态" in content
+
+
 def test_reconciled_live_position_messages_include_exchange_pnl(tmp_path: Path) -> None:
     messages = []
     notifier = EmailNotifier(_email_config(tmp_path), send_fn=messages.append)
