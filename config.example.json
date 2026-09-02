@@ -110,6 +110,8 @@
       "traditional_ultra_short_1m_max_extension_atr": 1.0,
       "traditional_ultra_short_1m_execution_max_extension_atr": 1.5,
       "traditional_ultra_short_reversal_enabled": true,
+      "traditional_ultra_short_reversal_allow_long": false,
+      "traditional_ultra_short_reversal_allow_short": true,
       "traditional_ultra_short_reversal_pivot_bars": 3,
       "traditional_ultra_short_reversal_rsi_long_max": 50.0,
       "traditional_ultra_short_reversal_rsi_short_min": 50.0,

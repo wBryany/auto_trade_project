@@ -95,6 +95,8 @@ class StrategyConfig:
     traditional_ultra_short_1m_max_extension_atr: float = 1.0
     traditional_ultra_short_1m_execution_max_extension_atr: float = 1.5
     traditional_ultra_short_reversal_enabled: bool = False
+    traditional_ultra_short_reversal_allow_long: bool = True
+    traditional_ultra_short_reversal_allow_short: bool = True
     traditional_ultra_short_reversal_pivot_bars: int = 3
     traditional_ultra_short_reversal_rsi_long_max: float = 50.0
     traditional_ultra_short_reversal_rsi_short_min: float = 50.0
@@ -999,6 +1001,10 @@ class MultiTimeframeStrategy:
         reversal_long = (
             self.config.traditional_ultra_short_enabled
             and self.config.traditional_ultra_short_reversal_enabled
+            and _traditional_ultra_short_reversal_side_enabled(
+                "long",
+                self.config,
+            )
             and (trend_long or ultra_short_context_long)
             and reversal_long_context
             and ultra_pressure_long
@@ -1013,6 +1019,10 @@ class MultiTimeframeStrategy:
         reversal_short = (
             self.config.traditional_ultra_short_enabled
             and self.config.traditional_ultra_short_reversal_enabled
+            and _traditional_ultra_short_reversal_side_enabled(
+                "short",
+                self.config,
+            )
             and (trend_short or ultra_short_context_short)
             and reversal_short_context
             and ultra_pressure_short
@@ -2682,6 +2692,19 @@ def _traditional_one_minute_impulse(
         and before_first.close >= min(candle.low for candle in prior_window)
         and current.close < first.low
     )
+
+
+def _traditional_ultra_short_reversal_side_enabled(
+    side: str,
+    config: StrategyConfig,
+) -> bool:
+    """Apply a directional kill switch without disabling continuation trades."""
+
+    if side == "long":
+        return bool(config.traditional_ultra_short_reversal_allow_long)
+    if side == "short":
+        return bool(config.traditional_ultra_short_reversal_allow_short)
+    return False
 
 
 def _traditional_ultra_short_one_minute_trigger(

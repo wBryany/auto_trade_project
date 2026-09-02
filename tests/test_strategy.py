@@ -32,6 +32,7 @@ from btc_futures_bot.strategy import (
     _traditional_ultra_short_one_minute_trigger,
     _traditional_ultra_short_pullback_reversal_context,
     _traditional_ultra_short_reversal_one_minute_trigger,
+    _traditional_ultra_short_reversal_side_enabled,
     _traditional_setup_macd_handoff,
     _traditional_setup_volume_handoff,
     dynamic_stop_loss_pct,
@@ -230,6 +231,17 @@ def test_ultra_short_reversal_reclaims_a_fresh_one_minute_extreme() -> None:
         "short",
         config,
     )
+
+
+def test_ultra_short_reversal_direction_switches_are_independent() -> None:
+    config = StrategyConfig(
+        traditional_ultra_short_reversal_allow_long=False,
+        traditional_ultra_short_reversal_allow_short=True,
+    )
+
+    assert not _traditional_ultra_short_reversal_side_enabled("long", config)
+    assert _traditional_ultra_short_reversal_side_enabled("short", config)
+    assert not _traditional_ultra_short_reversal_side_enabled("flat", config)
 
 
 def test_ultra_short_reversal_rejects_adverse_5m_momentum_and_thin_liquidity() -> None:
