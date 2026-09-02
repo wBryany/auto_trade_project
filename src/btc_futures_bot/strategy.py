@@ -85,6 +85,8 @@ class StrategyConfig:
     traditional_pressure_min_room_r: float = 0.8
     traditional_ultra_short_enabled: bool = False
     traditional_ultra_short_countertrend_enabled: bool = False
+    traditional_ultra_short_countertrend_allow_long: bool = True
+    traditional_ultra_short_countertrend_allow_short: bool = True
     traditional_ultra_short_countertrend_size_multiplier: float = 0.25
     traditional_ultra_short_pressure_min_room_r: float = 0.15
     traditional_ultra_short_1m_lookback: int = 5
@@ -777,14 +779,20 @@ class MultiTimeframeStrategy:
         ultra_short_context_long = (
             self.config.traditional_ultra_short_enabled
             and (
-                self.config.traditional_ultra_short_countertrend_enabled
+                _traditional_ultra_short_countertrend_side_enabled(
+                    "long",
+                    self.config,
+                )
                 or not base_strong_trend_short
             )
         )
         ultra_short_context_short = (
             self.config.traditional_ultra_short_enabled
             and (
-                self.config.traditional_ultra_short_countertrend_enabled
+                _traditional_ultra_short_countertrend_side_enabled(
+                    "short",
+                    self.config,
+                )
                 or not base_strong_trend_long
             )
         )
@@ -2692,6 +2700,21 @@ def _traditional_one_minute_impulse(
         and before_first.close >= min(candle.low for candle in prior_window)
         and current.close < first.low
     )
+
+
+def _traditional_ultra_short_countertrend_side_enabled(
+    side: str,
+    config: StrategyConfig,
+) -> bool:
+    """Allow opposing-regime ultra-short entries only for selected directions."""
+
+    if not config.traditional_ultra_short_countertrend_enabled:
+        return False
+    if side == "long":
+        return bool(config.traditional_ultra_short_countertrend_allow_long)
+    if side == "short":
+        return bool(config.traditional_ultra_short_countertrend_allow_short)
+    return False
 
 
 def _traditional_ultra_short_reversal_side_enabled(

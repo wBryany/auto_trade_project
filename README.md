@@ -78,7 +78,7 @@ CSV 使用 UTF-8 BOM，Excel 可以直接打开。当前纸面/回测会完整�
 
 `traditional_predictive_reversal_short_enabled` 用于处理 5m K 线尚未收盘时已经出现的冲高失败。它只读取已收盘的 1m K 线：先识别靠近 10m/15m 均线簇的放量、超买和 ATR 扩张尖峰，再要求随后首根 1m 同时跌回 EMA9/EMA21 下方、MACD 柱转负、RSI 明显回落且卖出确认量不低于近期均量的配置比例。信号仍然非重绘，不会使用正在形成的 K 线；默认按半风险开空，止损锚定最近 8 根 1m 的冲高结构并受最大止损比例限制。若 1m 时间戳不连续，分支直接保持空仓。
 
-超短反转分支可用 `traditional_ultra_short_reversal_allow_long` 和 `traditional_ultra_short_reversal_allow_short` 独立控制方向。关闭某一方只会抑制 1m 极值收复/拒绝触发的反转单，不会影响同方向的趋势延续与回调续走信号。
+超短分支可按方向停用不稳定的例外入场：`traditional_ultra_short_reversal_allow_long/short` 控制 1m 极值收复/拒绝反转，`traditional_ultra_short_countertrend_allow_long/short` 控制是否允许逆已收盘 1h 强趋势入场。关闭逆势某一方不会影响同方向、且不与 1h 强趋势冲突的延续与回调续走信号。
 
 传统 K 线模式还支持三层防追价保护：`traditional_cross_max_extension_atr` 限制 5m 金叉/死叉确认时相对快 EMA 的扩张；`traditional_execution_rsi_*` 与 `traditional_execution_max_extension_atr` 拒绝已经过热/过冷的 1m 执行；`traditional_pressure_filter_enabled` 从已收盘 5m K 线本地合成 10m、15m K 线，并要求入场方向到 EMA/SMA 压力或支撑至少保留 `traditional_pressure_min_room_r` 倍的最小止损空间。合成过程不会增加交易所行情请求。
 

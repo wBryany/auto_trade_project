@@ -79,6 +79,7 @@ def _tracked_and_local(tmp_path) -> tuple:
                 "strategy": {
                     "mode": "traditional_kline",
                     "min_stop_cost_multiple": 3.0,
+                    "traditional_ultra_short_countertrend_allow_long": False,
                     "traditional_ultra_short_reversal_enabled": True,
                     "traditional_ultra_short_reversal_allow_long": False,
                 },
@@ -112,6 +113,7 @@ def test_local_config_inherits_tracked_keys_it_does_not_override(tmp_path) -> No
     assert config["strategy"]["min_score"] == 4
     # ...but keys it never learned about no longer collapse to the code default.
     assert config["strategy"]["min_stop_cost_multiple"] == 3.0
+    assert config["strategy"]["traditional_ultra_short_countertrend_allow_long"] is False
     assert config["strategy"]["traditional_ultra_short_reversal_enabled"] is True
     assert config["strategy"]["traditional_ultra_short_reversal_allow_long"] is False
 
@@ -122,6 +124,7 @@ def test_local_config_path_is_merged_when_passed_directly(tmp_path) -> None:
     config = load_config(str(local))
 
     assert config["mode"] == "live"
+    assert config["strategy"]["traditional_ultra_short_countertrend_allow_long"] is False
     assert config["strategy"]["traditional_ultra_short_reversal_enabled"] is True
     assert config["strategy"]["traditional_ultra_short_reversal_allow_long"] is False
 

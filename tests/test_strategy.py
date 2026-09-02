@@ -28,6 +28,7 @@ from btc_futures_bot.strategy import (
     _traditional_reclaim_quality,
     _traditional_structural_scalp_regime,
     _traditional_strong_regime_quality,
+    _traditional_ultra_short_countertrend_side_enabled,
     _traditional_ultra_short_timeframe_support,
     _traditional_ultra_short_one_minute_trigger,
     _traditional_ultra_short_pullback_reversal_context,
@@ -527,6 +528,22 @@ def test_ultra_short_countertrend_uses_smaller_size_and_one_minute_stop() -> Non
 
     assert signal_position_size_multiplier(signal, config) == 0.3
     assert signal_stop_timeframe(signal, config) == "1m"
+
+
+def test_ultra_short_countertrend_direction_switches_are_independent() -> None:
+    config = StrategyConfig(
+        traditional_ultra_short_countertrend_enabled=True,
+        traditional_ultra_short_countertrend_allow_long=False,
+        traditional_ultra_short_countertrend_allow_short=True,
+    )
+
+    assert not _traditional_ultra_short_countertrend_side_enabled("long", config)
+    assert _traditional_ultra_short_countertrend_side_enabled("short", config)
+    assert not _traditional_ultra_short_countertrend_side_enabled("flat", config)
+    assert not _traditional_ultra_short_countertrend_side_enabled(
+        "short",
+        replace(config, traditional_ultra_short_countertrend_enabled=False),
+    )
 
 
 def test_pullback_quality_rejects_a_large_extended_volume_spike() -> None:

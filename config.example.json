@@ -100,6 +100,8 @@
       "traditional_pressure_min_room_r": 0.45,
       "traditional_ultra_short_enabled": true,
       "traditional_ultra_short_countertrend_enabled": true,
+      "traditional_ultra_short_countertrend_allow_long": false,
+      "traditional_ultra_short_countertrend_allow_short": true,
       "traditional_ultra_short_countertrend_size_multiplier": 0.25,
       "traditional_ultra_short_pressure_min_room_r": 0.65,
       "traditional_ultra_short_1m_lookback": 8,
