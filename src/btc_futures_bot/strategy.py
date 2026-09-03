@@ -126,8 +126,10 @@ class StrategyConfig:
     traditional_ultra_short_break_even_trigger_r: float = 0.7
     traditional_ultra_short_break_even_lock_r: float = 0.15
     traditional_ultra_short_break_even_activation_buffer_r: float = 0.05
-    traditional_ultra_short_trailing_trigger_r: float = 0.9
-    traditional_ultra_short_trailing_distance_r: float = 0.35
+    traditional_ultra_short_trailing_trigger_r: float = 1.1
+    traditional_ultra_short_trailing_distance_r: float = 0.45
+    traditional_ultra_short_reversal_short_trailing_trigger_r: float = 0.9
+    traditional_ultra_short_reversal_short_trailing_distance_r: float = 0.35
     traditional_structural_scalp_enabled: bool = False
     traditional_structural_scalp_max_fast_ema_distance_pct: float = 0.01
     traditional_structural_scalp_max_regime_gap_pct: float = 0.03
@@ -2530,7 +2532,7 @@ def signal_trade_management_overrides(
         config.mode == "traditional_kline"
         and config.traditional_ultra_short_enabled
     ):
-        return {
+        management = {
             "break_even_trigger_r": max(
                 0.0,
                 float(config.traditional_ultra_short_break_even_trigger_r),
@@ -2552,6 +2554,20 @@ def signal_trade_management_overrides(
                 float(config.traditional_ultra_short_trailing_distance_r),
             ),
         }
+        if "1m_ultra_short_reversal_short" in signal.reasons:
+            management["trailing_trigger_r"] = max(
+                0.0,
+                float(
+                    config.traditional_ultra_short_reversal_short_trailing_trigger_r
+                ),
+            )
+            management["trailing_distance_r"] = max(
+                0.1,
+                float(
+                    config.traditional_ultra_short_reversal_short_trailing_distance_r
+                ),
+            )
+        return management
     if not any(
         "_structural_scalp_recovery_" in reason for reason in signal.reasons
     ):

@@ -102,8 +102,8 @@ def test_ultra_short_one_minute_trigger_requires_fresh_volume_break() -> None:
         "break_even_trigger_r": 0.7,
         "break_even_lock_r": 0.15,
         "break_even_activation_buffer_r": 0.05,
-        "trailing_trigger_r": 0.9,
-        "trailing_distance_r": 0.35,
+        "trailing_trigger_r": 1.1,
+        "trailing_distance_r": 0.45,
     }
 
 
@@ -601,6 +601,26 @@ def test_ultra_short_mode_manages_normal_traditional_entries_quickly() -> None:
         "break_even_activation_buffer_r": 0.05,
         "trailing_trigger_r": 1.1,
         "trailing_distance_r": 0.45,
+    }
+
+
+def test_ultra_short_reversal_short_uses_tighter_trailing_protection() -> None:
+    signal = Signal("short", 7, 1, ("1m_ultra_short_reversal_short",))
+    config = StrategyConfig(
+        mode="traditional_kline",
+        traditional_ultra_short_enabled=True,
+        traditional_ultra_short_trailing_trigger_r=1.1,
+        traditional_ultra_short_trailing_distance_r=0.45,
+        traditional_ultra_short_reversal_short_trailing_trigger_r=0.9,
+        traditional_ultra_short_reversal_short_trailing_distance_r=0.35,
+    )
+
+    assert signal_trade_management_overrides(signal, config) == {
+        "break_even_trigger_r": 0.7,
+        "break_even_lock_r": 0.15,
+        "break_even_activation_buffer_r": 0.05,
+        "trailing_trigger_r": 0.9,
+        "trailing_distance_r": 0.35,
     }
 
 

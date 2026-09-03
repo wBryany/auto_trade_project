@@ -80,6 +80,8 @@ CSV 使用 UTF-8 BOM，Excel 可以直接打开。当前纸面/回测会完整�
 
 超短分支可按方向停用不稳定的例外入场：`traditional_ultra_short_reversal_allow_long/short` 控制 1m 极值收复/拒绝反转，`traditional_ultra_short_countertrend_allow_long/short` 控制是否允许逆已收盘 1h 强趋势入场。关闭逆势某一方不会影响同方向、且不与 1h 强趋势冲突的延续与回调续走信号。
 
+超短线默认使用 `traditional_ultra_short_trailing_trigger_r/distance_r` 管理追踪止盈；`traditional_ultra_short_reversal_short_trailing_trigger_r/distance_r` 可为 `1m_ultra_short_reversal_short` 单独设置更早、更紧的保护，不影响趋势延续等其他信号。
+
 传统 K 线模式还支持三层防追价保护：`traditional_cross_max_extension_atr` 限制 5m 金叉/死叉确认时相对快 EMA 的扩张；`traditional_execution_rsi_*` 与 `traditional_execution_max_extension_atr` 拒绝已经过热/过冷的 1m 执行；`traditional_pressure_filter_enabled` 从已收盘 5m K 线本地合成 10m、15m K 线，并要求入场方向到 EMA/SMA 压力或支撑至少保留 `traditional_pressure_min_room_r` 倍的最小止损空间。合成过程不会增加交易所行情请求。
 
 Binance 正式环境的标记价格及 1m/5m/1h K 线使用公共 WebSocket，账户、持仓、普通订单和条件单使用 User Data Stream。私有流在连接或重连时只读取一次完整账户/挂单 REST 快照，持仓直接复用账户快照中的 `positions`，代码不再请求 `/positionRisk`；之后由 `ACCOUNT_UPDATE`、`ORDER_TRADE_UPDATE` 和 `ALGO_UPDATE` 增量维护。`live_reconciliation_seconds` 控制的是本地缓存对账频率，不会触发私有 REST 轮询。listenKey 按 Binance 要求每 30 分钟续期。仪表盘复用同一私有流并由 `dashboard_snapshot_seconds` 控制页面快照缓存。行情评估仍可按更短的 `poll_seconds` 运行，交易所硬止损不依赖本地轮询。
