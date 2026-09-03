@@ -36,6 +36,7 @@ from btc_futures_bot.strategy import (
     _traditional_ultra_short_reversal_side_enabled,
     _traditional_setup_macd_handoff,
     _traditional_setup_volume_handoff,
+    adverse_dynamic_exit_reason,
     dynamic_stop_loss_pct,
     effective_break_even_trigger_r,
     signal_position_size_multiplier,
@@ -43,6 +44,99 @@ from btc_futures_bot.strategy import (
     signal_stop_timeframe,
     signal_trade_management_overrides,
 )
+
+
+def _adverse_exit_candles(
+    final_closes: tuple[float, ...],
+) -> list[Candle]:
+    closes = [100.0] * 12 + list(final_closes)
+    candles: list[Candle] = []
+    for index, close in enumerate(closes):
+        open_price = closes[index - 1] if index else close
+        high = max(open_price, close) + 0.1
+        low = min(open_price, close) - 0.1
+        candles.append(Candle(index * 60_000, open_price, high, low, close, 10.0))
+    return candles
+
+
+def _adverse_exit_config(**overrides: object) -> StrategyConfig:
+    values = {
+        "mode": "traditional_kline",
+        "enable_adverse_dynamic_exit": True,
+        "traditional_signal_fast": 2,
+        "traditional_signal_slow": 3,
+        "traditional_rsi_period": 3,
+        "traditional_macd_fast": 2,
+        "traditional_macd_slow": 4,
+        "traditional_macd_signal": 2,
+        "traditional_atr_period": 3,
+        "traditional_volume_sma_period": 5,
+        "adverse_dynamic_exit_trigger_r": 0.5,
+        "adverse_dynamic_exit_confirmation_bars": 2,
+        "adverse_dynamic_exit_min_hold_seconds": 0,
+    }
+    values.update(overrides)
+    return StrategyConfig(**values)
+
+
+def test_adverse_dynamic_exit_requires_price_loss_and_two_closed_confirmations() -> None:
+    candles = _adverse_exit_candles((98.0, 95.0))
+    position = Position(
+        "long",
+        1.0,
+        100.0,
+        90.0,
+        125.0,
+        candles[-2].timestamp,
+        initial_stop_price=90.0,
+        best_price=100.0,
+    )
+    config = _adverse_exit_config()
+
+    assert adverse_dynamic_exit_reason(
+        position,
+        {"1m": candles},
+        config,
+        95.0,
+        candles[-1].timestamp + 60_000,
+    ) == "dynamic_stop_loss"
+    assert adverse_dynamic_exit_reason(
+        replace(position, opened_at=candles[-1].timestamp),
+        {"1m": candles},
+        config,
+        95.0,
+        candles[-1].timestamp + 60_000,
+    ) == ""
+    assert adverse_dynamic_exit_reason(
+        position,
+        {"1m": candles},
+        config,
+        96.0,
+        candles[-1].timestamp + 60_000,
+    ) == ""
+
+
+def test_adverse_dynamic_exit_can_be_disabled_without_touching_hard_stop() -> None:
+    candles = _adverse_exit_candles((98.0, 95.0))
+    position = Position(
+        "long",
+        1.0,
+        100.0,
+        90.0,
+        125.0,
+        candles[-2].timestamp,
+        initial_stop_price=90.0,
+        best_price=100.0,
+    )
+
+    assert adverse_dynamic_exit_reason(
+        position,
+        {"1m": candles},
+        _adverse_exit_config(enable_adverse_dynamic_exit=False),
+        95.0,
+        candles[-1].timestamp + 60_000,
+    ) == ""
+    assert position.stop_price == 90.0
 
 
 def test_ultra_short_one_minute_trigger_requires_fresh_volume_break() -> None:
@@ -1322,6 +1416,9 @@ def test_optimized_exit_defaults_match_paper_configuration() -> None:
     assert config.trailing_distance_r == 0.75
     assert config.enable_profit_trend_exit is True
     assert config.profit_trend_exit_trigger_r == 1.0
+    assert config.enable_adverse_dynamic_exit is False
+    assert config.adverse_dynamic_exit_trigger_r == 0.7
+    assert config.adverse_dynamic_exit_confirmation_bars == 2
 
 
 def test_short_holding_cost_does_not_charge_unearned_funding_interval() -> None:

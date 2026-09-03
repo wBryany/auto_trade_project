@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 from .indicators import atr, ema, macd, rsi, sma
-from .models import Candle, Signal
+from .models import Candle, Position, Signal
 
 
 @dataclass(frozen=True)
@@ -37,6 +37,10 @@ class StrategyConfig:
     structure_stop_buffer_atr: float = 0.0
     min_hold_seconds: int = 90
     reversal_min_score: int = 5
+    enable_adverse_dynamic_exit: bool = False
+    adverse_dynamic_exit_trigger_r: float = 0.7
+    adverse_dynamic_exit_confirmation_bars: int = 2
+    adverse_dynamic_exit_min_hold_seconds: int = 90
     max_hold_seconds: int = 420
     hard_max_hold_seconds: int = 900
     traditional_trend_fast: int = 50
@@ -3133,6 +3137,115 @@ def effective_break_even_trigger_r(
     )
 
 
+def adverse_dynamic_exit_reason(
+    position: Position,
+    candles_by_timeframe: Mapping[str, Sequence[Candle]],
+    config: StrategyConfig,
+    current_price: float,
+    now_ms: int,
+) -> str:
+    """Return an online soft-stop reason while the original hard stop remains live.
+
+    A plain price threshold is too vulnerable to short-lived wicks, so an exit
+    also requires consecutive closed 1m candles below/above EMA9 with MACD
+    momentum against the position. The threshold is measured from the
+    immutable initial risk and never moves the exchange-side hard stop.
+    """
+
+    if not bool(getattr(config, "enable_adverse_dynamic_exit", False)):
+        return ""
+    if position.side not in {"long", "short"} or current_price <= 0:
+        return ""
+    initial_stop = position.initial_stop_price or position.stop_price
+    risk_distance = abs(position.entry_price - initial_stop)
+    if risk_distance <= 0:
+        return ""
+    current_r = (
+        (float(current_price) - position.entry_price) / risk_distance
+        if position.side == "long"
+        else (position.entry_price - float(current_price)) / risk_distance
+    )
+    adverse_r = max(0.0, -current_r)
+    if adverse_r <= 0:
+        return ""
+    one_minute = candles_by_timeframe.get("1m", ())
+    if not one_minute:
+        return ""
+
+    held_seconds = max(0.0, (int(now_ms) - position.opened_at) / 1000)
+    minimum_hold = max(
+        0,
+        int(getattr(config, "adverse_dynamic_exit_min_hold_seconds", 90)),
+    )
+    if held_seconds < minimum_hold:
+        return ""
+    trigger_r = max(
+        0.0,
+        float(getattr(config, "adverse_dynamic_exit_trigger_r", 0.7)),
+    )
+    if trigger_r <= 0 or adverse_r < trigger_r:
+        return ""
+    confirmations = max(
+        1,
+        int(getattr(config, "adverse_dynamic_exit_confirmation_bars", 2)),
+    )
+    if not _one_minute_adverse_confirmation(
+        position.side,
+        one_minute,
+        config,
+        position.opened_at,
+        confirmations,
+    ):
+        return ""
+    return "dynamic_stop_loss"
+
+
+def _one_minute_adverse_confirmation(
+    side: str,
+    candles: Sequence[Candle],
+    config: StrategyConfig,
+    opened_at: int,
+    bars: int,
+) -> bool:
+    bars = max(1, int(bars))
+    minimum = max(
+        int(config.traditional_signal_slow),
+        int(config.traditional_macd_slow) + int(config.traditional_macd_signal),
+        int(config.traditional_atr_period) + 1,
+        int(config.traditional_volume_sma_period) + 1,
+    )
+    if len(candles) < minimum + bars - 1:
+        return False
+    for index in range(len(candles) - bars, len(candles)):
+        candle = candles[index]
+        if candle.timestamp < opened_at:
+            return False
+        feature = _traditional_features(
+            candles[: index + 1],
+            config.traditional_signal_fast,
+            config.traditional_signal_slow,
+            config.traditional_rsi_period,
+            config.traditional_macd_fast,
+            config.traditional_macd_slow,
+            config.traditional_macd_signal,
+            config.traditional_atr_period,
+            config.traditional_volume_sma_period,
+        )
+        if feature.ema_fast is None or feature.macd_histogram is None:
+            return False
+        price_invalidated = (
+            feature.close < feature.ema_fast
+            if side == "long"
+            else feature.close > feature.ema_fast
+        )
+        momentum_invalidated = (
+            feature.macd_histogram < 0
+            if side == "long"
+            else feature.macd_histogram > 0
+        )
+        if not (price_invalidated and momentum_invalidated):
+            return False
+    return True
 def _traditional_ultra_short_higher_timeframe_alignment(
     trigger_candles: Sequence[Candle],
     side: str,

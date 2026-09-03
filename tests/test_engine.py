@@ -461,6 +461,7 @@ def test_live_entry_is_reported_only_after_server_stop_is_confirmed() -> None:
     assert result.raw["server_side_stop_confirmed"] is True
     assert result.raw["server_side_take_profit_enabled"] is False
     assert result.raw["profit_exit_mode"] == "dynamic_trend_and_trailing"
+    assert result.raw["risk_exit_mode"] == "dynamic_adverse_soft_stop"
 
 
 def test_binance_live_reconciliation_accepts_stop_only_position() -> None:
@@ -742,6 +743,75 @@ def test_live_position_checks_mark_price_each_poll_and_closes_at_protected_stop(
     assert adapter.mark_calls == 1
     assert adapter.close_request.reduce_only is True
     assert adapter.close_request.side == "sell"
+    assert engine.position is None
+
+
+def test_live_adverse_dynamic_exit_closes_locally_and_keeps_hard_stop_until_fill() -> None:
+    class Adapter:
+        name = "binance"
+        settings = SimpleNamespace(symbol="BTCUSDT", environment="production")
+
+        def __init__(self) -> None:
+            self.closed = False
+            self.cancelled_stop_id = ""
+
+        @staticmethod
+        def fetch_candles(interval: str, limit: int) -> list[Candle]:
+            return [
+                Candle(1, 100.0, 100.1, 99.9, 100.0, 10.0),
+                Candle(2, 100.0, 100.1, 99.9, 100.0, 10.0),
+            ]
+
+        def fetch_live_position(self) -> dict | None:
+            return None if self.closed else {"side": "long", "quantity": 1.0, "mark_price": 95.0}
+
+        @staticmethod
+        def fetch_mark_price() -> float:
+            return 95.0
+
+        def place_market_order(self, request: object) -> dict:
+            self.closed = True
+            return {"status": "FILLED", "executedQty": "1", "avgPrice": "95"}
+
+        @staticmethod
+        def market_fill(payload: dict, *, fallback_price: float) -> tuple[float, float]:
+            return float(payload["executedQty"]), float(payload["avgPrice"])
+
+        def cancel_protection_orders(self, position: Position) -> dict:
+            self.cancelled_stop_id = position.stop_order_id
+            return {"cancelled": [position.stop_client_id], "errors": []}
+
+    class Strategy:
+        config = StrategyConfig(trigger_timeframe="5m", regime_timeframe="1h")
+
+        @staticmethod
+        def evaluate(candles_by_timeframe: object) -> Signal:
+            return Signal("flat", 0, 1, ("no_entry",))
+
+    adapter = Adapter()
+    engine = TradingEngine(adapter, Strategy(), RiskManager(), EngineConfig(mode="live"))
+    engine.position = Position(
+        "long",
+        1.0,
+        100.0,
+        90.0,
+        125.0,
+        int(time.time() * 1000) - 120_000,
+        initial_stop_price=90.0,
+        best_price=100.0,
+        stop_order_id="hard-stop-1",
+        stop_client_id="hard-stop-client",
+    )
+
+    with patch(
+        "btc_futures_bot.engine.adverse_dynamic_exit_reason",
+        return_value="dynamic_stop_loss",
+    ):
+        result = engine.evaluate_once()
+
+    assert result.status == "live_active_exit"
+    assert result.raw["exit_reason"] == "dynamic_stop_loss"
+    assert adapter.cancelled_stop_id == "hard-stop-1"
     assert engine.position is None
 
 

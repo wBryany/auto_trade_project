@@ -13,6 +13,7 @@ from .risk import RiskConfig, RiskManager
 from .strategy import (
     MultiTimeframeStrategy,
     StrategyConfig,
+    adverse_dynamic_exit_reason,
     dynamic_stop_loss_pct,
     effective_break_even_trigger_r,
     signal_position_size_multiplier,
@@ -160,6 +161,16 @@ def run_backtest(
                 elif use_fixed_take_profit and exit_candle.low <= position.take_profit_price:
                     exit_price = position.take_profit_price
                     exit_reason = "take_profit"
+            if exit_price is None:
+                exit_reason = adverse_dynamic_exit_reason(
+                    position,
+                    candles_by_timeframe,
+                    strategy.config,
+                    exit_candle.close,
+                    decision_timestamp,
+                )
+                if exit_reason:
+                    exit_price = exit_candle.close
             time_exit_enabled = bool(getattr(strategy.config, "enable_time_exit", False))
             soft_max_hold_seconds = max(0, int(strategy.config.max_hold_seconds))
             if exit_price is None and time_exit_enabled and soft_max_hold_seconds:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
+from unittest.mock import patch
 
 from btc_futures_bot.backtest import run_backtest
 from btc_futures_bot.models import Signal
@@ -172,6 +173,57 @@ def test_backtest_dynamic_exit_default_does_not_force_fixed_take_profit(tmp_path
 
     assert dynamic.trades == 0
     assert fixed.trades == 1
+
+
+def test_backtest_uses_same_adverse_dynamic_exit_as_live(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    report_dir = tmp_path / "reports"
+    data_dir.mkdir()
+    _write_candles(data_dir / "1m.csv", count=6, interval_ms=60_000)
+
+    class OneLongSignal:
+        config = StrategyConfig(
+            mode="scalp",
+            trigger_timeframe="1m",
+            regime_timeframe="1m",
+            enable_profit_trend_exit=False,
+            break_even_trigger_r=0.0,
+            trailing_trigger_r=0.0,
+        )
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def evaluate(self, candles_by_timeframe: dict[str, list[object]]) -> Signal:
+            self.calls += 1
+            timestamp = candles_by_timeframe["1m"][-1].timestamp
+            if self.calls == 1:
+                return Signal("long", 6, timestamp, ("initial_long",))
+            return Signal("flat", 0, timestamp, ("hold",))
+
+    reporter = TradeReporter(report_dir)
+    try:
+        with patch(
+            "btc_futures_bot.backtest.adverse_dynamic_exit_reason",
+            return_value="dynamic_stop_loss",
+        ):
+            summary = run_backtest(
+                data_dir,
+                strategy=OneLongSignal(),
+                reporter=reporter,
+            )
+    finally:
+        reporter.close()
+
+    with (report_dir / "trade_report.csv").open(
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert summary.trades == 1
+    assert rows[0]["exit_reason"] == "dynamic_stop_loss"
 
 
 def test_backtest_enters_at_next_open_and_prices_gap_through_stop(tmp_path: Path) -> None:

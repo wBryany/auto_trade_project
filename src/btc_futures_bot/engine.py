@@ -18,6 +18,7 @@ from .reporting import TradeRecord, TradeReporter
 from .risk import RiskManager
 from .strategy import (
     MultiTimeframeStrategy,
+    adverse_dynamic_exit_reason,
     dynamic_stop_loss_pct,
     effective_break_even_trigger_r,
     signal_position_size_multiplier,
@@ -236,10 +237,9 @@ class TradingEngine:
             )
         live_mark_price: float | None = None
         if self.config.mode == "live" and self.position is not None:
-            # The exchange-side stop and take-profit remain the outage-safe
-            # fallback.  While the engine is online, every polling cycle also
-            # evaluates the current venue mark price for a protected trailing
-            # stop, profitable trend invalidation, or configured time exit.
+            # The exchange-side hard stop remains the outage-safe fallback.
+            # While online, every poll also evaluates the venue mark price for
+            # an adverse soft stop, protected trailing stop, trend, or time exit.
             live_mark_price = self.adapter.fetch_mark_price()
             active_exit = self._manage_live_position(
                 live_mark_price,
@@ -469,9 +469,9 @@ class TradingEngine:
                 else filled_price - stop_distance * self.config.take_profit_r
             )
             stop_client_id = self._client_id("stop")
-            # Binance keeps only the hard stop on the exchange. Profit exits
-            # are decided online from trend invalidation, break-even/trailing
-            # protection and the configured time-exit rules.
+            # Binance keeps only the hard stop on the exchange. Adverse soft
+            # stops and profit exits are decided online; the hard stop remains
+            # live until an online close has filled.
             take_profit_client_id = ""
             position = Position(
                 signal.side,
@@ -517,6 +517,7 @@ class TradingEngine:
                     "server_side_stop_confirmed": bool(protection_payload.get("confirmed")),
                     "server_side_take_profit_enabled": False,
                     "profit_exit_mode": "dynamic_trend_and_trailing",
+                    "risk_exit_mode": "dynamic_adverse_soft_stop",
                     "sizing": sizing_raw,
                 }
             except Exception as protection_error:
@@ -886,6 +887,14 @@ class TradingEngine:
             )
             if protected_stop_hit:
                 exit_reason = self._stop_exit_reason(position)
+        if not exit_reason:
+            exit_reason = adverse_dynamic_exit_reason(
+                position,
+                candles_by_timeframe,
+                self.strategy.config,
+                mark_price,
+                int(time.time() * 1000),
+            )
         if not exit_reason and self._profit_trend_exit_ready(candles_by_timeframe):
             exit_reason = "trend_invalidation"
         if not exit_reason:
@@ -1369,6 +1378,16 @@ class TradingEngine:
             elif candle.low <= self.position.take_profit_price:
                 exit_price = self.position.take_profit_price
                 exit_reason = "take_profit"
+        if exit_price is None:
+            exit_reason = adverse_dynamic_exit_reason(
+                self.position,
+                candles_by_timeframe or {},
+                self.strategy.config,
+                float(candle.close),
+                int(time.time() * 1000),
+            )
+            if exit_reason:
+                exit_price = float(candle.close)
         time_exit_enabled = bool(getattr(self.strategy.config, "enable_time_exit", False))
         soft_max_hold_seconds = max(0, int(getattr(self.strategy.config, "max_hold_seconds", 0)))
         if exit_price is None and time_exit_enabled and soft_max_hold_seconds:
@@ -1665,9 +1684,10 @@ class TradingEngine:
         else:
             self.consecutive_losses = 0
         LOG.info(
-            "%s %s exit side=%s price=%.4f pnl=%.4f",
+            "%s %s exit reason=%s side=%s price=%.4f pnl=%.4f",
             self.adapter.name,
             self.config.mode,
+            exit_reason,
             position.side,
             exit_price,
             pnl,
