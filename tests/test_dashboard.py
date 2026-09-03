@@ -5,10 +5,13 @@ import threading
 import time
 from unittest.mock import patch
 
+import pytest
+
 from btc_futures_bot.dashboard import (
     DASHBOARD_HTML,
     DashboardService,
     _json_safe,
+    _mark_to_market_view,
     _order_sizing_view,
     _position_dict,
 )
@@ -84,6 +87,8 @@ def test_dashboard_uses_saved_live_configuration_without_duplicate_confirmation(
     assert "启动权限直接采用“配置”中已保存的交易模式和网络" in DASHBOARD_HTML
     assert "理论最大可开金额使用比例 (%)" in DASHBOARD_HTML
     assert "s.market.mark_price_raw" in DASHBOARD_HTML
+    assert "最新成交价格" in DASHBOARD_HTML
+    assert "setInterval(loadStatus,1000)" in DASHBOARD_HTML
     assert "动态退出" in DASHBOARD_HTML
     assert "pollSecondsInput.min='1'" in DASHBOARD_HTML
     assert "不改变 K 线周期" in DASHBOARD_HTML
@@ -99,6 +104,36 @@ def test_dashboard_marks_live_take_profit_as_dynamic() -> None:
     assert paper is not None and paper["take_profit_mode"] == "fixed"
 
 
+def test_dashboard_reprices_position_and_unrealized_pnl_from_live_mark() -> None:
+    snapshot = {
+        "positions": [
+            {
+                "symbol": "BTCUSDT",
+                "side": "short",
+                "quantity": 0.001,
+                "entry_price": 77_852.6,
+                "mark_price": 77_900.0,
+                "unrealized_pnl": -0.0474,
+            }
+        ],
+        "account": {
+            "wallet_balance": 25.5,
+            "wallet_balance_raw": "25.5",
+            "unrealized_pnl": -0.0474,
+            "margin_balance": 25.4526,
+        },
+    }
+
+    positions, account = _mark_to_market_view(snapshot, "BTCUSDT", 77_800.0)
+
+    assert positions[0]["mark_price"] == 77_800.0
+    assert positions[0]["unrealized_pnl"] == pytest.approx(0.0526)
+    assert positions[0]["unrealized_pnl_raw"] == "0.0526"
+    assert account["unrealized_pnl"] == pytest.approx(0.0526)
+    assert account["margin_balance"] == pytest.approx(25.5526)
+    assert snapshot["positions"][0]["mark_price"] == 77_900.0
+
+
 def test_dashboard_market_snapshot_is_single_flight_across_tabs() -> None:
     service = DashboardService.__new__(DashboardService)
     service._lock = threading.RLock()
@@ -111,10 +146,13 @@ def test_dashboard_market_snapshot_is_single_flight_across_tabs() -> None:
         def __init__(self) -> None:
             self.calls = 0
 
-        def fetch_dashboard_snapshot(self):
+        def fetch_dashboard_snapshot_nonblocking(self):
             self.calls += 1
             time.sleep(0.05)
             return {"market": {"mark_price": 100.0}, "private_available": True}
+
+        def fetch_dashboard_snapshot(self):
+            raise AssertionError("dashboard refresh must not wait for private-stream startup")
 
     adapter = Adapter()
     service._adapter = lambda _config, _exchange: adapter
@@ -139,6 +177,71 @@ def test_dashboard_market_snapshot_is_single_flight_across_tabs() -> None:
     assert adapter.calls == 1
     assert len(results) == 8
     assert all(result["market"]["mark_price"] == 100.0 for result in results)
+
+
+def test_dashboard_overlays_cached_private_snapshot_with_live_market_tick() -> None:
+    service = DashboardService.__new__(DashboardService)
+
+    class Adapter:
+        def fetch_live_market_snapshot(self):
+            return {
+                "mark_price": 101.0,
+                "mark_price_raw": "101.0",
+                "last_price": 101.25,
+                "last_price_raw": "101.25",
+                "last_price_timestamp": 1_700_000_000_000,
+            }
+
+    service._adapter = lambda _config, _exchange: Adapter()
+    cached = {
+        "market": {"mark_price": 100.0, "stale": True},
+        "account": {"wallet_balance": 27.0},
+        "open_orders": [{"order_id": 1}],
+    }
+
+    refreshed = service._with_live_market({}, "binance", cached)
+
+    assert refreshed is not cached
+    assert refreshed["market"]["mark_price"] == 101.0
+    assert refreshed["market"]["last_price"] == 101.25
+    assert "stale" not in refreshed["market"]
+    assert refreshed["account"] is cached["account"]
+    assert refreshed["open_orders"] is cached["open_orders"]
+
+
+def test_dashboard_overlays_orders_and_positions_from_live_private_stream() -> None:
+    service = DashboardService.__new__(DashboardService)
+
+    class Adapter:
+        def fetch_live_dashboard_snapshot(self):
+            return {
+                "market": {"mark_price": 101.0},
+                "account": {"wallet_balance": 27.0},
+                "positions": [{"mark_price": 101.0}],
+                "open_orders": [{"order_id": 2, "status": "NEW"}],
+                "private_available": True,
+                "private_source": "websocket",
+            }
+
+    service._adapter = lambda _config, _exchange: Adapter()
+    cached = {
+        "market": {"mark_price": 100.0, "stale": True},
+        "account": {"wallet_balance": 26.0},
+        "positions": [{"mark_price": 100.0}],
+        "open_orders": [{"order_id": 1}],
+        "order_limits": {"effective_min_quantity_raw": "0.001"},
+        "private_available": True,
+        "private_stale": True,
+        "private_warning": "old",
+    }
+
+    refreshed = service._with_live_market({}, "binance", cached)
+
+    assert refreshed["positions"][0]["mark_price"] == 101.0
+    assert refreshed["open_orders"][0]["order_id"] == 2
+    assert refreshed["order_limits"] is cached["order_limits"]
+    assert "private_stale" not in refreshed
+    assert "stale" not in refreshed["market"]
 
 
 def test_dashboard_snapshot_failure_keeps_private_cache_and_backs_off() -> None:

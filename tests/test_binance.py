@@ -86,6 +86,96 @@ def test_binance_mark_price_prefers_websocket_without_rest(monkeypatch) -> None:
     assert adapter.fetch_mark_price() == 65_001.25
 
 
+def test_binance_live_dashboard_market_uses_websocket_trade_without_rest(monkeypatch) -> None:
+    adapter = _adapter()
+
+    class FakeStream:
+        def start(self) -> bool:
+            return True
+
+        def mark_price(self):
+            return 65_001.25, 65_000.5, 1_700_000_000_000
+
+        def latest_trade(self):
+            return 65_003.5, 1_700_000_000_100
+
+        def status(self):
+            return {"healthy": True, "trade_price_age_seconds": 0.1}
+
+    adapter._market_stream = FakeStream()
+    monkeypatch.setattr(
+        "btc_futures_bot.exchanges.binance.request_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("REST must not be called")),
+    )
+
+    market = adapter.fetch_live_market_snapshot()
+
+    assert market is not None
+    assert market["last_price"] == 65_003.5
+    assert market["last_price_endpoint"] == "@aggTrade"
+    assert market["mark_price"] == 65_001.25
+    assert market["price_endpoint"] == "@markPrice@1s"
+
+
+def test_binance_live_preflight_resumes_only_matching_bot_protected_position(monkeypatch) -> None:
+    adapter = _adapter()
+    adapter._private_stream = None
+    _set_symbol_rules(adapter)
+    monkeypatch.setenv("TEST_BINANCE_KEY", "configured")
+    monkeypatch.setenv("TEST_BINANCE_SECRET", "configured")
+    stop_id = "2000001406006245"
+    stop_client_id = "btcbot-stop-resume-test"
+    managed = {
+        "position": {
+            "side": "short",
+            "quantity": 0.001,
+            "entry_price": 77_852.6,
+            "stop_price": 78_203.0,
+            "initial_stop_price": 78_203.0,
+            "stop_order_id": stop_id,
+            "stop_client_id": stop_client_id,
+        }
+    }
+    private = {
+        "positions": [
+            {
+                "symbol": "BTCUSDT",
+                "positionSide": "BOTH",
+                "positionAmt": "-0.001",
+                "entryPrice": "77852.6",
+                "leverage": "20",
+            }
+        ],
+        "orders": [],
+        "algo_orders": [
+            {
+                "algoId": stop_id,
+                "clientAlgoId": stop_client_id,
+                "symbol": "BTCUSDT",
+                "algoType": "CONDITIONAL",
+                "orderType": "STOP_MARKET",
+                "side": "BUY",
+                "positionSide": "BOTH",
+                "workingType": "MARK_PRICE",
+                "closePosition": True,
+                "triggerPrice": "78203.0",
+                "algoStatus": "NEW",
+            }
+        ],
+    }
+    monkeypatch.setattr(adapter, "_private_snapshot", lambda **_kwargs: private)
+
+    resumed = adapter.prepare_live(max_leverage=20, managed_position=managed)
+
+    assert resumed["resumed"] is True
+    assert resumed["flat"] is False
+    assert resumed["stop_order_id"] == stop_id
+
+    managed["position"]["stop_client_id"] = "manual-stop"
+    with pytest.raises(RuntimeError, match="not bot-owned"):
+        adapter.prepare_live(max_leverage=20, managed_position=managed)
+
+
 def _exchange_info() -> dict:
     return {
         "symbols": [

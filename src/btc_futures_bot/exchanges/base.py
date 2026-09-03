@@ -74,7 +74,12 @@ class ExchangeAdapter(ABC):
 
         return None
 
-    def prepare_live(self, *, max_leverage: float) -> dict[str, Any]:
+    def prepare_live(
+        self,
+        *,
+        max_leverage: float,
+        managed_position: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Validate credentials/account state before order-capable mode starts."""
         if not self.has_credentials():
             raise RuntimeError(f"{self.name}: live mode requires API credentials")

@@ -80,6 +80,7 @@ class TradingEngine:
         self.notifier = notifier
         self.live_preflight: dict[str, Any] = {}
         self.unmanaged_live_position = self._load_unmanaged_live_position()
+        self._managed_live_position_state = self._load_managed_live_position()
         self._last_live_reconciliation_at = 0.0
         self._candle_cache: dict[str, list[Any]] = {}
         self._candle_cache_at: dict[str, float] = {}
@@ -94,8 +95,63 @@ class TradingEngine:
         if self.config.mode != "live":
             self.live_preflight = {"prepared": False, "mode": self.config.mode}
             return self.live_preflight
-        self.live_preflight = self.adapter.prepare_live(max_leverage=self.risk.max_leverage)
+        self.live_preflight = self.adapter.prepare_live(
+            max_leverage=self.risk.max_leverage,
+            managed_position=self._managed_live_position_state,
+        )
+        if self.live_preflight.get("resumed"):
+            self._restore_managed_live_position()
+            self._save_live_reconciliation_state()
+        elif self._managed_live_position_state is not None:
+            # The exchange is flat, so a previously saved managed position is
+            # historical and must not be eligible for a later restart.
+            self._managed_live_position_state = None
+            self._save_live_reconciliation_state()
         return self.live_preflight
+
+    def _restore_managed_live_position(self) -> None:
+        state = self._managed_live_position_state
+        if not state:
+            raise RuntimeError("live preflight resumed without a saved managed position")
+        raw_position = state.get("position") or {}
+        try:
+            self.position = Position(
+                side=str(raw_position["side"]),
+                quantity=float(raw_position["quantity"]),
+                entry_price=float(raw_position["entry_price"]),
+                stop_price=float(raw_position["stop_price"]),
+                take_profit_price=float(raw_position["take_profit_price"]),
+                opened_at=int(raw_position["opened_at"]),
+                initial_stop_price=float(
+                    raw_position.get("initial_stop_price") or raw_position["stop_price"]
+                ),
+                best_price=float(raw_position.get("best_price") or raw_position["entry_price"]),
+                stop_reason=str(raw_position.get("stop_reason") or "stop_loss"),
+                worst_price=float(raw_position.get("worst_price") or raw_position["entry_price"]),
+                entry_order_id=str(raw_position.get("entry_order_id") or ""),
+                entry_client_id=str(raw_position.get("entry_client_id") or ""),
+                stop_order_id=str(raw_position["stop_order_id"]),
+                stop_client_id=str(raw_position["stop_client_id"]),
+                take_profit_order_id=str(raw_position.get("take_profit_order_id") or ""),
+                take_profit_client_id=str(raw_position.get("take_profit_client_id") or ""),
+            )
+            raw_signal = state.get("signal") or {}
+            self.position_signal = (
+                Signal(
+                    str(raw_signal["side"]),
+                    int(raw_signal["score"]),
+                    int(raw_signal["timestamp"]),
+                    tuple(str(reason) for reason in raw_signal.get("reasons") or ()),
+                )
+                if raw_signal
+                else None
+            )
+            self.position_equity_before = float(state.get("position_equity_before") or 0)
+            self.last_position_candle_timestamp = int(
+                state.get("last_position_candle_timestamp") or 0
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(f"saved managed position is invalid: {error}") from error
 
     def _restore_recent_loss_streak(self) -> None:
         """Restore a timed loss-streak guard from completed trade history.
@@ -509,6 +565,7 @@ class TradingEngine:
                     take_profit_order_id="",
                 )
                 self.position = position
+                self._save_live_reconciliation_state()
                 status = "live_order_protected"
                 live_raw = {
                     "entry_order_id": position.entry_order_id,
@@ -835,22 +892,96 @@ class TradingEngine:
             LOG.warning("live reconciliation state ignored: %s", error)
             return None
 
+    def _load_managed_live_position(self) -> dict[str, Any] | None:
+        if self.config.mode != "live" or self.adapter.name != "binance" or not self.config.reconciliation_state_path:
+            return None
+        path = Path(self.config.reconciliation_state_path)
+        if not path.exists():
+            return None
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            snapshot = state.get("managed_position")
+            if not isinstance(snapshot, dict):
+                return None
+            if (
+                snapshot.get("exchange") != self.adapter.name
+                or snapshot.get("symbol") != self.adapter.settings.symbol
+                or snapshot.get("environment") != getattr(self.adapter.settings, "environment", "production")
+            ):
+                return None
+            return snapshot
+        except Exception as error:
+            LOG.warning("managed live reconciliation state ignored: %s", error)
+            return None
+
     def _save_unmanaged_live_position(self) -> None:
+        self._save_live_reconciliation_state()
+
+    def _managed_live_position_snapshot(self) -> dict[str, Any] | None:
+        position = self.position
+        if self.config.mode != "live" or self.adapter.name != "binance" or position is None:
+            return None
+        signal = self.position_signal
+        return {
+            "exchange": self.adapter.name,
+            "symbol": self.adapter.settings.symbol,
+            "environment": getattr(self.adapter.settings, "environment", "production"),
+            "position": {
+                "side": position.side,
+                "quantity": position.quantity,
+                "entry_price": position.entry_price,
+                "stop_price": position.stop_price,
+                "take_profit_price": position.take_profit_price,
+                "opened_at": position.opened_at,
+                "initial_stop_price": position.initial_stop_price,
+                "best_price": position.best_price,
+                "stop_reason": position.stop_reason,
+                "worst_price": position.worst_price,
+                "entry_order_id": position.entry_order_id,
+                "entry_client_id": position.entry_client_id,
+                "stop_order_id": position.stop_order_id,
+                "stop_client_id": position.stop_client_id,
+                "take_profit_order_id": position.take_profit_order_id,
+                "take_profit_client_id": position.take_profit_client_id,
+            },
+            "signal": (
+                {
+                    "side": signal.side,
+                    "score": signal.score,
+                    "timestamp": signal.timestamp,
+                    "reasons": list(signal.reasons),
+                }
+                if signal is not None
+                else None
+            ),
+            "position_equity_before": self.position_equity_before,
+            "last_position_candle_timestamp": self.last_position_candle_timestamp,
+        }
+
+    def _save_live_reconciliation_state(self) -> None:
         if not self.config.reconciliation_state_path:
             return
-        path = Path(self.config.reconciliation_state_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(
-                {"unmanaged_position": self.unmanaged_live_position},
-                ensure_ascii=False,
-                indent=2,
+        try:
+            path = Path(self.config.reconciliation_state_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(
+                    {
+                        "unmanaged_position": self.unmanaged_live_position,
+                        "managed_position": self._managed_live_position_snapshot(),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
             )
-            + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(path)
+            temporary.replace(path)
+        except OSError:
+            # Persistence must never turn a confirmed, protected live entry
+            # into an emergency close. The exchange hard stop remains active.
+            LOG.exception("failed to persist live reconciliation state")
 
     def _manage_live_position(
         self,
@@ -1696,6 +1827,7 @@ class TradingEngine:
         self.position_signal = None
         self.position_equity_before = 0.0
         self.last_position_candle_timestamp = 0
+        self._save_live_reconciliation_state()
         if self.notifier is not None and record is not None:
             try:
                 report_date = (
@@ -1712,6 +1844,7 @@ class TradingEngine:
                 LOG.exception("close email notification failed; position remains closed")
 
     def close(self) -> None:
+        self._save_live_reconciliation_state()
         close_adapter = getattr(self.adapter, "close", None)
         if close_adapter is not None:
             close_adapter()

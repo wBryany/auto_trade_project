@@ -86,7 +86,7 @@ CSV 使用 UTF-8 BOM，Excel 可以直接打开。当前纸面/回测会完整�
 
 传统 K 线模式还支持三层防追价保护：`traditional_cross_max_extension_atr` 限制 5m 金叉/死叉确认时相对快 EMA 的扩张；`traditional_execution_rsi_*` 与 `traditional_execution_max_extension_atr` 拒绝已经过热/过冷的 1m 执行；`traditional_pressure_filter_enabled` 从已收盘 5m K 线本地合成 10m、15m K 线，并要求入场方向到 EMA/SMA 压力或支撑至少保留 `traditional_pressure_min_room_r` 倍的最小止损空间。合成过程不会增加交易所行情请求。
 
-Binance 正式环境的标记价格及 1m/5m/1h K 线使用公共 WebSocket，账户、持仓、普通订单和条件单使用 User Data Stream。私有流在连接或重连时只读取一次完整账户/挂单 REST 快照，持仓直接复用账户快照中的 `positions`，代码不再请求 `/positionRisk`；之后由 `ACCOUNT_UPDATE`、`ORDER_TRADE_UPDATE` 和 `ALGO_UPDATE` 增量维护。`live_reconciliation_seconds` 控制的是本地缓存对账频率，不会触发私有 REST 轮询。listenKey 按 Binance 要求每 30 分钟续期。仪表盘复用同一私有流并由 `dashboard_snapshot_seconds` 控制页面快照缓存。行情评估仍可按更短的 `poll_seconds` 运行，交易所硬止损不依赖本地轮询。
+Binance 正式环境的最新成交价、标记价格及 1m/5m/1h K 线使用公共 WebSocket，账户、持仓、普通订单和条件单使用 User Data Stream。私有流在连接或重连时只读取一次完整账户/挂单 REST 快照，持仓直接复用账户快照中的 `positions`，代码不再请求 `/positionRisk`；之后由 `ACCOUNT_UPDATE`、`ORDER_TRADE_UPDATE` 和 `ALGO_UPDATE` 增量维护。`live_reconciliation_seconds` 控制的是本地缓存对账频率，不会触发私有 REST 轮询。listenKey 按 Binance 要求每 30 分钟续期。仪表盘每秒从内存读取最新成交价、标记价、持仓和订单；持仓标记价与未实现盈亏也按最新标记价重算，不受 `dashboard_snapshot_seconds` 的慢快照周期影响，同时不会增加交易所 REST 压力。计划内重启会持久化机器人管理的仓位，只有交易所仓位与唯一的 `btcbot-stop-*` 硬止损在方向、数量、入场价、订单 ID 和触发价上全部吻合时才恢复管理，否则仍拒绝启动。行情评估仍可按更短的 `poll_seconds` 运行，交易所硬止损不依赖本地轮询。
 
 风险配置支持 `loss_streak_pause_minutes`。当 `max_consecutive_losses` 大于 0 且连续亏损达到该值时，引擎进入有期限的长暂停；正式交易重启后会从持久化交易报表恢复最近连亏次数与剩余暂停时间。将 `max_consecutive_losses` 设为 `0` 会完全禁用连亏入场阈值，但单笔亏损后的 `cooldown_minutes` 短冷却仍然生效。
 

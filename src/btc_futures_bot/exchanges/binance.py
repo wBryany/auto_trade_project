@@ -183,48 +183,110 @@ class BinanceAdapter(ExchangeAdapter):
         self._rest_mark_price_at = time.monotonic()
         return str(mark_price), str(index_price), timestamp, "rest"
 
-    def fetch_dashboard_snapshot(self) -> dict[str, Any]:
+    def _dashboard_market_view(
+        self,
+        mark_price_raw: str,
+        index_price_raw: str,
+        market_timestamp: int,
+        price_source: str,
+    ) -> dict[str, Any]:
+        last_price_raw = mark_price_raw
+        last_price_timestamp = market_timestamp
+        last_price_source = (
+            "Binance USDⓈ-M WebSocket 标记价格"
+            if price_source == "websocket"
+            else "Binance USDⓈ-M REST 标记价格"
+        )
+        last_price_endpoint = (
+            "@markPrice@1s" if price_source == "websocket" else "/fapi/v1/premiumIndex"
+        )
+        stream = self._market_stream
+        latest_trade = getattr(stream, "latest_trade", None) if stream is not None else None
+        streamed_trade = latest_trade() if callable(latest_trade) else None
+        if streamed_trade is not None:
+            trade_price, trade_timestamp = streamed_trade
+            last_price_raw = str(trade_price)
+            last_price_timestamp = trade_timestamp
+            last_price_source = "Binance USDⓈ-M WebSocket 最新成交价"
+            last_price_endpoint = "@aggTrade"
+        market = {
+            "symbol": self.settings.symbol,
+            "mark_price": float(mark_price_raw),
+            "mark_price_raw": mark_price_raw,
+            "last_price": float(last_price_raw),
+            "last_price_raw": last_price_raw,
+            "last_price_timestamp": last_price_timestamp,
+            "last_price_source": last_price_source,
+            "last_price_endpoint": last_price_endpoint,
+            "index_price": float(index_price_raw),
+            "index_price_raw": index_price_raw,
+            "price_source": (
+                "Binance USDⓈ-M WebSocket 标记价格"
+                if price_source == "websocket"
+                else "Binance USDⓈ-M REST 标记价格"
+            ),
+            "price_endpoint": (
+                "@markPrice@1s"
+                if price_source == "websocket"
+                else "/fapi/v1/premiumIndex"
+            ),
+            "timestamp": market_timestamp,
+        }
+        if stream is not None:
+            market["stream"] = stream.status()
+        return market
+
+    def fetch_live_market_snapshot(self) -> dict[str, Any] | None:
+        """Return only fresh in-memory WebSocket prices without making REST calls."""
+
+        stream = self._market_stream
+        if stream is None:
+            return None
+        stream.start()
+        streamed = stream.mark_price()
+        if streamed is None:
+            return None
+        mark_price, index_price, timestamp = streamed
+        return self._dashboard_market_view(
+            str(mark_price),
+            str(index_price),
+            timestamp,
+            "websocket",
+        )
+
+    def fetch_dashboard_snapshot(
+        self,
+        *,
+        private_wait_seconds: float = 10.0,
+        include_order_limits: bool = True,
+    ) -> dict[str, Any]:
         mark_price_raw, index_price_raw, market_timestamp, price_source = self._market_prices()
         if Decimal(mark_price_raw) <= 0:
             raise RuntimeError(f"Binance returned no mark price for {self.settings.symbol}")
         snapshot: dict[str, Any] = {
-            "market": {
-                "symbol": self.settings.symbol,
-                "mark_price": float(mark_price_raw),
-                "mark_price_raw": mark_price_raw,
-                # Backward-compatible alias for paper-position display code.
-                "last_price": float(mark_price_raw),
-                "last_price_raw": mark_price_raw,
-                "index_price": float(index_price_raw),
-                "index_price_raw": index_price_raw,
-                "price_source": (
-                    "Binance USDⓈ-M WebSocket 标记价格"
-                    if price_source == "websocket"
-                    else "Binance USDⓈ-M REST 标记价格"
-                ),
-                "price_endpoint": (
-                    "@markPrice@1s" if price_source == "websocket" else "/fapi/v1/premiumIndex"
-                ),
-                "timestamp": market_timestamp,
-            },
+            "market": self._dashboard_market_view(
+                mark_price_raw,
+                index_price_raw,
+                market_timestamp,
+                price_source,
+            ),
             "positions": [],
             "open_orders": [],
             "private_available": False,
         }
-        if self._market_stream is not None:
-            snapshot["market"]["stream"] = self._market_stream.status()
         if self._private_stream is not None:
             snapshot["private_stream"] = self._private_stream.status()
-        try:
-            snapshot["order_limits"] = self.order_limits(mark_price_raw)
-        except Exception as error:
-            snapshot["order_limits"] = {"error": str(error)}
+        if include_order_limits:
+            try:
+                snapshot["order_limits"] = self.order_limits(mark_price_raw)
+            except Exception as error:
+                snapshot["order_limits"] = {"error": str(error)}
         if not self.has_credentials():
             snapshot["private_error"] = "未配置当前环境的 API Key；只显示公开行情"
             return snapshot
 
         try:
-            private = self._private_snapshot(wait_seconds=10.0)
+            private = self._private_snapshot(wait_seconds=max(0.0, private_wait_seconds))
             account = private["account"]
             position_rows = private["positions"]
             order_rows = private["orders"]
@@ -359,6 +421,28 @@ class BinanceAdapter(ExchangeAdapter):
             snapshot["private_retryable"] = self._private_error_is_retryable(error)
         return snapshot
 
+    def fetch_dashboard_snapshot_nonblocking(self) -> dict[str, Any]:
+        """Refresh dashboard state without ever waiting for private-stream startup."""
+
+        return self.fetch_dashboard_snapshot(private_wait_seconds=0.0)
+
+    def fetch_live_dashboard_snapshot(self) -> dict[str, Any] | None:
+        """Return WebSocket-backed market/private state without waiting or REST."""
+
+        market_stream = self._market_stream
+        private_stream = self._private_stream
+        if (
+            market_stream is None
+            or private_stream is None
+            or market_stream.mark_price() is None
+            or not private_stream.healthy()
+        ):
+            return None
+        return self.fetch_dashboard_snapshot(
+            private_wait_seconds=0.0,
+            include_order_limits=False,
+        )
+
     def close(self) -> None:
         if self._market_stream is not None:
             self._market_stream.close()
@@ -443,7 +527,12 @@ class BinanceAdapter(ExchangeAdapter):
         rounding = ROUND_DOWN if side.lower() == "sell" else ROUND_UP
         return self._round_step(Decimal(str(price)), self.symbol_rules()["price_tick"], rounding)
 
-    def prepare_live(self, *, max_leverage: float) -> dict[str, Any]:
+    def prepare_live(
+        self,
+        *,
+        max_leverage: float,
+        managed_position: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not self.has_credentials():
             raise RuntimeError("Binance live mode requires credentials for the selected environment")
         self.symbol_rules()
@@ -453,6 +542,14 @@ class BinanceAdapter(ExchangeAdapter):
         algo_orders = private["algo_orders"]
         active_positions = [row for row in positions if abs(float(row.get("positionAmt") or 0)) > 0]
         if active_positions or regular_orders or algo_orders:
+            if managed_position is not None:
+                return self._resume_protected_live_position(
+                    managed_position,
+                    active_positions,
+                    regular_orders,
+                    algo_orders,
+                    max_leverage=max_leverage,
+                )
             raise RuntimeError(
                 "Binance live preflight refused: existing position/order found; resolve it on Binance before starting"
             )
@@ -485,6 +582,85 @@ class BinanceAdapter(ExchangeAdapter):
             "position_mode": "one-way",
             "leverage": leverage,
             "flat": True,
+            "private_stream": (
+                self._private_stream.status() if self._private_stream is not None else None
+            ),
+        }
+
+    def _resume_protected_live_position(
+        self,
+        managed_state: dict[str, Any],
+        active_positions: list[dict[str, Any]],
+        regular_orders: list[dict[str, Any]],
+        algo_orders: list[dict[str, Any]],
+        *,
+        max_leverage: float,
+    ) -> dict[str, Any]:
+        """Resume only an exactly matching bot position with one valid hard stop."""
+
+        expected = managed_state.get("position") or {}
+        if len(active_positions) != 1 or regular_orders or len(algo_orders) != 1:
+            raise RuntimeError(
+                "Binance live resume refused: saved position requires exactly one position and one hard stop"
+            )
+        remote = active_positions[0]
+        if str(remote.get("positionSide") or "BOTH").upper() != "BOTH":
+            raise RuntimeError("Binance live resume refused: position is not in one-way mode")
+        amount = float(remote.get("positionAmt") or 0)
+        remote_side = "long" if amount > 0 else "short"
+        remote_quantity = abs(amount)
+        remote_entry = float(remote.get("entryPrice") or 0)
+        remote_leverage = float(remote.get("leverage") or 0)
+        expected_side = str(expected.get("side") or "")
+        expected_quantity = float(expected.get("quantity") or 0)
+        expected_entry = float(expected.get("entry_price") or 0)
+        if remote_side != expected_side:
+            raise RuntimeError("Binance live resume refused: saved position side does not match exchange")
+        if abs(remote_quantity - expected_quantity) > max(1e-12, expected_quantity * 0.001):
+            raise RuntimeError("Binance live resume refused: saved position quantity does not match exchange")
+        if abs(remote_entry - expected_entry) > max(1e-8, expected_entry * 0.00001):
+            raise RuntimeError("Binance live resume refused: saved entry price does not match exchange")
+        if remote_leverage <= 0 or remote_leverage > max(1.0, float(max_leverage)):
+            raise RuntimeError("Binance live resume refused: exchange leverage exceeds configured maximum")
+        if (
+            self.settings.margin_mode.lower() == "isolated"
+            and "isolated" in remote
+            and not self._truthy(remote.get("isolated"))
+        ):
+            raise RuntimeError("Binance live resume refused: exchange position is not isolated")
+
+        stop_client_id = str(expected.get("stop_client_id") or "")
+        stop_order_id = str(expected.get("stop_order_id") or "")
+        stop_price = float(expected.get("initial_stop_price") or expected.get("stop_price") or 0)
+        if not stop_client_id.startswith("btcbot-stop-"):
+            raise RuntimeError("Binance live resume refused: saved hard stop is not bot-owned")
+        if stop_price <= 0 or (
+            remote_side == "long" and stop_price >= remote_entry
+        ) or (
+            remote_side == "short" and stop_price <= remote_entry
+        ):
+            raise RuntimeError("Binance live resume refused: saved hard stop is not protective")
+        stop = algo_orders[0]
+        if str(stop.get("algoId") or "") != stop_order_id:
+            raise RuntimeError("Binance live resume refused: saved hard-stop id does not match exchange")
+        self._validate_open_algo_order(
+            stop,
+            client_id=stop_client_id,
+            order_type="STOP_MARKET",
+            exit_side="SELL" if remote_side == "long" else "BUY",
+            trigger_price=stop_price,
+        )
+        return {
+            "exchange": "binance",
+            "environment": self.settings.environment,
+            "symbol": self.settings.symbol,
+            "margin_mode": self.settings.margin_mode,
+            "position_mode": "one-way",
+            "leverage": remote_leverage,
+            "flat": False,
+            "resumed": True,
+            "stop_order_id": stop_order_id,
+            "stop_client_id": stop_client_id,
             "private_stream": (
                 self._private_stream.status() if self._private_stream is not None else None
             ),

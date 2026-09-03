@@ -10,6 +10,7 @@ from btc_futures_bot.models import Candle
 def test_combined_stream_updates_seeded_kline_and_mark_price() -> None:
     stream = BinanceMarketStream("BTCUSDT", "production")
     assert stream.url.startswith("wss://fstream.binance.com/market/stream?streams=")
+    assert "btcusdt@aggTrade" in stream.url
     stream.seed_candles(
         "1m",
         [Candle(1_700_000_000_000, 100.0, 101.0, 99.0, 100.5, 10.0)],
@@ -45,12 +46,25 @@ def test_combined_stream_updates_seeded_kline_and_mark_price() -> None:
             },
         }
     )
+    trade_message = json.dumps(
+        {
+            "stream": "btcusdt@aggTrade",
+            "data": {
+                "e": "aggTrade",
+                "E": 1_700_000_001_100,
+                "T": 1_700_000_001_050,
+                "p": "101.35",
+            },
+        }
+    )
 
     with patch("btc_futures_bot.binance_stream.time.monotonic", return_value=100.0):
         stream.process_message(kline_message)
         stream.process_message(mark_message)
+        stream.process_message(trade_message)
         assert stream.healthy()
         assert stream.mark_price() == (101.25, 101.2, 1_700_000_001_000)
+        assert stream.latest_trade() == (101.35, 1_700_000_001_050)
 
     candles = stream.candles("1m", 300)
     assert len(candles) == 1
@@ -64,3 +78,4 @@ def test_stream_ignores_unconfigured_events() -> None:
 
     assert stream.candles("1m", 10) == []
     assert stream.mark_price() is None
+    assert stream.latest_trade() is None

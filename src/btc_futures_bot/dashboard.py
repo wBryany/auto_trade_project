@@ -135,6 +135,43 @@ def _position_dict(
     }
 
 
+def _mark_to_market_view(
+    snapshot: dict[str, Any],
+    symbol: str,
+    mark_price: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Refresh price-derived position/account values without a private API read."""
+
+    positions = [dict(position) for position in snapshot.get("positions") or []]
+    account = dict(snapshot.get("account") or {})
+    selected_symbol = str(symbol or "").upper()
+    refreshed_pnl = Decimal("0")
+    all_positions_refreshed = bool(positions)
+    for position in positions:
+        position_symbol = str(position.get("symbol") or selected_symbol).upper()
+        if mark_price <= 0 or position_symbol != selected_symbol:
+            all_positions_refreshed = False
+            continue
+        entry = _decimal(position.get("entry_price"))
+        quantity = abs(_decimal(position.get("quantity")))
+        direction = Decimal("1") if str(position.get("side")) == "long" else Decimal("-1")
+        pnl = (Decimal(str(mark_price)) - entry) * quantity * direction
+        notional = abs(entry * quantity)
+        position["mark_price"] = mark_price
+        position["unrealized_pnl"] = float(pnl)
+        position["unrealized_pnl_raw"] = _decimal_text(pnl)
+        position["unrealized_pnl_pct"] = float(pnl / notional) if notional else 0.0
+        refreshed_pnl += pnl
+    if account and all_positions_refreshed:
+        wallet = _decimal(account.get("wallet_balance_raw") or account.get("wallet_balance"))
+        margin = wallet + refreshed_pnl
+        account["unrealized_pnl"] = float(refreshed_pnl)
+        account["unrealized_pnl_raw"] = _decimal_text(refreshed_pnl)
+        account["margin_balance"] = float(margin)
+        account["margin_balance_raw"] = _decimal_text(margin)
+    return positions, account
+
+
 class DashboardService:
     def __init__(self, config_path: str) -> None:
         self.config_path = str(Path(config_path))
@@ -472,7 +509,12 @@ class DashboardService:
             self._snapshot_refreshing = True
         try:
             adapter = self._adapter(config, exchange_name)
-            snapshot = adapter.fetch_dashboard_snapshot()
+            fetch_snapshot = getattr(adapter, "fetch_dashboard_snapshot_nonblocking", None)
+            snapshot = (
+                fetch_snapshot()
+                if callable(fetch_snapshot)
+                else adapter.fetch_dashboard_snapshot()
+            )
             with self._snapshot_condition:
                 now = time.time()
                 private_now = time.monotonic()
@@ -554,6 +596,46 @@ class DashboardService:
                 self._snapshot_refreshing = False
                 self._snapshot_condition.notify_all()
 
+    def _with_live_market(
+        self,
+        config: dict[str, Any],
+        exchange_name: str,
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Overlay cached private data with the newest in-memory market tick."""
+
+        try:
+            adapter = self._adapter(config, exchange_name)
+            fetch_live_snapshot = getattr(adapter, "fetch_live_dashboard_snapshot", None)
+            live_snapshot = fetch_live_snapshot() if callable(fetch_live_snapshot) else None
+            if live_snapshot:
+                refreshed = dict(snapshot)
+                refreshed.update(live_snapshot)
+                if "order_limits" not in live_snapshot and "order_limits" in snapshot:
+                    refreshed["order_limits"] = snapshot["order_limits"]
+                refreshed.pop("private_stale", None)
+                refreshed.pop("private_warning", None)
+                refreshed.pop("snapshot_error", None)
+                market = dict(refreshed.get("market") or {})
+                market.pop("stale", None)
+                refreshed["market"] = market
+                return refreshed
+            fetch_live_market = getattr(adapter, "fetch_live_market_snapshot", None)
+            if not callable(fetch_live_market):
+                return snapshot
+            live_market = fetch_live_market()
+            if not live_market:
+                return snapshot
+        except Exception:
+            LOG.debug("live dashboard market refresh failed; using cached price", exc_info=True)
+            return snapshot
+        refreshed = dict(snapshot)
+        market = dict(snapshot.get("market") or {})
+        market.update(live_market)
+        market.pop("stale", None)
+        refreshed["market"] = market
+        return refreshed
+
     def private_check(self) -> dict[str, Any]:
         config = self._config()
         exchange_name = self._exchange(config)
@@ -614,10 +696,16 @@ class DashboardService:
         exchange_config = config.get("exchanges", {}).get(exchange_name, {})
         try:
             snapshot = self._market_snapshot(config, exchange_name)
+            snapshot = self._with_live_market(config, exchange_name, snapshot)
         except Exception as error:
             snapshot = {"market": {}, "positions": [], "open_orders": [], "private_available": False, "private_error": str(error)}
         market = snapshot.get("market") or {}
         mark_price = market.get("mark_price") or market.get("last_price")
+        positions, account = _mark_to_market_view(
+            snapshot,
+            str(exchange_config.get("symbol") or ""),
+            float(mark_price or 0),
+        )
         paper_position = (
             _position_dict(
                 self.engine.position,
@@ -627,17 +715,11 @@ class DashboardService:
             if self.engine and self.engine.position
             else None
         )
-        positions = snapshot.get("positions") or []
         for position in positions:
-            entry = abs(float(position.get("entry_price") or 0))
-            quantity = abs(float(position.get("quantity") or 0))
-            notional = entry * quantity
-            position["unrealized_pnl_pct"] = float(position.get("unrealized_pnl") or 0) / notional if notional else 0.0
             if snapshot.get("private_stale"):
                 position["source"] = "exchange_stale"
         if paper_position:
             positions = [paper_position]
-        account = dict(snapshot.get("account") or {})
         if account:
             account["source"] = (
                 "exchange_stale" if snapshot.get("private_stale") else "exchange"
@@ -937,7 +1019,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   <section id="console" class="tab active">
     <div class="grid metrics">
       <div class="panel metric"><div class="eyebrow">账户权益</div><div id="equity" class="metric-value">—</div><div id="balanceSub" class="small">等待账户数据</div></div>
-      <div class="panel metric"><div class="eyebrow">合约标记价格</div><div id="markPrice" class="metric-value">—</div><div id="marketSub" class="small">—</div></div>
+      <div class="panel metric"><div class="eyebrow">最新成交价格</div><div id="markPrice" class="metric-value">—</div><div id="marketSub" class="small">—</div></div>
       <div class="panel metric"><div class="eyebrow">未实现盈亏</div><div id="unrealized" class="metric-value">—</div><div id="pnlSub" class="small">含当前持仓</div></div>
       <div class="panel metric"><div class="eyebrow">当前挂单</div><div id="orderCount" class="metric-value">—</div><div id="engineSub" class="small">引擎未启动</div></div>
     </div>
@@ -976,12 +1058,12 @@ const fillBaseConfig=fillConfig;fillConfig=function(c){fillBaseConfig(c);const e
 async function loadConfig(){try{fillConfig(await api('/api/config'))}catch(e){toast(e.message)}}
 async function saveConfig(){try{const d=await api('/api/config',{method:'POST',body:JSON.stringify({exchange:$('cfgExchange').value,api_key:$('apiKey').value,api_secret:$('apiSecret').value,passphrase:$('passphrase').value,mode:$('cfgMode').value,symbol:$('symbol').value,poll_seconds:Number($('pollSeconds').value),paper_equity:Number($('paperEquity').value),max_leverage:Number($('maxLeverage').value),stop_loss_pct:Number($('stopLoss').value)/100,risk_per_trade:Number($('riskPerTrade').value)/100,max_notional_pct:Number($('maxNotional').value)/100,min_score:Number($('minScore').value),min_volume_ratio:Number($('minVolumeRatio').value),take_profit_r:Number($('takeProfitR').value)})});$('apiKey').value='';$('apiSecret').value='';$('passphrase').value='';fillConfig(d);toast('配置已保存，请重新检查私有 API')}catch(e){toast(e.message)}}
 function renderOrderSizing(s){const x=s.order_sizing||{};if(!x.available){$('orderSizingBox').textContent=x.error||'当前平台未提供下单额度数据';return}const ok=Boolean(x.strategy_cap_meets_minimum),fallback=Boolean(x.minimum_fallback_available);const message=ok?'30%容量上限满足交易所最小订单':fallback?'30%计算结果低于最小单时，将按交易所最小单兜底':'账户理论容量不足最小单：不下单并发送邮件通知';$('orderSizingBox').innerHTML=`交易所最小：<b>${exact(x.effective_min_notional_raw)} USDT</b>（${exact(x.effective_min_quantity_raw)} BTC；MIN_NOTIONAL ${exact(x.min_notional_filter_raw)} USDT）<br>账户理论最大：<b>${exact(x.estimated_max_open_notional_raw)} USDT</b>（${exact(x.estimated_max_open_quantity_raw)} BTC，${exact(x.current_leverage_raw)}x，按数量步进取整，未扣手续费/滑点）<br>理论最大可开金额使用上限：<b class="${ok||fallback?'positive':'negative'}">${exact(x.effective_strategy_cap_raw)} USDT</b>（理论最大 ${exact(x.strategy_cap_basis_raw)} USDT × ${pct(x.max_notional_pct_raw)}；单笔风险预算 ${exact(x.risk_budget_raw)} USDT）<br><span class="${ok||fallback?'positive':'negative'}">${message}</span><br>实际下单：${esc(x.formula||'—')}`}
-function renderStatus(s){const connected=s.connection.market;const privateOk=s.connection.private;const privateLabel=s.connection.private_source==='websocket'?'私有 WebSocket':'私有 API';const markRaw=s.market.mark_price_raw??s.market.mark_price??s.market.last_price_raw??s.market.last_price;const priceSource=s.market.price_source||`${s.exchange} 合约行情`;$('statusDot').className=`dot ${connected?'ok':'bad'}`;$('statusText').textContent=connected?`${s.exchange} · ${s.environment} · ${s.running?'引擎运行中':'引擎已停止'}`:'行情连接失败';$('equity').textContent=exact(s.account.wallet_balance_raw??s.account.wallet_balance);$('balanceSub').textContent=`可用 ${exact(s.account.available_balance_raw??s.account.available_balance)} · 保证金 ${exact(s.account.margin_balance_raw??s.account.margin_balance)}`;$('markPrice').textContent=Number(markRaw)>0?exact(markRaw):'—';$('marketSub').textContent=`${s.symbol||'—'} · ${priceSource}`;$('unrealized').innerHTML=pnl(s.account.unrealized_pnl);$('pnlSub').textContent=privateOk?'交易所实时数据':'模拟盘估算';$('orderCount').textContent=(s.open_orders||[]).length;$('engineSub').textContent=s.running?`最近周期 ${time(s.last_cycle_at)}`:'引擎未启动';$('modeLabel').textContent=s.mode;$('lastCycle').textContent=time(s.last_cycle_at);$('runtimeNotice').textContent=s.last_error||s.connection.private_error||(s.running?'引擎正在按配置运行；页面每 1 秒刷新一次':'请在“配置”中保存测试网 API Key。没有 Key 时仍可运行公开行情和模拟盘。');$('runtimeNotice').className=s.last_error?'notice negative':'notice';$('connectionBox').innerHTML=`行情：<span class="${connected?'positive':'negative'}">${connected?'正常':'失败'}</span><br>${privateLabel}：<span class="${privateOk?'positive':'neutral'}">${privateOk?'已连接':'未连接'}</span>${s.connection.private_error?`<br><span class="negative">${esc(s.connection.private_error)}</span>`:''}<br>交易对：${esc(s.symbol)}<br>模式：${esc(s.mode)}`;renderOrderSizing(s);const sig=s.signal;$('signalBox').innerHTML=sig?`方向：<b>${esc(sig.side)}</b> · 分数：<b>${sig.score}</b><br>${esc((sig.reasons||[]).join(' · '))}`:'暂无信号';$('resultBox').textContent=s.last_result?`${s.last_result.status} · ${s.last_result.position?'持仓已更新':''}`:'—';$('positionsBody').innerHTML=(s.positions||[]).length?s.positions.map(p=>`<tr><td>${esc(p.source||'exchange')}</td><td>${esc(p.side)}</td><td>${num(p.quantity,5)}</td><td>${num(p.entry_price,2)}</td><td>${num(p.mark_price,2)}</td><td>${pnl(p.unrealized_pnl)}</td><td>${num(p.stop_price,2)}</td><td>${p.take_profit_mode==='dynamic'?'动态退出':num(p.take_profit_price,2)}</td></tr>`).join(''):'<tr><td colspan="8" class="empty">暂无持仓</td></tr>';$('ordersBody').innerHTML=(s.open_orders||[]).length?s.open_orders.map(o=>`<tr><td>${esc(o.order_id||o.client_order_id||'—')}</td><td>${esc(o.side)}</td><td>${esc(o.type)}</td><td>${esc(o.status)}</td><td>${num(o.quantity,5)}</td><td>${num(o.stop_price||o.price,2)}</td><td>${o.reduce_only?'是':'否'}</td></tr>`).join(''):'<tr><td colspan="7" class="empty">暂无挂单</td></tr>'}
-async function loadStatus(){try{renderStatus(await api('/api/status'))}catch(e){$('statusDot').className='dot bad';$('statusText').textContent=e.message}}
+function renderStatus(s){const connected=s.connection.market;const privateOk=s.connection.private;const privateLabel=s.connection.private_source==='websocket'?'私有 WebSocket':'私有 API';const markRaw=s.market.mark_price_raw??s.market.mark_price;const lastRaw=s.market.last_price_raw??s.market.last_price??markRaw;const priceSource=s.market.last_price_source||s.market.price_source||`${s.exchange} 合约行情`;const tickAt=Number(s.market.last_price_timestamp||s.market.timestamp||0);const age=tickAt?Math.max(0,(Date.now()-tickAt)/1000):null;const ageText=age===null?'':` · ${age.toFixed(1)} 秒前`;$('statusDot').className=`dot ${connected?'ok':'bad'}`;$('statusText').textContent=connected?`${s.exchange} · ${s.environment} · ${s.running?'引擎运行中':'引擎已停止'}`:'行情连接失败';$('equity').textContent=exact(s.account.wallet_balance_raw??s.account.wallet_balance);$('balanceSub').textContent=`可用 ${exact(s.account.available_balance_raw??s.account.available_balance)} · 保证金 ${exact(s.account.margin_balance_raw??s.account.margin_balance)}`;$('markPrice').textContent=Number(lastRaw)>0?exact(lastRaw):'—';$('marketSub').textContent=`${s.symbol||'—'} · ${priceSource} · 标记 ${exact(markRaw)}${ageText}`;$('unrealized').innerHTML=pnl(s.account.unrealized_pnl);$('pnlSub').textContent=privateOk?'交易所实时数据':'模拟盘估算';$('orderCount').textContent=(s.open_orders||[]).length;$('engineSub').textContent=s.running?`最近周期 ${time(s.last_cycle_at)}`:'引擎未启动';$('modeLabel').textContent=s.mode;$('lastCycle').textContent=time(s.last_cycle_at);$('runtimeNotice').textContent=s.last_error||s.connection.private_error||(s.running?'引擎正在按配置运行；页面每 1 秒刷新一次':'请在“配置”中保存测试网 API Key。没有 Key 时仍可运行公开行情和模拟盘。');$('runtimeNotice').className=s.last_error?'notice negative':'notice';$('connectionBox').innerHTML=`行情：<span class="${connected?'positive':'negative'}">${connected?'正常':'失败'}</span><br>${privateLabel}：<span class="${privateOk?'positive':'neutral'}">${privateOk?'已连接':'未连接'}</span>${s.connection.private_error?`<br><span class="negative">${esc(s.connection.private_error)}</span>`:''}<br>交易对：${esc(s.symbol)}<br>模式：${esc(s.mode)}`;renderOrderSizing(s);const sig=s.signal;$('signalBox').innerHTML=sig?`方向：<b>${esc(sig.side)}</b> · 分数：<b>${sig.score}</b><br>${esc((sig.reasons||[]).join(' · '))}`:'暂无信号';$('resultBox').textContent=s.last_result?`${s.last_result.status} · ${s.last_result.position?'持仓已更新':''}`:'—';$('positionsBody').innerHTML=(s.positions||[]).length?s.positions.map(p=>`<tr><td>${esc(p.source||'exchange')}</td><td>${esc(p.side)}</td><td>${num(p.quantity,5)}</td><td>${num(p.entry_price,2)}</td><td>${num(p.mark_price,2)}</td><td>${pnl(p.unrealized_pnl)}</td><td>${num(p.stop_price,2)}</td><td>${p.take_profit_mode==='dynamic'?'动态退出':num(p.take_profit_price,2)}</td></tr>`).join(''):'<tr><td colspan="8" class="empty">暂无持仓</td></tr>';$('ordersBody').innerHTML=(s.open_orders||[]).length?s.open_orders.map(o=>`<tr><td>${esc(o.order_id||o.client_order_id||'—')}</td><td>${esc(o.side)}</td><td>${esc(o.type)}</td><td>${esc(o.status)}</td><td>${num(o.quantity,5)}</td><td>${num(o.stop_price||o.price,2)}</td><td>${o.reduce_only?'是':'否'}</td></tr>`).join(''):'<tr><td colspan="7" class="empty">暂无挂单</td></tr>'}
+let statusRequestInFlight=false;async function loadStatus(){if(statusRequestInFlight)return;statusRequestInFlight=true;try{renderStatus(await api('/api/status'))}catch(e){$('statusDot').className='dot bad';$('statusText').textContent=e.message}finally{statusRequestInFlight=false}}
 async function startEngine(){try{await api('/api/start',{method:'POST',body:JSON.stringify({exchange:$('runExchange').value})});toast('引擎已启动');loadStatus()}catch(e){toast(e.message)}}async function stopEngine(){try{await api('/api/stop',{method:'POST',body:'{}'});toast('引擎已停止');loadStatus()}catch(e){toast(e.message)}}async function privateCheck(){try{const d=await api('/api/private-check',{method:'POST',body:'{}'});toast(`私有 API 成功，权益 ${exact(d.equity_raw??d.equity)}`);loadStatus()}catch(e){toast(e.message)}}
 function summaryRows(rows){return rows.length?rows.map(r=>`<tr><td>${esc(r.period)}</td><td>${r.trades}</td><td>${pct(r.win_rate)}</td><td>${pnl(r.gross_pnl)}</td><td>${num(r.trading_fee)}</td><td>${num(r.total_cost)}</td><td>${pnl(r.net_pnl)}</td></tr>`).join(''):'<tr><td colspan="7" class="empty">暂无数据</td></tr>'}
 async function loadReports(){try{const q=new URLSearchParams();if($('fromDate').value)q.set('from',$('fromDate').value);if($('toDate').value)q.set('to',$('toDate').value);if($('reportExchange').value)q.set('exchange',$('reportExchange').value);const d=await api('/api/reports?'+q.toString()),s=d.stats;$('statTrades').textContent=s.trades;$('statWinRate').textContent=s.trades?`${(s.wins/s.trades*100).toFixed(2)}%`:'0%';$('statGross').innerHTML=pnl(s.gross_pnl);$('statCost').innerHTML=num(s.total_cost);$('statNet').innerHTML=pnl(s.net_pnl);$('tradesBody').innerHTML=d.trades.length?d.trades.map(r=>`<tr><td>${esc(r.exit_time)}</td><td>${esc(r.exchange)}</td><td>${esc(r.side)}</td><td>${num(r.entry_price,2)}</td><td>${num(r.exit_price,2)}</td><td>${num(r.quantity,5)}</td><td>${pnl(r.gross_pnl)}</td><td>${num(r.trading_fee)}</td><td>${num(r.total_cost)}</td><td>${pnl(r.net_pnl)}</td><td>${pct(r.net_pnl_pct)}</td><td>${pct(r.fee_ratio_pct)}</td><td>${esc(r.exit_reason)}</td></tr>`).join(''):'<tr><td colspan="13" class="empty">暂无交易记录</td></tr>';$('dailyBody').innerHTML=summaryRows(d.daily);$('monthlyBody').innerHTML=summaryRows(d.monthly)}catch(e){toast(e.message)}}
-$('saveBtn').onclick=saveConfig;$('configCheckBtn').onclick=privateCheck;$('startBtn').onclick=startEngine;$('stopBtn').onclick=stopEngine;$('privateBtn').onclick=privateCheck;$('reportBtn').onclick=loadReports;$('cfgExchange').onchange=()=>{$('runExchange').value=$('cfgExchange').value;if($('cfgExchange').value==='binance'&&/[-_]/.test($('symbol').value))$('symbol').value='BTCUSDT';syncEnvironmentUi()};$('cfgEnvironment').onchange=syncEnvironmentUi;$('cfgMode').onchange=syncEnvironmentUi;loadConfig();loadStatus();setInterval(loadStatus,2000);
+$('saveBtn').onclick=saveConfig;$('configCheckBtn').onclick=privateCheck;$('startBtn').onclick=startEngine;$('stopBtn').onclick=stopEngine;$('privateBtn').onclick=privateCheck;$('reportBtn').onclick=loadReports;$('cfgExchange').onchange=()=>{$('runExchange').value=$('cfgExchange').value;if($('cfgExchange').value==='binance'&&/[-_]/.test($('symbol').value))$('symbol').value='BTCUSDT';syncEnvironmentUi()};$('cfgEnvironment').onchange=syncEnvironmentUi;$('cfgMode').onchange=syncEnvironmentUi;loadConfig();loadStatus();setInterval(loadStatus,1000);
 </script>
 <script>
 async function loadOperations(){try{const q=new URLSearchParams();if($('operationsFrom').value)q.set('from',$('operationsFrom').value);if($('operationsTo').value)q.set('to',$('operationsTo').value);if($('operationsType').value)q.set('type',$('operationsType').value);if($('operationsQuery').value)q.set('q',$('operationsQuery').value);const d=await api('/api/operations?'+q.toString());$('operationPath').textContent=d.path;$('operationsBody').innerHTML=d.rows.length?d.rows.map(r=>{const detail=JSON.stringify({details:r.details||{},result:r.result||{}});return `<tr><td>${esc(r.local_time||r.timestamp)}</td><td>${esc(r.event_type)}</td><td>${esc(r.action)}</td><td>${esc(r.status)}</td><td>${esc(r.summary)}</td><td>${esc((r.changed_files||[]).join(', '))}</td><td title="${esc(detail)}">${esc(detail)}</td><td>${esc(r.source)}</td></tr>`}).join(''):'<tr><td colspan="8" class="empty">暂无操作日志</td></tr>'}catch(e){toast(e.message)}}

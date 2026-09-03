@@ -25,7 +25,7 @@ BINANCE_STREAM_URLS = {
 
 
 class BinanceMarketStream:
-    """Maintain Binance mark price and K-line caches over one combined stream."""
+    """Maintain Binance trade, mark price, and K-line caches over one stream."""
 
     intervals = ("1m", "5m", "1h")
 
@@ -45,6 +45,7 @@ class BinanceMarketStream:
         if base_url is None:
             raise ValueError("Binance stream environment must be testnet or production")
         streams = [f"{self.symbol}@kline_{interval}" for interval in self.intervals]
+        streams.append(f"{self.symbol}@aggTrade")
         streams.append(f"{self.symbol}@markPrice@1s")
         self.url = f"{base_url}/stream?streams={'/'.join(streams)}"
         self._lock = threading.RLock()
@@ -57,6 +58,10 @@ class BinanceMarketStream:
         self._mark_price = 0.0
         self._index_price = 0.0
         self._market_timestamp = 0
+        self._mark_received_at = 0.0
+        self._last_trade_price = 0.0
+        self._last_trade_timestamp = 0
+        self._trade_received_at = 0.0
         self._last_message_at = 0.0
         self._connected = False
         self._last_error = ""
@@ -127,9 +132,25 @@ class BinanceMarketStream:
 
     def mark_price(self) -> tuple[float, float, int] | None:
         with self._lock:
-            if not self.healthy() or self._mark_price <= 0:
+            if (
+                not self._connected
+                or self._mark_price <= 0
+                or not self._mark_received_at
+                or time.monotonic() - self._mark_received_at > self.stale_seconds
+            ):
                 return None
             return self._mark_price, self._index_price, self._market_timestamp
+
+    def latest_trade(self) -> tuple[float, int] | None:
+        with self._lock:
+            if (
+                not self._connected
+                or self._last_trade_price <= 0
+                or not self._trade_received_at
+                or time.monotonic() - self._trade_received_at > self.stale_seconds
+            ):
+                return None
+            return self._last_trade_price, self._last_trade_timestamp
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -143,6 +164,16 @@ class BinanceMarketStream:
                 "connected": self._connected,
                 "healthy": self.healthy(),
                 "last_message_age_seconds": age,
+                "mark_price_age_seconds": (
+                    max(0.0, time.monotonic() - self._mark_received_at)
+                    if self._mark_received_at
+                    else None
+                ),
+                "trade_price_age_seconds": (
+                    max(0.0, time.monotonic() - self._trade_received_at)
+                    if self._trade_received_at
+                    else None
+                ),
                 "last_error": self._last_error,
             }
 
@@ -175,7 +206,19 @@ class BinanceMarketStream:
                 self._mark_price = float(data.get("p") or 0)
                 self._index_price = float(data.get("i") or 0)
                 self._market_timestamp = int(data.get("E") or time.time() * 1000)
-                self._last_message_at = time.monotonic()
+                received_at = time.monotonic()
+                self._mark_received_at = received_at
+                self._last_message_at = received_at
+            return
+        if event == "aggTrade":
+            with self._lock:
+                self._last_trade_price = float(data.get("p") or 0)
+                self._last_trade_timestamp = int(
+                    data.get("T") or data.get("E") or time.time() * 1000
+                )
+                received_at = time.monotonic()
+                self._trade_received_at = received_at
+                self._last_message_at = received_at
 
     def _trim(self, bucket: dict[int, Candle]) -> None:
         overflow = len(bucket) - self.max_history

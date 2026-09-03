@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -598,6 +599,77 @@ def test_binance_unmanaged_position_emails_open_and_close_once_across_restart(tm
     assert second_notifier.closed[0]["exit_price"] == 79_000.0
     assert second_notifier.closed[0]["realized_pnl"] == 1.0
     assert second_engine.unmanaged_live_position is None
+
+
+def test_binance_managed_position_is_restored_after_safe_restart(tmp_path) -> None:
+    state_path = tmp_path / "live_reconciliation_state.json"
+    managed = {
+        "exchange": "binance",
+        "symbol": "BTCUSDT",
+        "environment": "production",
+        "position": {
+            "side": "short",
+            "quantity": 0.001,
+            "entry_price": 77_852.6,
+            "stop_price": 78_203.0,
+            "take_profit_price": 76_976.6,
+            "opened_at": 1_788_435_361_907,
+            "initial_stop_price": 78_203.0,
+            "best_price": 77_841.8,
+            "stop_reason": "stop_loss",
+            "worst_price": 77_976.0,
+            "entry_order_id": "10",
+            "entry_client_id": "btcbot-entry-test",
+            "stop_order_id": "20",
+            "stop_client_id": "btcbot-stop-test",
+            "take_profit_order_id": "",
+            "take_profit_client_id": "",
+        },
+        "signal": {
+            "side": "short",
+            "score": 6,
+            "timestamp": 1_788_435_300_000,
+            "reasons": ["1m_ultra_short_reversal_short"],
+        },
+        "position_equity_before": 25.5,
+        "last_position_candle_timestamp": 1_788_435_300_000,
+    }
+    state_path.write_text(
+        json.dumps({"unmanaged_position": None, "managed_position": managed}),
+        encoding="utf-8",
+    )
+
+    class Adapter:
+        name = "binance"
+        settings = SimpleNamespace(symbol="BTCUSDT", environment="production")
+
+        def prepare_live(self, *, max_leverage: float, managed_position: dict | None = None):
+            assert max_leverage == 3
+            assert managed_position == managed
+            return {"prepared": True, "resumed": True, "flat": False}
+
+        def close(self) -> None:
+            return None
+
+    engine = TradingEngine(
+        Adapter(),
+        MultiTimeframeStrategy(StrategyConfig()),
+        RiskManager(),
+        EngineConfig(mode="live", reconciliation_state_path=str(state_path)),
+    )
+
+    preflight = engine.prepare_live()
+
+    assert preflight["resumed"] is True
+    assert engine.position is not None
+    assert engine.position.side == "short"
+    assert engine.position.stop_client_id == "btcbot-stop-test"
+    assert engine.position.best_price == 77_841.8
+    assert engine.position_signal is not None
+    assert engine.position_signal.reasons == ("1m_ultra_short_reversal_short",)
+    engine.close()
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved["managed_position"]["position"]["stop_order_id"] == "20"
 
 
 def test_live_entry_rolls_back_when_stop_is_not_confirmed() -> None:
