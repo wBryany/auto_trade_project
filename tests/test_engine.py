@@ -1563,6 +1563,109 @@ def test_embedded_protection_status_errors_emit_emergency_notification() -> None
     assert notifier.emergencies[0]["incident"] == "protection_status:123456"
 
 
+def test_managed_stop_reconciliation_records_exchange_fill_price_and_time(tmp_path) -> None:
+    fill_timestamp = 1_788_525_008_035
+
+    class Adapter(_EmergencyAdapter):
+        @staticmethod
+        def fetch_protection_status(position: Position) -> dict:
+            return {"stop": {"status": "FILLED", "triggerPrice": "80863.6"}}
+
+        @staticmethod
+        def fetch_latest_close_fill(position: Position, *, after_ms: int) -> dict:
+            assert after_ms == position.opened_at
+            return {
+                "quantity": position.quantity,
+                "price": 80777.1,
+                "timestamp": fill_timestamp,
+            }
+
+    reporter = TradeReporter(tmp_path)
+    engine = TradingEngine(
+        Adapter(),
+        _FixedLongSignalStrategy(),
+        RiskManager(
+            RiskConfig(stop_loss_pct=0.005),
+            costs=CostConfig(
+                maker_fee_pct=0.0,
+                taker_fee_pct=0.0,
+                slippage_pct=0.0,
+                funding_rate_pct_per_8h=0.0,
+            ),
+        ),
+        EngineConfig(mode="live"),
+        reporter=reporter,
+    )
+    engine.position = Position(
+        "long",
+        0.001,
+        81229.2,
+        80863.6686,
+        82143.0285,
+        1_788_521_161_832,
+        initial_stop_price=80863.6686,
+        stop_order_id="1",
+        stop_client_id="stop",
+    )
+
+    try:
+        engine._finalize_binance_live_position_closed(
+            Candle(fill_timestamp, 81158.0, 81158.0, 81158.0, 81158.0, 0.0)
+        )
+        rows = reporter.query_trades(exchange="binance", scope="production")
+    finally:
+        reporter.close()
+
+    assert engine.position is None
+    assert len(rows) == 1
+    assert rows[0]["exit_reason"] == "stop_loss"
+    assert rows[0]["exit_price"] == pytest.approx(80777.1)
+    assert rows[0]["exit_time"] == "2026-09-04T12:30:08Z"
+    assert rows[0]["holding_minutes"] == pytest.approx(
+        (fill_timestamp - 1_788_521_161_832) / 60_000
+    )
+
+
+def test_managed_close_fill_lookup_error_alerts_and_uses_status_fallback() -> None:
+    fill_error = ApiError(
+        'HTTP 429: {"code":-1003,"msg":"too many requests"}',
+        status_code=429,
+        api_code=-1003,
+    )
+
+    class Adapter(_EmergencyAdapter):
+        @staticmethod
+        def fetch_protection_status(position: Position) -> dict:
+            return {"stop": {"status": "FILLED", "triggerPrice": "99.0"}}
+
+        @staticmethod
+        def fetch_latest_close_fill(position: Position, *, after_ms: int) -> dict:
+            raise fill_error
+
+    notifier = _EmergencyNotifier()
+    engine = _alert_test_engine(Adapter(), notifier)
+    engine.position = Position(
+        "long",
+        1.0,
+        100.0,
+        99.0,
+        103.0,
+        123_456,
+        initial_stop_price=99.0,
+        stop_order_id="1",
+        stop_client_id="stop",
+    )
+
+    engine._finalize_binance_live_position_closed(
+        Candle(123_999, 98.5, 99.1, 98.0, 98.5, 0.0)
+    )
+
+    assert engine.position is None
+    assert len(notifier.emergencies) == 1
+    assert notifier.emergencies[0]["error"] is fill_error
+    assert notifier.emergencies[0]["incident"] == "managed_close_fill:123456"
+
+
 def test_unmanaged_close_fill_lookup_error_emits_emergency_before_fallback() -> None:
     fill_error = ApiError(
         'HTTP 429: {"code":-1003,"msg":"too many requests"}',

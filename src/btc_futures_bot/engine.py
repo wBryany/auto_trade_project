@@ -879,11 +879,45 @@ class TradingEngine:
                         exit_price = selected_price
                         break
                 break
+        exit_time_ms: int | None = None
+        fetch_close_fill = getattr(self.adapter, "fetch_latest_close_fill", None)
+        if callable(fetch_close_fill):
+            incident = f"managed_close_fill:{position.opened_at}"
+            try:
+                fill = fetch_close_fill(position, after_ms=position.opened_at)
+                if not isinstance(fill, dict):
+                    raise RuntimeError("Binance returned no matching close fill")
+                fill_quantity = float(fill.get("quantity") or 0)
+                fill_price = float(fill.get("price") or 0)
+                fill_timestamp = int(fill.get("timestamp") or 0)
+                if fill_quantity + 1e-12 < position.quantity * 0.999:
+                    raise RuntimeError("Binance close-fill quantity is incomplete")
+                if fill_price <= 0 or fill_timestamp <= 0:
+                    raise RuntimeError("Binance close-fill price or timestamp is invalid")
+                exit_price = fill_price
+                exit_time_ms = fill_timestamp
+                self.resolve_emergency("order_failure", incident)
+            except Exception as fill_error:
+                self.notify_emergency(
+                    fill_error,
+                    category="order_failure",
+                    context="交易所已空仓，但真实平仓成交查询失败，将使用保护单状态或最新已收 K 线兜底记录",
+                    incident=incident,
+                    details={
+                        "方向": position.side,
+                        "数量": position.quantity,
+                        "退出原因": exit_reason,
+                    },
+                )
         self._cancel_protection_orders_with_alert(
             position,
             context="交易所已空仓，但取消残留保护单失败",
         )
-        self._close_paper_position(exit_price, exit_reason)
+        self._close_paper_position(
+            exit_price,
+            exit_reason,
+            exit_time_ms=exit_time_ms,
+        )
 
     def _cancel_protection_orders_with_alert(
         self,
@@ -2043,11 +2077,21 @@ class TradingEngine:
             return position.stop_reason
         return "trailing_stop"
 
-    def _close_paper_position(self, exit_price: float, exit_reason: str) -> None:
+    def _close_paper_position(
+        self,
+        exit_price: float,
+        exit_reason: str,
+        *,
+        exit_time_ms: int | None = None,
+    ) -> None:
         if self.position is None:
             return
         position = self.position
-        exit_time_ms = int(time.time() * 1000)
+        exit_time_ms = (
+            int(time.time() * 1000)
+            if exit_time_ms is None
+            else int(exit_time_ms)
+        )
         holding_hours = max(0.0, (exit_time_ms - position.opened_at) / 3_600_000)
         pnl = self.risk.estimate_net_pnl(
             position.side,
