@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from btc_futures_bot.engine import EngineConfig, TradingEngine
 from btc_futures_bot.costs import CostConfig
+from btc_futures_bot.http_client import ApiError
 from btc_futures_bot.models import Candle, Position, Signal
 from btc_futures_bot.reporting import TradeRecord, TradeReporter
 from btc_futures_bot.risk import RiskConfig, RiskManager
@@ -1214,3 +1215,316 @@ def test_transient_private_failure_retries_same_signal_with_fresh_price() -> Non
     assert len(notifier.private_messages) == 1
     assert notifier.capacity_messages == []
     assert engine._private_entry_retry_signal_timestamp == 0
+
+
+class _EmergencyNotifier:
+    def __init__(self) -> None:
+        self.emergencies: list[dict[str, object]] = []
+        self.resolved: list[tuple[str, str]] = []
+
+    def notify_emergency(self, error: Exception, **payload: object) -> bool:
+        self.emergencies.append({"error": error, **payload})
+        return True
+
+    def resolve_emergency(
+        self,
+        category: str,
+        exchange: str,
+        incident: str = "",
+    ) -> None:
+        self.resolved.append((category, incident))
+
+    @staticmethod
+    def notify_open(*args: object, **kwargs: object) -> None:
+        return None
+
+    @staticmethod
+    def notify_close(*args: object, **kwargs: object) -> None:
+        return None
+
+
+class _FixedLongSignalStrategy:
+    config = StrategyConfig(trigger_timeframe="5m", regime_timeframe="1h")
+
+    @staticmethod
+    def evaluate(candles_by_timeframe: object) -> Signal:
+        return Signal("long", 6, 1, ("fixed",))
+
+
+class _EmergencyAdapter:
+    name = "binance"
+    settings = SimpleNamespace(symbol="BTCUSDT", environment="production")
+
+    def __init__(
+        self,
+        *,
+        entry_error: Exception | None = None,
+        protection_error: Exception | None = None,
+        close_error: Exception | None = None,
+        equity_error: Exception | None = None,
+        live_position: dict[str, object] | None = None,
+    ) -> None:
+        self.entry_error = entry_error
+        self.protection_error = protection_error
+        self.close_error = close_error
+        self.equity_error = equity_error
+        self.live_position = live_position
+
+    @staticmethod
+    def fetch_candles(interval: str, limit: int) -> list[Candle]:
+        return [
+            Candle(1, 100.0, 100.1, 99.9, 100.0, 10.0),
+            Candle(2, 100.0, 100.1, 99.9, 100.0, 1.0),
+        ]
+
+    def fetch_live_position(self) -> dict[str, object] | None:
+        return self.live_position
+
+    def fetch_equity(self) -> float:
+        if self.equity_error is not None:
+            raise self.equity_error
+        return 10_000.0
+
+    @staticmethod
+    def normalize_order_quantity(quantity: float, reference_price: float) -> float:
+        return quantity
+
+    def place_market_order(self, request: object) -> dict:
+        error = self.close_error if getattr(request, "reduce_only", False) else self.entry_error
+        if error is not None:
+            raise error
+        return {"orderId": 11, "status": "FILLED", "executedQty": "1", "avgPrice": "100"}
+
+    @staticmethod
+    def market_fill(payload: dict, *, fallback_price: float) -> tuple[float, float]:
+        return float(payload["executedQty"]), float(payload["avgPrice"])
+
+    def place_protection_orders(self, position: Position, **kwargs: object) -> dict:
+        if self.protection_error is not None:
+            raise self.protection_error
+        return {"stop": {"algoId": 21}, "take_profit": None, "confirmed": True}
+
+    @staticmethod
+    def emergency_close(position: Position, *, client_id: str) -> dict:
+        return {"status": "FILLED", "executedQty": "1", "avgPrice": "99.9"}
+
+    @staticmethod
+    def cancel_protection_orders(position: Position) -> dict:
+        return {"cancelled": True, "errors": []}
+
+
+def _alert_test_engine(adapter: object, notifier: _EmergencyNotifier) -> TradingEngine:
+    return TradingEngine(
+        adapter,
+        _FixedLongSignalStrategy(),
+        RiskManager(RiskConfig(stop_loss_pct=0.005)),
+        EngineConfig(mode="live"),
+        notifier=notifier,
+    )
+
+
+def test_live_entry_order_error_emits_emergency_notification() -> None:
+    entry_error = RuntimeError("entry market order rejected")
+    notifier = _EmergencyNotifier()
+    engine = _alert_test_engine(_EmergencyAdapter(entry_error=entry_error), notifier)
+
+    try:
+        engine.evaluate_once()
+    except RuntimeError as raised:
+        assert raised is entry_error
+    else:
+        raise AssertionError("entry order error must remain visible to the engine loop")
+
+    assert len(notifier.emergencies) == 1
+    assert notifier.emergencies[0]["error"] is entry_error
+    assert notifier.emergencies[0]["category"] == "order_failure"
+    assert notifier.emergencies[0]["incident"] == "entry_submit"
+
+
+def test_deduplicated_capacity_emergency_does_not_fall_back_to_normal_email() -> None:
+    class Notifier(_EmergencyNotifier):
+        def __init__(self) -> None:
+            super().__init__()
+            self.capacity_messages: list[dict[str, object]] = []
+
+        def notify_emergency(self, error: Exception, **payload: object) -> bool:
+            self.emergencies.append({"error": error, **payload})
+            return False
+
+        def notify_order_unavailable(self, **payload: object) -> None:
+            self.capacity_messages.append(payload)
+
+    error = RuntimeError('{"code":-4164,"msg":"minimum notional"}')
+    notifier = Notifier()
+    result = _alert_test_engine(
+        _EmergencyAdapter(entry_error=error),
+        notifier,
+    ).evaluate_once()
+
+    assert result.status == "minimum_order_unavailable"
+    assert len(notifier.emergencies) == 1
+    assert notifier.capacity_messages == []
+
+
+def test_live_protection_error_emits_emergency_even_after_successful_rollback() -> None:
+    protection_error = RuntimeError("stop order was not confirmed open")
+    notifier = _EmergencyNotifier()
+    result = _alert_test_engine(
+        _EmergencyAdapter(protection_error=protection_error),
+        notifier,
+    ).evaluate_once()
+
+    assert result.status == "live_entry_rolled_back"
+    assert result.position is None
+    assert len(notifier.emergencies) == 1
+    assert notifier.emergencies[0]["error"] is protection_error
+    assert notifier.emergencies[0]["category"] == "order_failure"
+    assert notifier.emergencies[0]["incident"] == "protection_submit"
+    assert ("order_failure", "entry_submit") in notifier.resolved
+    assert ("ip_restricted", "") in notifier.resolved
+
+
+def test_embedded_protection_cancel_errors_emit_emergency_notification() -> None:
+    class Adapter(_EmergencyAdapter):
+        @staticmethod
+        def cancel_protection_orders(position: Position) -> dict:
+            return {
+                "cancelled": [],
+                "errors": ['HTTP 429: {"code":-1003,"msg":"too many requests"}'],
+            }
+
+    notifier = _EmergencyNotifier()
+    engine = _alert_test_engine(Adapter(), notifier)
+    position = Position("long", 1.0, 100.0, 99.0, 103.0, 123_456)
+
+    result = engine._cancel_protection_orders_with_alert(
+        position,
+        context="test cancellation",
+    )
+
+    assert result["errors"]
+    assert len(notifier.emergencies) == 1
+    assert notifier.emergencies[0]["category"] == "order_failure"
+    assert notifier.emergencies[0]["incident"] == "protection_cancel:123456"
+
+
+def test_embedded_protection_status_errors_emit_emergency_notification() -> None:
+    class Adapter(_EmergencyAdapter):
+        @staticmethod
+        def fetch_protection_status(position: Position) -> dict:
+            return {"stop": {"error": "HTTP 418: IP banned"}}
+
+    notifier = _EmergencyNotifier()
+    engine = _alert_test_engine(Adapter(), notifier)
+    engine.position = Position(
+        "long",
+        1.0,
+        100.0,
+        99.0,
+        103.0,
+        123_456,
+        stop_order_id="1",
+        stop_client_id="stop",
+    )
+
+    engine._finalize_binance_live_position_closed(
+        Candle(123_999, 99.0, 99.0, 99.0, 99.0, 0.0)
+    )
+
+    assert engine.position is None
+    assert len(notifier.emergencies) == 1
+    assert notifier.emergencies[0]["category"] == "order_failure"
+    assert notifier.emergencies[0]["incident"] == "protection_status:123456"
+
+
+def test_unmanaged_close_fill_lookup_error_emits_emergency_before_fallback() -> None:
+    fill_error = ApiError(
+        'HTTP 429: {"code":-1003,"msg":"too many requests"}',
+        status_code=429,
+        api_code=-1003,
+    )
+
+    class Adapter(_EmergencyAdapter):
+        @staticmethod
+        def fetch_latest_close_fill(position: Position, *, after_ms: int) -> dict:
+            raise fill_error
+
+    class Notifier(_EmergencyNotifier):
+        @staticmethod
+        def notify_reconciled_close(**payload: object) -> bool:
+            return True
+
+    notifier = Notifier()
+    engine = _alert_test_engine(Adapter(), notifier)
+    engine.unmanaged_live_position = {
+        "side": "short",
+        "quantity": 1.0,
+        "entry_price": 100.0,
+        "observed_at_ms": 123_456,
+    }
+
+    engine._resolve_unmanaged_live_position(
+        Candle(123_999, 99.0, 99.0, 99.0, 99.0, 0.0)
+    )
+
+    assert engine.unmanaged_live_position is None
+    assert len(notifier.emergencies) == 1
+    assert notifier.emergencies[0]["error"] is fill_error
+    assert notifier.emergencies[0]["incident"] == "reconcile_close_fill:123456"
+
+
+def test_live_close_order_error_emits_emergency_notification() -> None:
+    close_error = RuntimeError("reduce-only close order rejected")
+    notifier = _EmergencyNotifier()
+    engine = _alert_test_engine(
+        _EmergencyAdapter(
+            close_error=close_error,
+            live_position={"side": "long", "quantity": 1.0, "mark_price": 99.0},
+        ),
+        notifier,
+    )
+    engine.position = Position(
+        "long",
+        1.0,
+        100.0,
+        99.0,
+        103.0,
+        int(time.time() * 1000) - 60_000,
+        stop_order_id="1",
+        stop_client_id="stop",
+    )
+
+    try:
+        engine._close_live_position(99.0, "stop_loss")
+    except RuntimeError as raised:
+        assert raised is close_error
+    else:
+        raise AssertionError("failed close order must remain visible to the engine loop")
+
+    assert len(notifier.emergencies) == 1
+    assert notifier.emergencies[0]["error"] is close_error
+    assert notifier.emergencies[0]["category"] == "order_failure"
+    assert notifier.emergencies[0]["incident"] == "close_submit"
+
+
+def test_rate_limited_private_api_trade_result_forwards_raw_error_to_notifier() -> None:
+    rate_limit_error = ApiError(
+        'HTTP 429 GET https://fapi.binance.com/fapi/v2/account: {"code":-1003}',
+        status_code=429,
+        retry_at=time.time() + 60,
+    )
+
+    notifier = _EmergencyNotifier()
+    result = _alert_test_engine(
+        _EmergencyAdapter(equity_error=rate_limit_error),
+        notifier,
+    ).evaluate_once()
+
+    assert result.status == "private_api_unavailable"
+    assert result.position is None
+    assert len(notifier.emergencies) == 1
+    assert notifier.emergencies[0]["error"] is rate_limit_error
+    assert notifier.emergencies[0]["category"] == "order_failure"
+    assert notifier.emergencies[0]["incident"] == "entry_private_api"
+    assert rate_limit_error.rate_limited is True
+    assert ("ip_restricted", "") not in notifier.resolved

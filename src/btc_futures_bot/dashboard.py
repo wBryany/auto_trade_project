@@ -13,7 +13,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .engine import normalized_poll_seconds
-from .http_client import ApiError
+from .http_client import ApiError, clear_rate_limits, is_rate_limit_error
 from .main import (
     build_engine,
     credential_values,
@@ -194,6 +194,7 @@ class DashboardService:
         self._dashboard_adapter: Any = None
         self._dashboard_adapter_key: tuple[str, str, str, str] | None = None
         self.operation_logger = OperationLogger(Path(self.config_path).parent / "logs" / "operation_log.jsonl")
+        self.notifier = self._build_notifier(initial_config)
         self._first_cycle_logged = False
         self._last_logged_error = ""
         self._last_macro_block = ""
@@ -206,6 +207,24 @@ class DashboardService:
     def _config(self) -> dict[str, Any]:
         return load_config(self.config_path)
 
+    def _build_notifier(self, config: dict[str, Any]) -> EmailNotifier:
+        exchange_name = self._exchange(config)
+        try:
+            email_config = EmailNotificationConfig.from_mapping(
+                config.get("email_notifications", {}),
+                default_timezone=str(config.get("report_timezone", "Asia/Shanghai")),
+                default_state_path=str(
+                    report_directory(config, exchange_name) / "email_notification_state.json"
+                ),
+            )
+            return EmailNotifier(email_config)
+        except Exception as error:
+            LOG.exception("email notifications disabled because configuration is invalid")
+            return EmailNotifier(
+                EmailNotificationConfig(enabled=False),
+                initial_error=f"邮件配置无效，通知已隔离禁用：{error}",
+            )
+
     def _exchange(self, config: dict[str, Any], requested: str = "") -> str:
         if requested and requested in config.get("exchanges", {}):
             return requested
@@ -216,6 +235,87 @@ class DashboardService:
             return self.exchange_name
         enabled = [name for name, value in config.get("exchanges", {}).items() if value.get("enabled")]
         return enabled[0] if enabled else "binance"
+
+    def _notify_emergency(
+        self,
+        error: BaseException | str,
+        *,
+        category: str,
+        context: str,
+        incident: str,
+        config: dict[str, Any],
+        exchange_name: str,
+        details: dict[str, Any] | None = None,
+    ) -> bool:
+        notifier = getattr(self, "notifier", None)
+        if notifier is None:
+            return False
+        notify = getattr(notifier, "notify_emergency", None)
+        if not callable(notify):
+            return False
+        exchange = config.get("exchanges", {}).get(exchange_name, {})
+        try:
+            return bool(
+                notify(
+                    error,
+                    category=category,
+                    exchange=exchange_name,
+                    symbol=str(exchange.get("symbol") or ""),
+                    mode=str(config.get("mode") or "paper"),
+                    environment=str(exchange.get("environment") or ""),
+                    context=context,
+                    incident=incident,
+                    details=details,
+                )
+            )
+        except Exception:
+            LOG.exception("dashboard emergency email notification enqueue failed")
+            return False
+
+    def _handle_snapshot_alerts(
+        self,
+        snapshot: dict[str, Any],
+        config: dict[str, Any],
+        exchange_name: str,
+    ) -> None:
+        notifier = getattr(self, "notifier", None)
+        if notifier is None:
+            return
+        order_limits = snapshot.get("order_limits") or {}
+        private_stream = snapshot.get("private_stream") or {}
+        candidates = (
+            order_limits.get("error") if isinstance(order_limits, dict) else "",
+            snapshot.get("private_error"),
+            snapshot.get("snapshot_error"),
+            private_stream.get("last_error") if isinstance(private_stream, dict) else "",
+        )
+        rate_limit_error = next(
+            (item for item in candidates if item and is_rate_limit_error(item)),
+            None,
+        )
+        if rate_limit_error is not None:
+            self._notify_emergency(
+                str(rate_limit_error),
+                category="ip_restricted",
+                context="页面交易所状态检测",
+                incident="snapshot",
+                config=config,
+                exchange_name=exchange_name,
+            )
+            return
+        if (
+            snapshot.get("private_available")
+            and str(snapshot.get("private_source") or "").lower() == "rest"
+            and not (
+            isinstance(order_limits, dict) and order_limits.get("error")
+            )
+        ):
+            resolve = getattr(notifier, "resolve_emergency", None)
+            if callable(resolve):
+                try:
+                    resolve("ip_restricted", exchange_name, "snapshot")
+                except Exception:
+                    LOG.exception("dashboard IP alert recovery reset failed")
 
     def config_view(self) -> dict[str, Any]:
         config = self._config()
@@ -284,18 +384,25 @@ class DashboardService:
         }
 
     def save_config(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if self.running:
-            raise RuntimeError("请先停止交易引擎，再修改配置")
-        before = self.config_view()
-        self.exchange_name = str(payload.get("exchange", "binance"))
-        target = save_dashboard_config(self.config_path, payload)
         with self._lock:
+            if self.running:
+                raise RuntimeError("请先停止交易引擎，再修改配置")
+            before = self.config_view()
+            self.exchange_name = str(payload.get("exchange", "binance"))
+            target = save_dashboard_config(self.config_path, payload)
+            previous_notifier = self.notifier
+            if not previous_notifier.close():
+                LOG.warning(
+                    "previous email notifier is still draining after its SMTP timeout"
+                )
+            replacement_notifier = self._build_notifier(self._config())
+            self.notifier = replacement_notifier
             self._exchange_snapshot = {}
             self._snapshot_at = 0
             self._private_snapshot_at = 0
             self._dashboard_adapter = None
             self._dashboard_adapter_key = None
-        after = self.config_view()
+            after = self.config_view()
         tracked = ("exchange", "mode", "symbol", "environment", "base_url", "poll_seconds", "paper_equity", "max_leverage", "stop_loss_pct", "risk_per_trade", "max_notional_pct", "min_score", "take_profit_r", "volume_sma_period", "min_volume_ratio", "require_full_alignment", "email_notifications")
         changed = {
             key: {"before": before.get(key), "after": after.get(key)}
@@ -337,13 +444,26 @@ class DashboardService:
                 config.get("report_timezone", "Asia/Shanghai"),
             )
             try:
-                self.engine = build_engine(exchange_name, config, reporter=self.reporter)
+                self.engine = build_engine(
+                    exchange_name,
+                    config,
+                    reporter=self.reporter,
+                    notifier=self.notifier,
+                )
                 preflight = (
                     self.engine.prepare_live()
                     if mode == "live"
                     else {"prepared": False, "mode": mode}
                 )
-            except Exception:
+            except Exception as error:
+                self._notify_emergency(
+                    error,
+                    category="engine_runtime",
+                    context="实盘启动预检失败",
+                    incident="start",
+                    config=config,
+                    exchange_name=exchange_name,
+                )
                 if self.engine is not None:
                     self.engine.close()
                 self.reporter.close()
@@ -399,11 +519,33 @@ class DashboardService:
         self.operation_logger.record("engine_stop", "stop", summary="交易引擎已停止", result={"running": False})
         return {"running": False}
 
+    def shutdown(self) -> None:
+        """Release the dashboard-owned adapter and email worker on process exit."""
+
+        try:
+            self.stop()
+        finally:
+            adapter = self._dashboard_adapter
+            if adapter is not None:
+                close_adapter = getattr(adapter, "close", None)
+                if callable(close_adapter):
+                    try:
+                        close_adapter()
+                    except Exception:
+                        LOG.exception("dashboard adapter shutdown failed")
+            self._dashboard_adapter = None
+            self._dashboard_adapter_key = None
+            self.notifier.close()
+
     def restart(self, payload: dict[str, Any]) -> dict[str, Any]:
         reason = str(payload.get("reason", "页面手动重启"))
         self.operation_logger.record("engine_restart", "restart", status="started", summary="开始重启交易引擎", details={"reason": reason})
         try:
             self.stop()
+            # A user may have just switched the router's outbound proxy/IP.
+            # Explicit restart is the safe boundary for discarding the old
+            # process-local Binance retry deadline and probing the new route.
+            clear_rate_limits()
             result = self.start(payload)
             self.operation_logger.record("engine_restart", "restart", summary="交易引擎重启成功", details={"reason": reason}, result=result)
             return result
@@ -417,10 +559,12 @@ class DashboardService:
             rate_limit_wait = 0.0
             try:
                 result = self.engine.evaluate_once()
+                self.engine.resolve_emergency("engine_runtime", "cycle")
                 with self._lock:
                     self.last_result = result
                     self.last_cycle_at = time.time()
                     self.last_error = ""
+                    self._last_logged_error = ""
                 macro_status = self.engine.macro_risk.status() if self.engine and self.engine.macro_risk else {}
                 macro_block = str(macro_status.get("reason") or "") if macro_status.get("blocked") else ""
                 if macro_block != self._last_macro_block:
@@ -456,6 +600,16 @@ class DashboardService:
                     LOG.warning("dashboard engine cycle API failure: %s", error)
                 else:
                     LOG.exception("dashboard engine cycle failed")
+                notify_emergency = getattr(self.engine, "notify_emergency", None)
+                if callable(notify_emergency) and not bool(
+                    getattr(error, "_btc_emergency_notified", False)
+                ):
+                    notify_emergency(
+                        error,
+                        category="engine_runtime",
+                        context="行情周期执行失败",
+                        incident="cycle",
+                    )
                 if isinstance(error, ApiError) and error.rate_limited:
                     rate_limit_wait = error.retry_after_seconds
                 with self._lock:
@@ -515,6 +669,7 @@ class DashboardService:
                 if callable(fetch_snapshot)
                 else adapter.fetch_dashboard_snapshot()
             )
+            self._handle_snapshot_alerts(snapshot, config, exchange_name)
             with self._snapshot_condition:
                 now = time.time()
                 private_now = time.monotonic()
@@ -552,6 +707,11 @@ class DashboardService:
                 self._snapshot_at = now
             return snapshot
         except Exception as error:
+            self._handle_snapshot_alerts(
+                {"snapshot_error": str(error)},
+                config,
+                exchange_name,
+            )
             with self._snapshot_condition:
                 if not self._exchange_snapshot:
                     raise
@@ -626,7 +786,13 @@ class DashboardService:
             live_market = fetch_live_market()
             if not live_market:
                 return snapshot
-        except Exception:
+        except Exception as error:
+            if is_rate_limit_error(error):
+                self._handle_snapshot_alerts(
+                    {"snapshot_error": str(error)},
+                    config,
+                    exchange_name,
+                )
             LOG.debug("live dashboard market refresh failed; using cached price", exc_info=True)
             return snapshot
         refreshed = dict(snapshot)
@@ -652,43 +818,31 @@ class DashboardService:
         }
 
     def email_test(self) -> dict[str, Any]:
-        config = self._config()
-        notifier = self.engine.notifier if self.engine and self.engine.notifier else None
-        temporary = False
-        if notifier is None:
-            email_config = EmailNotificationConfig.from_mapping(
-                config.get("email_notifications", {}),
-                default_timezone=str(config.get("report_timezone", "Asia/Shanghai")),
-                default_state_path=str(
-                    report_directory(config, self._exchange(config)) / "email_notification_state.json"
-                ),
+        notifier = self.notifier
+        if not notifier.config.enabled:
+            raise RuntimeError("请先启用邮件通知并保存配置")
+        if not notifier.ready:
+            raise RuntimeError(
+                f"邮件配置不完整；请检查 SMTP、发件/收件邮箱，并设置环境变量 {notifier.config.password_env}"
             )
-            notifier = EmailNotifier(email_config)
-            temporary = True
-        try:
-            if not notifier.config.enabled:
-                raise RuntimeError("请先启用邮件通知并保存配置")
-            if not notifier.ready:
-                raise RuntimeError(
-                    f"邮件配置不完整；请检查 SMTP、发件/收件邮箱，并设置环境变量 {notifier.config.password_env}"
-                )
-            if not notifier.send_test():
-                raise RuntimeError("测试邮件未进入发送队列")
-            notifier.flush(notifier.config.timeout_seconds + 2)
-            status = notifier.status()
-            if status.get("last_error"):
-                raise RuntimeError(str(status["last_error"]))
-            self.operation_logger.record(
-                "email_notification",
-                "test",
-                summary="测试邮件发送成功",
-                details={"recipients_count": len(notifier.config.recipients)},
-                result={"sent": True},
-            )
-            return {"sent": True, "recipients_count": len(notifier.config.recipients)}
-        finally:
-            if temporary:
-                notifier.close()
+        sent_before = int(notifier.status().get("sent_count") or 0)
+        if not notifier.send_test():
+            raise RuntimeError("测试邮件未进入发送队列")
+        if not notifier.flush(notifier.config.timeout_seconds + 2):
+            raise RuntimeError("测试邮件发送超时，请检查 SMTP 网络和服务日志")
+        status = notifier.status()
+        if status.get("last_error"):
+            raise RuntimeError(str(status["last_error"]))
+        if int(status.get("sent_count") or 0) <= sent_before:
+            raise RuntimeError("测试邮件没有确认发送成功，请检查 SMTP 服务日志")
+        self.operation_logger.record(
+            "email_notification",
+            "test",
+            summary="测试邮件发送成功",
+            details={"recipients_count": len(notifier.config.recipients)},
+            result={"sent": True},
+        )
+        return {"sent": True, "recipients_count": len(notifier.config.recipients)}
 
     def status(self) -> dict[str, Any]:
         config = self._config()
@@ -764,9 +918,10 @@ class DashboardService:
             last_error = self.last_error
             last_cycle_at = self.last_cycle_at
             started_at = self.started_at
+        notifier = getattr(self, "notifier", None)
         email_status = (
-            self.engine.notifier.status()
-            if self.engine and self.engine.notifier
+            notifier.status()
+            if notifier is not None
             else {
                 "enabled": bool(config.get("email_notifications", {}).get("enabled", False)),
                 "ready": False,
@@ -994,7 +1149,7 @@ def run_dashboard(config_path: str, *, host: str = "127.0.0.1", port: int = 8787
     except KeyboardInterrupt:
         print("\nDashboard stopped")
     finally:
-        service.stop()
+        service.shutdown()
         server.server_close()
 
 

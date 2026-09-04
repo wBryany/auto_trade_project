@@ -1269,6 +1269,7 @@ class BinanceAdapter(ExchangeAdapter):
                     safe_message,
                     status_code=error.status_code,
                     retry_at=error.retry_at,
+                    api_code=error.api_code,
                 ) from None
         raise ApiError("Binance signed request failed after server-time synchronization")
 

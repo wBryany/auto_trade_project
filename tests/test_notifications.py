@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from btc_futures_bot.costs import CostConfig
 from btc_futures_bot.engine import EngineConfig, TradingEngine
+from btc_futures_bot.http_client import ApiError
 from btc_futures_bot import main as main_module
 from btc_futures_bot.models import Candle, Position, Signal
 from btc_futures_bot.notifications import EmailNotificationConfig, EmailNotifier
@@ -201,6 +202,214 @@ def test_private_api_unavailable_email_is_not_labeled_as_insufficient_funds(
     assert "下单金额不足" not in content
     assert "接下来约 32 秒内保留" in content
     assert "重新校验信号、当前价格和账户状态" in content
+
+
+def test_emergency_messages_cover_engine_order_and_ip_failures(tmp_path: Path) -> None:
+    messages = []
+    notifier = EmailNotifier(_email_config(tmp_path), send_fn=messages.append)
+
+    notifier.notify_emergency(
+        RuntimeError("strategy evaluation exploded"),
+        category="engine_runtime",
+        exchange="binance",
+        symbol="BTCUSDT",
+        mode="live",
+        environment="production",
+        context="engine evaluate_once",
+        incident="engine-cycle",
+    )
+    notifier.notify_emergency(
+        RuntimeError("entry market order rejected"),
+        category="order_failure",
+        exchange="binance",
+        symbol="BTCUSDT",
+        mode="live",
+        environment="production",
+        context="entry place_market_order",
+        incident="entry-order",
+    )
+    notifier.notify_emergency(
+        RuntimeError('HTTP 418: {"code":-1003,"msg":"IP banned"}'),
+        category="ip_restricted",
+        exchange="binance",
+        symbol="BTCUSDT",
+        mode="live",
+        environment="production",
+        context="fetch candles",
+        incident="binance-ip-limit",
+    )
+    assert notifier.flush()
+    notifier.close()
+
+    assert len(messages) == 3
+    combined = [f"{message['Subject']}\n{message.get_content()}" for message in messages]
+    assert all("紧急" in message["Subject"] for message in messages)
+    assert "引擎" in combined[0]
+    assert "strategy evaluation exploded" in combined[0]
+    assert "engine evaluate_once" in combined[0]
+    assert "下单" in combined[1]
+    assert "entry market order rejected" in combined[1]
+    assert "entry place_market_order" in combined[1]
+    assert "IP" in combined[2]
+    assert "HTTP 418" in combined[2]
+    assert "fetch candles" in combined[2]
+    assert "切换节点" in combined[2]
+    assert "重启" in combined[2]
+    assert all("binance" in content for content in combined)
+    assert all("BTCUSDT" in content for content in combined)
+    assert all("live" in content for content in combined)
+    assert all("production" in content for content in combined)
+
+
+def test_non_binance_rate_limit_alert_uses_the_actual_exchange_name(tmp_path: Path) -> None:
+    messages = []
+    notifier = EmailNotifier(_email_config(tmp_path), send_fn=messages.append)
+
+    assert notifier.notify_emergency(
+        RuntimeError("HTTP 429: too many requests"),
+        category="engine_runtime",
+        exchange="okx",
+        symbol="BTC-USDT-SWAP",
+        mode="paper",
+        environment="demo",
+        context="fetch candles",
+    )
+    assert notifier.flush()
+    notifier.close()
+
+    assert len(messages) == 1
+    assert "OKX" in messages[0]["Subject"].upper()
+    assert "Binance" not in messages[0]["Subject"]
+
+
+def test_emergency_message_is_deduplicated_until_incident_is_resolved(tmp_path: Path) -> None:
+    messages = []
+    notifier = EmailNotifier(_email_config(tmp_path), send_fn=messages.append)
+    context = {
+        "category": "engine_runtime",
+        "exchange": "binance",
+        "symbol": "BTCUSDT",
+        "mode": "live",
+        "environment": "production",
+        "context": "engine evaluate_once",
+        "incident": "engine-cycle",
+    }
+
+    assert notifier.notify_emergency(RuntimeError("first cycle failure"), **context)
+    assert not notifier.notify_emergency(RuntimeError("same incident, changed detail"), **context)
+    assert notifier.flush()
+    assert len(messages) == 1
+
+    notifier.resolve_emergency(
+        "engine_runtime",
+        "binance",
+        incident="engine-cycle",
+    )
+    assert notifier.notify_emergency(RuntimeError("failure after recovery"), **context)
+    assert notifier.flush()
+    notifier.close()
+
+    assert len(messages) == 2
+    assert "first cycle failure" in messages[0].get_content()
+    assert "failure after recovery" in messages[1].get_content()
+
+
+def test_emergency_recovery_during_delivery_does_not_restore_old_cooldown(
+    tmp_path: Path,
+) -> None:
+    delivery_started = threading.Event()
+    release_delivery = threading.Event()
+    messages = []
+
+    def blocking_send(message: object) -> None:
+        delivery_started.set()
+        assert release_delivery.wait(timeout=2)
+        messages.append(message)
+
+    notifier = EmailNotifier(_email_config(tmp_path), send_fn=blocking_send)
+    context = {
+        "category": "engine_runtime",
+        "exchange": "binance",
+        "symbol": "BTCUSDT",
+        "mode": "live",
+        "environment": "production",
+        "context": "engine evaluate_once",
+        "incident": "engine-cycle",
+    }
+
+    assert notifier.notify_emergency(RuntimeError("first failure"), **context)
+    assert delivery_started.wait(timeout=2)
+    notifier.resolve_emergency("engine_runtime", "binance", incident="engine-cycle")
+    assert notifier.notify_emergency(
+        RuntimeError("new failure while recovered delivery is finishing"),
+        **context,
+    )
+    release_delivery.set()
+    assert notifier.flush()
+    notifier.close()
+    assert len(messages) == 2
+
+
+def test_closed_notifier_rejects_new_emails(tmp_path: Path) -> None:
+    messages = []
+    notifier = EmailNotifier(_email_config(tmp_path), send_fn=messages.append)
+    assert notifier.close()
+
+    assert not notifier.send_test()
+    assert messages == []
+
+
+def test_emergency_delivery_survives_state_persistence_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    messages = []
+    notifier = EmailNotifier(_email_config(tmp_path), send_fn=messages.append)
+
+    def fail_state_write() -> None:
+        raise OSError("state directory is read only")
+
+    monkeypatch.setattr(notifier, "_save_state", fail_state_write)
+    assert notifier.notify_emergency(
+        RuntimeError("engine failed"),
+        category="engine_runtime",
+        exchange="binance",
+        symbol="BTCUSDT",
+        mode="live",
+        environment="production",
+        context="engine cycle",
+    )
+    assert notifier.flush()
+    notifier.close()
+
+    assert len(messages) == 1
+    assert "engine failed" in messages[0].get_content()
+
+
+def test_emergency_message_handles_unrepresentable_retry_timestamp(tmp_path: Path) -> None:
+    messages = []
+    notifier = EmailNotifier(_email_config(tmp_path), send_fn=messages.append)
+    error = ApiError(
+        "HTTP 429",
+        status_code=429,
+        retry_at=float("inf"),
+        api_code=-1003,
+    )
+
+    assert notifier.notify_emergency(
+        error,
+        category="engine_runtime",
+        exchange="binance",
+        symbol="BTCUSDT",
+        mode="live",
+        environment="production",
+        context="engine cycle",
+    )
+    assert notifier.flush()
+    notifier.close()
+
+    assert len(messages) == 1
+    assert "无法在本机解析" in messages[0].get_content()
 
 
 def test_reconciled_live_position_messages_include_exchange_pnl(tmp_path: Path) -> None:

@@ -60,6 +60,7 @@ class TradingEngine:
         reporter: TradeReporter | None = None,
         macro_risk: MacroRiskController | None = None,
         notifier: EmailNotifier | None = None,
+        close_notifier: bool = True,
     ) -> None:
         self.adapter = adapter
         self.strategy = strategy
@@ -78,6 +79,7 @@ class TradingEngine:
         self.macro_risk = macro_risk
         self.pending_macro_signal: Signal | None = None
         self.notifier = notifier
+        self._close_notifier = bool(close_notifier)
         self.live_preflight: dict[str, Any] = {}
         self.unmanaged_live_position = self._load_unmanaged_live_position()
         self._managed_live_position_state = self._load_managed_live_position()
@@ -99,6 +101,8 @@ class TradingEngine:
             max_leverage=self.risk.max_leverage,
             managed_position=self._managed_live_position_state,
         )
+        self.resolve_emergency("ip_restricted")
+        self.resolve_emergency("engine_runtime", "start")
         if self.live_preflight.get("resumed"):
             self._restore_managed_live_position()
             self._save_live_reconciliation_state()
@@ -357,6 +361,7 @@ class TradingEngine:
         if self.config.mode == "live":
             try:
                 equity = self.adapter.fetch_equity()
+                self.resolve_emergency("order_failure", "entry_private_api")
             except Exception as private_error:
                 retryable = self._is_retryable_private_error(private_error)
                 private_raw: dict[str, Any] = {
@@ -371,6 +376,7 @@ class TradingEngine:
                         current_price,
                         private_raw,
                         started_at=entry_attempt_started_at,
+                        error=private_error,
                     )
                     return TradeResult(
                         self.adapter.name,
@@ -389,6 +395,7 @@ class TradingEngine:
                     str(private_raw["private_error"]),
                     retryable=False,
                     retry_seconds=0.0,
+                    error=private_error,
                 )
                 self._clear_private_entry_retry()
                 return TradeResult(
@@ -430,6 +437,7 @@ class TradingEngine:
                 current_price,
                 signal,
             )
+            private_error_object = sizing_raw.pop("_private_error_object", None)
             if requested_quantity is None:
                 if sizing_raw.get("private_api_unavailable"):
                     if sizing_raw.get("retryable_private_error"):
@@ -438,6 +446,7 @@ class TradingEngine:
                             current_price,
                             sizing_raw,
                             started_at=entry_attempt_started_at,
+                            error=private_error_object,
                         )
                         return TradeResult(
                             self.adapter.name,
@@ -456,6 +465,7 @@ class TradingEngine:
                         str(sizing_raw.get("private_error") or "私有 API 不可用"),
                         retryable=False,
                         retry_seconds=0.0,
+                        error=private_error_object,
                     )
                     self._clear_private_entry_retry()
                     return TradeResult(
@@ -491,14 +501,29 @@ class TradingEngine:
                         entry_client_id,
                     )
                 )
+                self.resolve_emergency("ip_restricted")
             except Exception as entry_error:
+                emergency_supported = callable(
+                    getattr(self.notifier, "notify_emergency", None)
+                )
+                self.notify_emergency(
+                    entry_error,
+                    category="order_failure",
+                    context="提交开仓市价单失败",
+                    incident="entry_submit",
+                    details={
+                        "方向": signal.side,
+                        "请求数量": requested_quantity,
+                    },
+                )
                 if self._is_order_capacity_error(entry_error):
-                    self._notify_order_unavailable(
-                        signal,
-                        current_price,
-                        sizing_raw,
-                        f"交易所拒绝最小订单：{entry_error}",
-                    )
+                    if not emergency_supported:
+                        self._notify_order_unavailable(
+                            signal,
+                            current_price,
+                            sizing_raw,
+                            f"交易所拒绝最小订单：{entry_error}",
+                        )
                     return TradeResult(
                         self.adapter.name,
                         "minimum_order_unavailable",
@@ -507,10 +532,21 @@ class TradingEngine:
                         raw={**sizing_raw, "error": str(entry_error)},
                     )
                 raise
-            filled_quantity, filled_price = self.adapter.market_fill(
-                entry_payload,
-                fallback_price=current_price,
-            )
+            try:
+                filled_quantity, filled_price = self.adapter.market_fill(
+                    entry_payload,
+                    fallback_price=current_price,
+                )
+            except Exception as fill_error:
+                self.notify_emergency(
+                    fill_error,
+                    category="order_failure",
+                    context="确认开仓订单成交结果失败，订单状态可能不确定",
+                    incident="entry_submit",
+                    details={"方向": signal.side, "请求数量": requested_quantity},
+                )
+                raise
+            self.resolve_emergency("order_failure", "entry_submit")
             filled_stop_pct = self._dynamic_stop_loss_pct(
                 stop_candles,
                 signal.side,
@@ -566,6 +602,8 @@ class TradingEngine:
                 )
                 self.position = position
                 self._save_live_reconciliation_state()
+                self.resolve_emergency("order_failure", "entry_submit")
+                self.resolve_emergency("order_failure", "protection_submit")
                 status = "live_order_protected"
                 live_raw = {
                     "entry_order_id": position.entry_order_id,
@@ -584,6 +622,7 @@ class TradingEngine:
                         position,
                         client_id=self._client_id("emergency-close"),
                     )
+                    self.resolve_emergency("ip_restricted")
                     rollback_quantity, rollback_price = self.adapter.market_fill(
                         rollback_payload,
                         fallback_price=filled_price,
@@ -591,8 +630,18 @@ class TradingEngine:
                     if rollback_quantity + 1e-12 < position.quantity:
                         raise RuntimeError("emergency close was only partially filled")
                     self._confirm_binance_flat("protection-failure emergency close")
-                    self.adapter.cancel_protection_orders(position)
+                    self._cancel_protection_orders_with_alert(
+                        position,
+                        context="保护单失败后的紧急平仓已成交，但取消残留保护单失败",
+                    )
                     self._close_paper_position(rollback_price, "protection_failed_emergency_close")
+                    self.notify_emergency(
+                        protection_error,
+                        category="order_failure",
+                        context="保护止损单提交失败；紧急平仓已确认",
+                        incident="protection_submit",
+                        details={"方向": position.side, "数量": position.quantity},
+                    )
                     return TradeResult(
                         self.adapter.name,
                         "live_entry_rolled_back",
@@ -602,12 +651,26 @@ class TradingEngine:
                     )
                 except Exception as rollback_failure:
                     rollback_error = str(rollback_failure)
+                    combined_error = RuntimeError(
+                        "保护单提交失败且紧急平仓失败："
+                        f"protection={protection_error}; emergency_close={rollback_failure}"
+                    )
+                    self.notify_emergency(
+                        combined_error,
+                        category="order_failure",
+                        context="保护单与紧急平仓均失败，可能存在未保护仓位",
+                        incident="protection_submit",
+                        details={"方向": position.side, "数量": position.quantity},
+                    )
                 return TradeResult(
                     self.adapter.name,
                     "live_unprotected_close_pending",
                     signal=signal,
                     position=self.position,
-                    raw={"protection_error": str(protection_error), "emergency_close_error": rollback_error},
+                    raw={
+                        "protection_error": str(protection_error),
+                        "emergency_close_error": rollback_error,
+                    },
                 )
         else:
             position = Position(
@@ -711,6 +774,7 @@ class TradingEngine:
                         position,
                         client_id=self._client_id("emergency-retry"),
                     )
+                    self.resolve_emergency("ip_restricted")
                     closed_quantity, close_price = self.adapter.market_fill(
                         rollback_payload,
                         fallback_price=float(remote.get("mark_price") or candle.close),
@@ -718,10 +782,27 @@ class TradingEngine:
                     if closed_quantity + 1e-12 < position.quantity:
                         raise RuntimeError("emergency close retry was only partially filled")
                     self._confirm_binance_flat("unprotected-position emergency close retry")
-                    self.adapter.cancel_protection_orders(position)
+                    self._cancel_protection_orders_with_alert(
+                        position,
+                        context="未保护仓位紧急平仓后取消残留保护单失败",
+                    )
                     self._close_paper_position(close_price, "protection_failed_emergency_close")
+                    self.resolve_emergency(
+                        "order_failure",
+                        f"emergency_close:{position.opened_at}",
+                    )
                 except Exception as error:
-                    raise RuntimeError(f"unprotected Binance position; emergency close retry failed: {error}") from error
+                    wrapped = RuntimeError(
+                        f"unprotected Binance position; emergency close retry failed: {error}"
+                    )
+                    self.notify_emergency(
+                        wrapped,
+                        category="order_failure",
+                        context="未保护仓位紧急平仓重试失败",
+                        incident=f"emergency_close:{position.opened_at}",
+                        details={"方向": position.side, "数量": position.quantity},
+                    )
+                    raise wrapped from error
             return
 
         self._finalize_binance_live_position_closed(candle)
@@ -736,7 +817,35 @@ class TradingEngine:
         # the race between polls. Inspect known bot ids (including legacy
         # take-profit ids), cancel anything left, and record the best price.
         position = self.position
-        statuses = self.adapter.fetch_protection_status(position)
+        try:
+            statuses = self.adapter.fetch_protection_status(position)
+        except Exception as status_error:
+            self.notify_emergency(
+                status_error,
+                category="order_failure",
+                context="交易所已空仓，但查询保护单成交状态失败",
+                incident=f"protection_status:{position.opened_at}",
+                details={"方向": position.side, "数量": position.quantity},
+            )
+            raise
+        status_errors = {
+            name: str(payload.get("error"))
+            for name, payload in statuses.items()
+            if isinstance(payload, dict) and payload.get("error")
+        }
+        if status_errors:
+            self.notify_emergency(
+                RuntimeError(
+                    "查询保护单成交状态部分失败："
+                    + "; ".join(
+                        f"{name}={error}" for name, error in status_errors.items()
+                    )
+                ),
+                category="order_failure",
+                context="交易所已空仓，退出价格将使用可用成交状态或最新 K 线兜底",
+                incident=f"protection_status:{position.opened_at}",
+                details={"方向": position.side, "数量": position.quantity},
+            )
         exit_reason = "exchange_position_closed"
         exit_price = float(candle.close)
         for name, reason, configured_price in (
@@ -765,8 +874,34 @@ class TradingEngine:
                         exit_price = selected_price
                         break
                 break
-        self.adapter.cancel_protection_orders(position)
+        self._cancel_protection_orders_with_alert(
+            position,
+            context="交易所已空仓，但取消残留保护单失败",
+        )
         self._close_paper_position(exit_price, exit_reason)
+
+    def _cancel_protection_orders_with_alert(
+        self,
+        position: Position,
+        *,
+        context: str,
+    ) -> dict[str, Any]:
+        cancellation = self.adapter.cancel_protection_orders(position)
+        errors = list(cancellation.get("errors") or [])
+        incident = f"protection_cancel:{position.opened_at}"
+        if errors:
+            self.notify_emergency(
+                RuntimeError(
+                    "取消保护单失败：" + "; ".join(str(error) for error in errors)
+                ),
+                category="order_failure",
+                context=context,
+                incident=incident,
+                details={"方向": position.side, "数量": position.quantity},
+            )
+        else:
+            self.resolve_emergency("order_failure", incident)
+        return cancellation
 
     def _observe_unmanaged_live_position(self, remote: dict[str, Any]) -> None:
         side = str(remote.get("side") or "")
@@ -844,8 +979,19 @@ class TradingEngine:
                 position,
                 after_ms=int(snapshot["observed_at_ms"]),
             )
-        except Exception:
+            self.resolve_emergency(
+                "order_failure",
+                f"reconcile_close_fill:{snapshot['observed_at_ms']}",
+            )
+        except Exception as fill_error:
             LOG.exception("Binance close-fill lookup failed; fallback email will use the latest closed candle")
+            self.notify_emergency(
+                fill_error,
+                category="order_failure",
+                context="未托管仓位平仓成交查询失败，将用最新已收 K 线价格兜底",
+                incident=f"reconcile_close_fill:{snapshot['observed_at_ms']}",
+                details={"方向": position.side, "数量": position.quantity},
+            )
         exit_price = float((fill or {}).get("price") or candle.close)
         exit_time_ms = int((fill or {}).get("timestamp") or time.time() * 1000)
         if self.notifier is not None:
@@ -1102,6 +1248,7 @@ class TradingEngine:
                     self._client_id("close"),
                 )
             )
+            self.resolve_emergency("ip_restricted")
             closed_quantity, close_price = self.adapter.market_fill(
                 close_payload,
                 fallback_price=reference_price,
@@ -1119,6 +1266,13 @@ class TradingEngine:
                 except Exception:
                     remote = {"unknown": True}
                 if remote is None:
+                    self.notify_emergency(
+                        close_error,
+                        category="order_failure",
+                        context="主动平仓订单报错，但交易所已确认空仓并完成对账",
+                        incident="close_submit",
+                        details={"方向": position.side, "数量": position.quantity},
+                    )
                     self._finalize_binance_live_position_closed(
                         Candle(
                             int(time.time() * 1000),
@@ -1134,12 +1288,21 @@ class TradingEngine:
                         "exit_price": reference_price,
                         "close_error": str(close_error),
                     }
+            self.notify_emergency(
+                close_error,
+                category="order_failure",
+                context="主动平仓订单失败，仓位可能仍然存在",
+                incident="close_submit",
+                details={"方向": position.side, "数量": position.quantity},
+            )
             raise
 
-        cancellation = self.adapter.cancel_protection_orders(position)
-        if cancellation.get("errors"):
-            LOG.warning("%s protection cancellation warnings=%s", self.adapter.name, cancellation["errors"])
+        cancellation = self._cancel_protection_orders_with_alert(
+            position,
+            context="主动平仓已完成，但取消残留保护单失败",
+        )
         self._close_paper_position(close_price, exit_reason)
+        self.resolve_emergency("order_failure", "close_submit")
         return {
             "closed_quantity": closed_quantity,
             "exit_price": close_price,
@@ -1175,11 +1338,26 @@ class TradingEngine:
                     "private_api_unavailable": True,
                     "private_error": reason,
                     "retryable_private_error": self._is_retryable_private_error(snapshot_error),
+                    "_private_error_object": snapshot_error,
                 }
             )
             return None, sizing
 
         limits = dict(snapshot.get("order_limits") or {})
+        limits_error = str(limits.get("error") or "")
+        if limits_error:
+            reason = f"无法读取 Binance 下单规则或额度：{limits_error}"
+            sizing.update(
+                {
+                    "blocked": True,
+                    "private_api_unavailable": True,
+                    "private_error": reason,
+                    "retryable_private_error": bool(
+                        snapshot.get("private_retryable", snapshot.get("private_transient"))
+                    ),
+                }
+            )
+            return None, sizing
         minimum_quantity = float(limits.get("effective_min_quantity_raw") or 0)
         minimum_notional = float(limits.get("effective_min_notional_raw") or 0)
         available_quantity = float(limits.get("estimated_max_open_quantity_raw") or 0)
@@ -1206,6 +1384,9 @@ class TradingEngine:
                 }
             )
             return None, sizing
+        self.resolve_emergency("order_failure", "entry_private_api")
+        if str(snapshot.get("private_source") or "").lower() == "rest":
+            self.resolve_emergency("ip_restricted")
         if minimum_quantity <= 0 or desired_quantity + 1e-12 >= minimum_quantity:
             # The original normalization error was not caused by the minimum
             # order threshold, so it must not be silently converted into a
@@ -1267,6 +1448,7 @@ class TradingEngine:
         sizing: dict[str, Any],
         *,
         started_at: float,
+        error: BaseException | str | None = None,
     ) -> bool:
         now = time.monotonic()
         same_signal = bool(
@@ -1302,6 +1484,7 @@ class TradingEngine:
                 str(sizing.get("private_error") or "Binance 私有 API 暂时不可用"),
                 retryable=retry_scheduled,
                 retry_seconds=remaining,
+                error=error,
             )
             self._private_entry_retry_notice_sent = True
         if not retry_scheduled:
@@ -1324,8 +1507,24 @@ class TradingEngine:
         *,
         retryable: bool,
         retry_seconds: float,
+        error: BaseException | str | None = None,
     ) -> None:
         if self.notifier is None:
+            return
+        emergency = getattr(self.notifier, "notify_emergency", None)
+        if callable(emergency):
+            self.notify_emergency(
+                error if error is not None else reason,
+                category="order_failure",
+                context="开仓前私有 API 不可用，未发送订单",
+                incident="entry_private_api",
+                details={
+                    "方向": signal.side,
+                    "当前价格": current_price,
+                    "是否计划重试": retryable,
+                    "重试窗口秒数": max(0.0, retry_seconds),
+                },
+            )
             return
         notify = getattr(self.notifier, "notify_private_api_unavailable", None)
         if not callable(notify):
@@ -1343,6 +1542,74 @@ class TradingEngine:
             )
         except Exception:  # Notification failures must never affect order safety.
             LOG.exception("private-API email notification failed; entry remains blocked")
+
+    def notify_emergency(
+        self,
+        error: BaseException | str,
+        *,
+        category: str,
+        context: str,
+        incident: str = "",
+        details: dict[str, Any] | None = None,
+    ) -> bool:
+        """Queue an operational alert without ever changing trading behavior."""
+
+        if self.notifier is None:
+            return False
+        notify = getattr(self.notifier, "notify_emergency", None)
+        if not callable(notify):
+            return False
+        payload_details = {
+            "当前本地仓位": "有" if self.position is not None else "无",
+            **(details or {}),
+        }
+        try:
+            accepted = bool(
+                notify(
+                    error,
+                    category=category,
+                    exchange=self.adapter.name,
+                    symbol=self.adapter.settings.symbol,
+                    mode=self.config.mode,
+                    environment=str(
+                        getattr(self.adapter.settings, "environment", "") or ""
+                    ),
+                    context=context,
+                    incident=incident,
+                    details=payload_details,
+                )
+            )
+            if isinstance(error, BaseException):
+                try:
+                    setattr(error, "_btc_emergency_notified", True)
+                except (AttributeError, TypeError):
+                    pass
+            return accepted
+        except Exception:  # An alert failure must never replace the trading error.
+            LOG.exception("emergency email notification enqueue failed")
+            return False
+
+    def resolve_emergency(self, category: str, incident: str = "") -> None:
+        if self.notifier is None:
+            return
+        resolve = getattr(self.notifier, "resolve_emergency", None)
+        if not callable(resolve):
+            return
+        try:
+            resolve(category, self.adapter.name, incident)
+        except Exception:
+            LOG.exception("emergency email recovery reset failed")
+
+    @staticmethod
+    def _emergency_was_notified(error: BaseException) -> bool:
+        current: BaseException | None = error
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if bool(getattr(current, "_btc_emergency_notified", False)):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
 
     @staticmethod
     def _is_retryable_private_error(error: Exception) -> bool:
@@ -1848,7 +2115,7 @@ class TradingEngine:
         close_adapter = getattr(self.adapter, "close", None)
         if close_adapter is not None:
             close_adapter()
-        if self.notifier is not None:
+        if self.notifier is not None and self._close_notifier:
             self.notifier.close()
 
     def run_forever(self) -> None:
@@ -1857,10 +2124,18 @@ class TradingEngine:
             retry_after = 0.0
             try:
                 result = self.evaluate_once()
+                self.resolve_emergency("engine_runtime", "cycle")
                 if result.status not in {"no_action", "position_held"}:
                     LOG.warning("%s", result)
             except Exception as error:
                 LOG.exception("cycle failed for %s; no new order submitted", self.adapter.name)
+                if not self._emergency_was_notified(error):
+                    self.notify_emergency(
+                        error,
+                        category="engine_runtime",
+                        context="行情周期执行失败",
+                        incident="cycle",
+                    )
                 if isinstance(error, ApiError) and error.rate_limited:
                     retry_after = error.retry_after_seconds
             time.sleep(max(float(normalized_poll_seconds(self.config.poll_seconds)), retry_after))

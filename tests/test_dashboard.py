@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -16,6 +17,48 @@ from btc_futures_bot.dashboard import (
     _position_dict,
 )
 from btc_futures_bot.models import Position
+
+
+class _RecordingEmergencyNotifier:
+    def __init__(self) -> None:
+        self.notifications: list[dict[str, object]] = []
+        self.resolutions: list[tuple[str, str, str]] = []
+
+    def notify_emergency(
+        self,
+        error: object,
+        *,
+        category: str,
+        exchange: str,
+        symbol: str,
+        mode: str,
+        environment: str,
+        context: str,
+        incident: str = "",
+        details: dict[str, object] | None = None,
+    ) -> bool:
+        self.notifications.append(
+            {
+                "error": error,
+                "category": category,
+                "exchange": exchange,
+                "symbol": symbol,
+                "mode": mode,
+                "environment": environment,
+                "context": context,
+                "incident": incident,
+                "details": details,
+            }
+        )
+        return True
+
+    def resolve_emergency(
+        self,
+        category: str,
+        exchange: str,
+        incident: str = "",
+    ) -> None:
+        self.resolutions.append((category, exchange, incident))
 
 
 def test_json_safe_replaces_non_finite_values_recursively() -> None:
@@ -183,6 +226,283 @@ def test_dashboard_market_snapshot_is_single_flight_across_tabs() -> None:
     assert adapter.calls == 1
     assert len(results) == 8
     assert all(result["market"]["mark_price"] == 100.0 for result in results)
+
+
+def test_dashboard_run_loop_alerts_on_error_then_resolves_after_success() -> None:
+    service = DashboardService.__new__(DashboardService)
+    service._lock = threading.RLock()
+    service.last_result = None
+    service.last_error = ""
+    service.last_cycle_at = 0.0
+    service._first_cycle_logged = False
+    service._last_logged_error = ""
+    service._last_macro_block = ""
+    timeline: list[str] = []
+
+    recovered_result = SimpleNamespace(
+        exchange="binance",
+        status="flat",
+        position=None,
+        signal=SimpleNamespace(side="flat", score=0),
+        raw={},
+    )
+
+    class Engine:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(poll_seconds=1)
+            self.macro_risk = None
+            self.evaluate_calls = 0
+            self.notifications: list[dict[str, object]] = []
+            self.resolutions: list[tuple[str, str]] = []
+
+        def evaluate_once(self):
+            self.evaluate_calls += 1
+            if self.evaluate_calls == 1:
+                timeline.append("evaluate_error")
+                raise RuntimeError("venue cycle unavailable")
+            assert service._last_logged_error == "venue cycle unavailable"
+            timeline.append("evaluate_success")
+            return recovered_result
+
+        def notify_emergency(
+            self,
+            error: object,
+            *,
+            category: str,
+            context: str,
+            incident: str = "",
+            details: dict[str, object] | None = None,
+        ) -> bool:
+            timeline.append("notify_emergency")
+            self.notifications.append(
+                {
+                    "error": error,
+                    "category": category,
+                    "context": context,
+                    "incident": incident,
+                    "details": details,
+                }
+            )
+            return True
+
+        def resolve_emergency(self, category: str, incident: str = "") -> None:
+            timeline.append("resolve_emergency")
+            self.resolutions.append((category, incident))
+
+    class TwoCycleStopEvent:
+        def __init__(self) -> None:
+            self.checks = 0
+
+        def is_set(self) -> bool:
+            self.checks += 1
+            return self.checks > 2
+
+        def wait(self, _timeout: float) -> bool:
+            return False
+
+    class OperationLogger:
+        def record(self, *_args: object, **kwargs: object) -> None:
+            if kwargs.get("status") == "error":
+                timeline.append("record_error")
+
+    engine = Engine()
+    service.engine = engine
+    service._stop_event = TwoCycleStopEvent()
+    service.operation_logger = OperationLogger()
+
+    service._run_loop()
+
+    assert engine.evaluate_calls == 2
+    assert len(engine.notifications) == 1
+    notification = engine.notifications[0]
+    assert str(notification["error"]) == "venue cycle unavailable"
+    assert notification["category"] == "engine_runtime"
+    assert notification["context"] == "行情周期执行失败"
+    assert notification["incident"] == "cycle"
+    assert engine.resolutions == [("engine_runtime", "cycle")]
+    assert service.last_result is recovered_result
+    assert service.last_error == ""
+    assert service._last_logged_error == ""
+    assert timeline.index("notify_emergency") < timeline.index("record_error")
+    assert timeline.index("evaluate_success") < timeline.index("resolve_emergency")
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "expected_error"),
+    [
+        (
+            {
+                "market": {"mark_price": 100.0},
+                "private_available": True,
+                "order_limits": {"error": "HTTP 429: rate limit exceeded"},
+            },
+            "HTTP 429: rate limit exceeded",
+        ),
+        (
+            {
+                "market": {"mark_price": 100.0},
+                "private_available": False,
+                "private_error": "HTTP 418: IP banned after rate limit violation",
+            },
+            "HTTP 418: IP banned after rate limit violation",
+        ),
+    ],
+    ids=("order-limits", "private-api"),
+)
+def test_dashboard_market_snapshot_alerts_on_rate_limit_errors(
+    snapshot: dict[str, object],
+    expected_error: str,
+) -> None:
+    service = DashboardService.__new__(DashboardService)
+    service._lock = threading.RLock()
+    service._snapshot_condition = threading.Condition(service._lock)
+    service._snapshot_refreshing = False
+    service._exchange_snapshot = {}
+    service._snapshot_at = 0.0
+    service._private_snapshot_at = 0.0
+    service.notifier = _RecordingEmergencyNotifier()
+
+    class Adapter:
+        def fetch_dashboard_snapshot(self) -> dict[str, object]:
+            return snapshot
+
+    service._adapter = lambda _config, _exchange: Adapter()
+    config = {
+        "mode": "live",
+        "dashboard_snapshot_seconds": 5,
+        "exchanges": {
+            "binance": {
+                "environment": "production",
+                "symbol": "BTCUSDT",
+            }
+        },
+    }
+
+    with patch("btc_futures_bot.dashboard.time.time", return_value=100.0):
+        service._market_snapshot(config, "binance")
+
+    assert len(service.notifier.notifications) == 1
+    notification = service.notifier.notifications[0]
+    assert str(notification["error"]) == expected_error
+    assert notification["category"] == "ip_restricted"
+    assert notification["context"] == "页面交易所状态检测"
+    assert notification["incident"] == "snapshot"
+
+
+def test_dashboard_healthy_market_snapshot_resolves_rate_limit_alert() -> None:
+    service = DashboardService.__new__(DashboardService)
+    service._lock = threading.RLock()
+    service._snapshot_condition = threading.Condition(service._lock)
+    service._snapshot_refreshing = False
+    service._exchange_snapshot = {}
+    service._snapshot_at = 0.0
+    service._private_snapshot_at = 0.0
+    service.notifier = _RecordingEmergencyNotifier()
+    snapshot = {
+        "market": {"mark_price": 100.0},
+        "private_available": True,
+        "private_source": "rest",
+        "private_error": "",
+        "order_limits": {"effective_min_quantity_raw": "0.001"},
+    }
+
+    class Adapter:
+        def fetch_dashboard_snapshot(self) -> dict[str, object]:
+            return snapshot
+
+    service._adapter = lambda _config, _exchange: Adapter()
+    config = {
+        "mode": "live",
+        "dashboard_snapshot_seconds": 5,
+        "exchanges": {
+            "binance": {
+                "environment": "production",
+                "symbol": "BTCUSDT",
+            }
+        },
+    }
+
+    with patch("btc_futures_bot.dashboard.time.time", return_value=100.0):
+        service._market_snapshot(config, "binance")
+
+    assert service.notifier.notifications == []
+    assert service.notifier.resolutions == [("ip_restricted", "binance", "snapshot")]
+
+
+def test_dashboard_websocket_snapshot_does_not_falsely_resolve_rest_ip_alert() -> None:
+    service = DashboardService.__new__(DashboardService)
+    service.notifier = _RecordingEmergencyNotifier()
+    snapshot = {
+        "market": {"mark_price": 100.0},
+        "private_available": True,
+        "private_source": "websocket",
+        "private_error": "",
+        "order_limits": {"effective_min_quantity_raw": "0.001"},
+    }
+    config = {
+        "mode": "live",
+        "exchanges": {
+            "binance": {"environment": "production", "symbol": "BTCUSDT"}
+        },
+    }
+
+    service._handle_snapshot_alerts(snapshot, config, "binance")
+
+    assert service.notifier.notifications == []
+    assert service.notifier.resolutions == []
+
+
+def test_dashboard_email_test_rejects_delivery_timeout() -> None:
+    service = DashboardService.__new__(DashboardService)
+
+    class Notifier:
+        config = SimpleNamespace(
+            enabled=True,
+            timeout_seconds=1.0,
+            password_env="BTC_EMAIL_PASSWORD",
+            recipients=("owner@example.com",),
+        )
+        ready = True
+
+        @staticmethod
+        def status() -> dict[str, object]:
+            return {"sent_count": 0, "last_error": ""}
+
+        @staticmethod
+        def send_test() -> bool:
+            return True
+
+        @staticmethod
+        def flush(_timeout: float) -> bool:
+            return False
+
+    service.notifier = Notifier()
+
+    with pytest.raises(RuntimeError, match="发送超时"):
+        service.email_test()
+
+
+def test_dashboard_explicit_restart_clears_old_ip_rate_limit_gate() -> None:
+    service = DashboardService.__new__(DashboardService)
+    timeline: list[str] = []
+
+    class OperationLogger:
+        @staticmethod
+        def record(*_args: object, **_kwargs: object) -> None:
+            return None
+
+    service.operation_logger = OperationLogger()
+    service.stop = lambda: timeline.append("stop") or {"running": False}
+    service.start = lambda _payload: timeline.append("start") or {"running": True}
+
+    with patch(
+        "btc_futures_bot.dashboard.clear_rate_limits",
+        side_effect=lambda: timeline.append("clear_rate_limits"),
+    ):
+        result = service.restart({"reason": "proxy node changed"})
+
+    assert result == {"running": True}
+    assert timeline == ["stop", "clear_rate_limits", "start"]
 
 
 def test_dashboard_overlays_cached_private_snapshot_with_live_market_tick() -> None:

@@ -4,7 +4,12 @@ from io import BytesIO
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
-from btc_futures_bot.http_client import ApiError, clear_rate_limits, request_json
+from btc_futures_bot.http_client import (
+    ApiError,
+    clear_rate_limits,
+    is_rate_limit_error,
+    request_json,
+)
 
 
 class _Response:
@@ -157,5 +162,57 @@ def test_binance_ban_timestamp_takes_precedence_over_default_backoff() -> None:
                 assert raised.retry_at == 1_700_000_123.0
             else:
                 raise AssertionError("418 must be surfaced")
+    finally:
+        clear_rate_limits()
+
+
+def test_rate_limit_classifier_uses_http_status_or_structured_binance_code() -> None:
+    assert is_rate_limit_error(ApiError("teapot ban", status_code=418))
+    assert is_rate_limit_error(ApiError("too many requests", status_code=429))
+    assert is_rate_limit_error(
+        ApiError("Binance request rejected", status_code=400, api_code=-1003)
+    )
+    assert not is_rate_limit_error(
+        ApiError("unrelated bad request", status_code=400, api_code=-1100)
+    )
+
+
+def test_http_400_binance_minus_1003_is_structured_and_blocks_followup_requests() -> None:
+    error = HTTPError(
+        "https://fapi.binance.com/fapi/v1/account",
+        400,
+        "bad request",
+        {},
+        BytesIO(
+            b'{"code":-1003,"msg":"Too many requests; IP banned until 1700000123000."}'
+        ),
+    )
+    clear_rate_limits()
+    try:
+        with (
+            patch("btc_futures_bot.http_client.urlopen", side_effect=error) as mocked_urlopen,
+            patch("btc_futures_bot.http_client.time.time", return_value=1_700_000_000.0),
+        ):
+            try:
+                request_json("GET", "https://fapi.binance.com/fapi/v1/account")
+            except ApiError as raised:
+                assert raised.status_code == 400
+                assert raised.api_code == -1003
+                assert is_rate_limit_error(raised)
+                assert raised.rate_limited
+                assert raised.retry_at == 1_700_000_123.0
+            else:
+                raise AssertionError("Binance -1003 must be surfaced as a rate-limit error")
+
+            try:
+                request_json("GET", "https://fapi.binance.com/fapi/v1/openOrders")
+            except ApiError as blocked:
+                assert is_rate_limit_error(blocked)
+                assert blocked.rate_limited
+                assert blocked.retry_after_seconds == 123.0
+            else:
+                raise AssertionError("same-host followup request must be blocked locally")
+
+        assert mocked_urlopen.call_count == 1
     finally:
         clear_rate_limits()

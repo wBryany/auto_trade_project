@@ -724,14 +724,20 @@ def test_binance_signed_get_does_not_retry_rate_limit(monkeypatch) -> None:
 
     def request(*args, **kwargs):
         calls.append((args, kwargs))
-        raise ApiError("HTTP 429", status_code=429, retry_at=9_999_999_999)
+        raise ApiError(
+            "HTTP 429",
+            status_code=429,
+            retry_at=9_999_999_999,
+            api_code=-1003,
+        )
 
     monkeypatch.setattr("btc_futures_bot.exchanges.binance.request_json", request)
 
-    with pytest.raises(ApiError, match="429"):
+    with pytest.raises(ApiError, match="429") as raised:
         adapter.fetch_equity()
 
     assert len(calls) == 1
+    assert raised.value.api_code == -1003
 
 
 def test_binance_private_network_failure_is_marked_transient(monkeypatch) -> None:

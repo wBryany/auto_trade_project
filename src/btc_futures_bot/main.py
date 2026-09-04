@@ -389,7 +389,12 @@ def load_runtime_dotenv(config_path: str) -> list[str]:
     return loaded
 
 
-def build_engine(name: str, raw: dict[str, Any], reporter: TradeReporter | None = None) -> TradingEngine:
+def build_engine(
+    name: str,
+    raw: dict[str, Any],
+    reporter: TradeReporter | None = None,
+    notifier: EmailNotifier | None = None,
+) -> TradingEngine:
     account = raw.get("account", {})
     strategy = MultiTimeframeStrategy(StrategyConfig(**raw.get("strategy", {})))
     exchange_raw = raw["exchanges"][name]
@@ -427,8 +432,8 @@ def build_engine(name: str, raw: dict[str, Any], reporter: TradeReporter | None 
         default_cache_path=default_macro_cache,
     )
     macro_risk = MacroRiskController(macro_config) if macro_config.enabled else None
-    notifier = None
-    if reporter is not None:
+    notifier_owned = False
+    if reporter is not None and notifier is None:
         try:
             email_config = EmailNotificationConfig.from_mapping(
                 raw.get("email_notifications", {}),
@@ -436,12 +441,14 @@ def build_engine(name: str, raw: dict[str, Any], reporter: TradeReporter | None 
                 default_state_path=str(selected_report_dir / "email_notification_state.json"),
             )
             notifier = EmailNotifier(email_config)
+            notifier_owned = True
         except Exception as error:  # Invalid optional email config cannot prevent trading startup.
             logging.getLogger(__name__).exception("email notifications disabled because configuration is invalid")
             notifier = EmailNotifier(
                 EmailNotificationConfig(enabled=False),
                 initial_error=f"邮件配置无效，通知已隔离禁用：{error}",
             )
+            notifier_owned = True
     return TradingEngine(
         adapter,
         strategy,
@@ -450,6 +457,7 @@ def build_engine(name: str, raw: dict[str, Any], reporter: TradeReporter | None 
         reporter=reporter,
         macro_risk=macro_risk,
         notifier=notifier,
+        close_notifier=notifier_owned,
     )
 
 
@@ -506,7 +514,24 @@ def main() -> None:
         return
     if config.get("mode", "paper") == "live":
         for engine in engines:
-            engine.prepare_live()
+            try:
+                engine.prepare_live()
+            except Exception as error:
+                engine.notify_emergency(
+                    error,
+                    category="engine_runtime",
+                    context="实盘启动预检失败",
+                    incident="start",
+                )
+                if engine.notifier is not None:
+                    flushed = engine.notifier.flush(
+                        engine.notifier.config.timeout_seconds + 2.0
+                    )
+                    if not flushed:
+                        logging.getLogger(__name__).error(
+                            "timed out waiting for the live-preflight emergency email"
+                        )
+                raise
     if args.once:
         for engine in engines:
             print(engine.evaluate_once())

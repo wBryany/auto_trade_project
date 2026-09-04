@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
+from .http_client import ApiError, is_rate_limit_error, redact_url_credentials
 from .models import Position, Signal
 from .reporting import TradeRecord, TradeReporter
 
@@ -93,10 +94,13 @@ class _QueuedEmail:
     event_type: str
     report_date: str = ""
     body_factory: Callable[[], str] | None = None
+    incident_key: str = ""
 
 
 class EmailNotifier:
     """Send trade notifications without blocking the market-data loop."""
+
+    _EMERGENCY_COOLDOWN_SECONDS = 1_800.0
 
     def __init__(
         self,
@@ -110,8 +114,10 @@ class EmailNotifier:
         self._send_fn = send_fn
         self._now_fn = now_fn or (lambda: datetime.now(ZoneInfo(self.config.timezone)))
         self._queue: queue.Queue[_QueuedEmail] = queue.Queue(maxsize=100)
+        self._urgent_queue: queue.Queue[_QueuedEmail] = queue.Queue(maxsize=20)
         self._stop_event = threading.Event()
         self._lock = threading.RLock()
+        self._closed = False
         self._worker: threading.Thread | None = None
         self._last_sent_at = ""
         self._last_error = str(initial_error)
@@ -119,6 +125,9 @@ class EmailNotifier:
         self._last_daily_report_date = ""
         self._daily_pending: set[str] = set()
         self._last_daily_failure_at = 0.0
+        self._emergency_pending: dict[str, int] = {}
+        self._emergency_resolved_pending: dict[str, int] = {}
+        self._last_emergency_alerts: dict[str, float] = {}
         self._load_state()
         if self.config.enabled:
             self._worker = threading.Thread(
@@ -142,6 +151,8 @@ class EmailNotifier:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
+            if self._prune_expired_emergency_alerts(self._now_fn().timestamp()):
+                self._save_state_safely()
             return {
                 "enabled": self.config.enabled,
                 "ready": self.ready,
@@ -150,12 +161,198 @@ class EmailNotifier:
                 "daily_report_hour": self.config.daily_report_hour,
                 "timezone": self.config.timezone,
                 "password_configured": bool(os.getenv(self.config.password_env, "").strip()),
-                "queued": self._queue.qsize(),
+                "queued": self._queue.qsize() + self._urgent_queue.qsize(),
                 "sent_count": self._sent_count,
                 "last_sent_at": self._last_sent_at,
                 "last_error": self._last_error,
                 "last_daily_report_date": self._last_daily_report_date,
+                "emergency_incidents_in_cooldown": len(self._last_emergency_alerts),
             }
+
+    def notify_emergency(
+        self,
+        error: BaseException | str,
+        *,
+        category: str,
+        exchange: str,
+        symbol: str,
+        mode: str,
+        environment: str,
+        context: str,
+        incident: str = "",
+        details: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Queue a high-priority, deduplicated operational alert."""
+
+        selected_category = self._emergency_category(category, error)
+        incident_key = self._emergency_incident_key(
+            selected_category,
+            exchange,
+            incident,
+        )
+        now = self._now_fn().astimezone(ZoneInfo(self.config.timezone))
+        now_timestamp = now.timestamp()
+        error_text = redact_url_credentials(str(error)).strip() or type(error).__name__
+        api_error = self._find_api_error(error)
+        venue_name = str(exchange or "交易所").strip()
+        if selected_category == "ip_restricted":
+            if venue_name.lower() == "binance":
+                subject = "【紧急】Binance IP 限频/封禁"
+                heading = "Binance 出口 IP 已被限制或封禁"
+            else:
+                subject = f"【紧急】{venue_name} API 限频/IP 限制"
+                heading = f"{venue_name} API 已限频或出口 IP 受限"
+            handling = (
+                "请手动切换路由器代理节点，确认公网出口 IP 已变化后，"
+                "从页面重启引擎或运行 scripts\\restart_bot.ps1。程序不会自动切换节点。"
+            )
+        else:
+            subject, heading, handling = {
+                "order_failure": (
+                    "【紧急】下单失败",
+                    "交易订单执行失败",
+                    "请立即登录交易所核对实际仓位、成交和挂单；确认前不要重复手工下单。",
+                ),
+                "engine_runtime": (
+                    "【紧急】交易引擎报错",
+                    "交易引擎发生异常",
+                    "请立即查看交易页面和错误日志，并核对交易所仓位及保护单状态。",
+                ),
+            }.get(
+                selected_category,
+                (
+                    "【紧急】交易系统异常",
+                    "交易系统发生异常",
+                    "请立即查看交易页面、错误日志和交易所实际状态。",
+                ),
+            )
+        lines = [
+            heading,
+            f"时间：{now:%Y-%m-%d %H:%M:%S %Z}",
+            f"平台/模式：{exchange} / {mode}",
+            f"网络：{environment or '—'}",
+            f"合约：{symbol or '—'}",
+            f"阶段：{context or '运行中'}",
+            f"错误：{error_text}",
+        ]
+        if api_error is not None:
+            if api_error.status_code is not None:
+                lines.append(f"HTTP 状态：{api_error.status_code}")
+            if api_error.api_code not in (None, ""):
+                lines.append(f"交易所错误码：{api_error.api_code}")
+            if api_error.retry_after_seconds > 0:
+                try:
+                    retry_at = datetime.fromtimestamp(
+                        api_error.retry_at,
+                        tz=ZoneInfo(self.config.timezone),
+                    )
+                    lines.append(
+                        f"预计可重试：{retry_at:%Y-%m-%d %H:%M:%S %Z}"
+                        f"（约 {max(1, int(round(api_error.retry_after_seconds)))} 秒后）"
+                    )
+                except (OSError, OverflowError, ValueError):
+                    lines.append("预计可重试：交易所返回的限频时间无法在本机解析")
+        for key, value in (details or {}).items():
+            lines.append(f"{key}：{redact_url_credentials(str(value))}")
+        lines.append(f"处理建议：{handling}")
+
+        with self._lock:
+            if self._prune_expired_emergency_alerts(now_timestamp):
+                self._save_state_safely()
+            last_sent = self._last_emergency_alerts.get(incident_key, 0.0)
+            pending_count = self._emergency_pending.get(incident_key, 0)
+            resolved_pending_count = self._emergency_resolved_pending.get(
+                incident_key,
+                0,
+            )
+            if pending_count > resolved_pending_count or (
+                last_sent > 0
+                and now_timestamp - last_sent < self._EMERGENCY_COOLDOWN_SECONDS
+            ):
+                return False
+            self._emergency_pending[incident_key] = pending_count + 1
+
+        accepted = self._enqueue(
+            _QueuedEmail(
+                subject,
+                "\n".join(lines),
+                f"emergency_{selected_category}",
+                incident_key=incident_key,
+            )
+        )
+        if not accepted:
+            with self._lock:
+                remaining = self._emergency_pending.get(incident_key, 1) - 1
+                if remaining > 0:
+                    self._emergency_pending[incident_key] = remaining
+                else:
+                    self._emergency_pending.pop(incident_key, None)
+        return accepted
+
+    def resolve_emergency(
+        self,
+        category: str,
+        exchange: str,
+        incident: str = "",
+    ) -> None:
+        """Mark a proven-recovered incident eligible for a future fresh alert."""
+
+        incident_key = self._emergency_incident_key(category, exchange, incident)
+        with self._lock:
+            state_changed = incident_key in self._last_emergency_alerts
+            self._last_emergency_alerts.pop(incident_key, None)
+            pending_count = self._emergency_pending.get(incident_key, 0)
+            if pending_count:
+                # Delivery may complete after the caller has already proven
+                # recovery. Count those older deliveries so a fresh incident
+                # may queue immediately without inheriting their cooldown.
+                self._emergency_resolved_pending[incident_key] = pending_count
+            if state_changed:
+                self._save_state_safely()
+
+    @staticmethod
+    def _emergency_category(category: str, error: BaseException | str) -> str:
+        if is_rate_limit_error(error):
+            return "ip_restricted"
+        selected = str(category or "").strip().lower()
+        if selected in {"order", "order_error", "order_failure", "private_api"}:
+            return "order_failure"
+        if selected in {"engine", "engine_error", "engine_runtime", "runtime"}:
+            return "engine_runtime"
+        return selected or "engine_runtime"
+
+    @staticmethod
+    def _emergency_incident_key(category: str, exchange: str, incident: str) -> str:
+        selected = str(category or "engine_runtime").strip().lower()
+        venue = str(exchange or "unknown").strip().lower()
+        # A Binance ban is one host/IP incident even though its countdown text
+        # and the operation that discovers it can change on every request.
+        if selected == "ip_restricted":
+            return f"ip_restricted:{venue}"
+        scope = str(incident or "default").strip().lower()
+        return f"{selected}:{venue}:{scope}"
+
+    @staticmethod
+    def _find_api_error(error: BaseException | str) -> ApiError | None:
+        current: BaseException | None = error if isinstance(error, BaseException) else None
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, ApiError):
+                return current
+            current = current.__cause__ or current.__context__
+        return None
+
+    def _prune_expired_emergency_alerts(self, now_timestamp: float) -> bool:
+        cutoff = float(now_timestamp) - self._EMERGENCY_COOLDOWN_SECONDS
+        expired = [
+            key
+            for key, sent_at in self._last_emergency_alerts.items()
+            if sent_at <= cutoff
+        ]
+        for key in expired:
+            self._last_emergency_alerts.pop(key, None)
+        return bool(expired)
 
     def notify_open(
         self,
@@ -499,34 +696,56 @@ class EmailNotifier:
 
     def flush(self, timeout: float = 3.0) -> bool:
         deadline = time.monotonic() + max(0.0, timeout)
-        while self._queue.unfinished_tasks and time.monotonic() < deadline:
+        while (
+            self._queue.unfinished_tasks or self._urgent_queue.unfinished_tasks
+        ) and time.monotonic() < deadline:
             time.sleep(0.01)
-        return self._queue.unfinished_tasks == 0
+        return (
+            self._queue.unfinished_tasks == 0
+            and self._urgent_queue.unfinished_tasks == 0
+        )
 
-    def close(self) -> None:
-        self._stop_event.set()
+    def close(self) -> bool:
+        with self._lock:
+            self._closed = True
+            self._stop_event.set()
         worker = self._worker
         if worker and worker is not threading.current_thread():
-            worker.join(timeout=3)
+            worker.join(timeout=max(3.0, self.config.timeout_seconds + 2.0))
+        return worker is None or not worker.is_alive()
 
     def _enqueue(self, item: _QueuedEmail) -> bool:
-        if not self.config.enabled:
-            return False
-        try:
-            self._queue.put_nowait(item)
-            return True
-        except queue.Full:
-            with self._lock:
-                self._last_error = "邮件通知队列已满"
-            LOG.error("email notification queue is full; dropping %s", item.event_type)
-            return False
+        with self._lock:
+            if not self.config.enabled or self._closed:
+                return False
+            selected_queue = self._urgent_queue if item.incident_key else self._queue
+            try:
+                selected_queue.put_nowait(item)
+                return True
+            except queue.Full:
+                self._last_error = (
+                    "紧急邮件通知队列已满"
+                    if item.incident_key
+                    else "邮件通知队列已满"
+                )
+                LOG.error("email notification queue is full; dropping %s", item.event_type)
+                return False
 
     def _run(self) -> None:
-        while not self._stop_event.is_set() or not self._queue.empty():
+        while (
+            not self._stop_event.is_set()
+            or not self._urgent_queue.empty()
+            or not self._queue.empty()
+        ):
+            selected_queue = self._urgent_queue
             try:
-                item = self._queue.get(timeout=0.25)
+                item = self._urgent_queue.get_nowait()
             except queue.Empty:
-                continue
+                selected_queue = self._queue
+                try:
+                    item = self._queue.get(timeout=0.25)
+                except queue.Empty:
+                    continue
             try:
                 self._deliver(item)
                 with self._lock:
@@ -536,7 +755,26 @@ class EmailNotifier:
                     if item.report_date:
                         self._last_daily_report_date = item.report_date
                         self._daily_pending.discard(item.report_date)
-                        self._save_state()
+                    if item.incident_key:
+                        pending_count = self._emergency_pending.get(item.incident_key, 1)
+                        if pending_count > 1:
+                            self._emergency_pending[item.incident_key] = pending_count - 1
+                        else:
+                            self._emergency_pending.pop(item.incident_key, None)
+                        resolved_count = self._emergency_resolved_pending.get(
+                            item.incident_key,
+                            0,
+                        )
+                        if resolved_count > 1:
+                            self._emergency_resolved_pending[item.incident_key] = (
+                                resolved_count - 1
+                            )
+                        elif resolved_count == 1:
+                            self._emergency_resolved_pending.pop(item.incident_key, None)
+                        else:
+                            self._last_emergency_alerts[item.incident_key] = self._now_fn().timestamp()
+                    if item.report_date or item.incident_key:
+                        self._save_state_safely()
                 LOG.info("email notification sent type=%s recipients=%s", item.event_type, len(self.config.recipients))
             except Exception as error:  # Email outages must never stop trading.
                 with self._lock:
@@ -544,9 +782,25 @@ class EmailNotifier:
                     if item.report_date:
                         self._daily_pending.discard(item.report_date)
                         self._last_daily_failure_at = time.monotonic()
+                    if item.incident_key:
+                        pending_count = self._emergency_pending.get(item.incident_key, 1)
+                        if pending_count > 1:
+                            self._emergency_pending[item.incident_key] = pending_count - 1
+                        else:
+                            self._emergency_pending.pop(item.incident_key, None)
+                        resolved_count = self._emergency_resolved_pending.get(
+                            item.incident_key,
+                            0,
+                        )
+                        if resolved_count > 1:
+                            self._emergency_resolved_pending[item.incident_key] = (
+                                resolved_count - 1
+                            )
+                        elif resolved_count == 1:
+                            self._emergency_resolved_pending.pop(item.incident_key, None)
                 LOG.exception("email notification failed type=%s", item.event_type)
             finally:
-                self._queue.task_done()
+                selected_queue.task_done()
 
     def _deliver(self, item: _QueuedEmail) -> None:
         sender = self.config.sender or os.getenv(self.config.username_env, "").strip()
@@ -600,6 +854,14 @@ class EmailNotifier:
         try:
             state = json.loads(path.read_text(encoding="utf-8"))
             self._last_daily_report_date = str(state.get("last_daily_report_date") or "")
+            emergency = state.get("last_emergency_alerts") or {}
+            if isinstance(emergency, Mapping):
+                cutoff = self._now_fn().timestamp() - self._EMERGENCY_COOLDOWN_SECONDS
+                self._last_emergency_alerts = {
+                    str(key): float(value)
+                    for key, value in emergency.items()
+                    if str(key) and float(value) > cutoff
+                }
         except Exception as error:
             LOG.warning("email notification state ignored: %s", error)
 
@@ -609,7 +871,10 @@ class EmailNotifier:
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.write_text(
             json.dumps(
-                {"last_daily_report_date": self._last_daily_report_date},
+                {
+                    "last_daily_report_date": self._last_daily_report_date,
+                    "last_emergency_alerts": self._last_emergency_alerts,
+                },
                 ensure_ascii=False,
                 indent=2,
             )
@@ -617,3 +882,11 @@ class EmailNotifier:
             encoding="utf-8",
         )
         temporary.replace(path)
+
+    def _save_state_safely(self) -> bool:
+        try:
+            self._save_state()
+            return True
+        except Exception:
+            LOG.exception("email notification state could not be persisted")
+            return False
