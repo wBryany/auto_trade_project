@@ -25,6 +25,102 @@ from .reporting import TradeRecord, TradeReporter
 LOG = logging.getLogger(__name__)
 
 
+_STRATEGY_INSPECTION_REPORT_TITLES = frozenset(
+    {
+        "BTC 整点巡检报告",
+        "BTC 自动交易整点巡检报告",
+        "BTC 自动交易策略整点巡检报告",
+    }
+)
+_STRATEGY_INSPECTION_REQUIRED_FIELDS = (
+    "巡检时间与覆盖窗口",
+    "Git",
+    "页面服务",
+    "交易引擎",
+    "交易所连接",
+    "仓位与挂单",
+    "新增平仓交易",
+    "K线环境（1m/5m/1h/4h）",
+    "多单入场质量",
+    "空单入场质量",
+    "手续费后期望",
+    "MFE/MAE、退出原因与回撤",
+    "本轮结论",
+    "策略/代码/配置修改",
+    "测试结果",
+    "重启与验证",
+    "提交与推送",
+    "失败与用户处理",
+)
+_STRATEGY_INSPECTION_DRAFT_MARKER = re.compile(
+    r"(?im)(?:^\s*(?:\.{3,}|…{2,}|\?{3,})\s*$|"
+    r"\b(?:todo|tbd|fixme|wip|placeholder|wait\s+wrong)\b|"
+    r"待补充|待完善|占位符|稍后补充|尚未填写|\{\{.+?\}\})"
+)
+_MAX_STRATEGY_INSPECTION_REPORT_BYTES = 64 * 1024
+
+
+def prepare_strategy_inspection_report(report: str, *, run_id: str) -> str:
+    """Normalize and validate a complete hourly strategy-inspection report."""
+
+    normalized_run_id = str(run_id).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.:+-]{1,80}", normalized_run_id):
+        raise ValueError("run_id 格式无效")
+
+    raw_report = (
+        str(report)
+        .lstrip("\ufeff")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+    )
+    if "\x00" in raw_report:
+        raise ValueError("巡检报告不能包含 NUL 字符")
+    if len(raw_report.encode("utf-8")) > _MAX_STRATEGY_INSPECTION_REPORT_BYTES:
+        raise ValueError("巡检报告不能超过 64 KiB")
+
+    lines = redact_url_credentials(raw_report).strip().splitlines()
+    while lines:
+        first = lines[0].strip().strip("#*_ ")
+        if first.rstrip("：:") in _STRATEGY_INSPECTION_REPORT_TITLES:
+            lines.pop(0)
+            continue
+        batch_match = re.fullmatch(r"巡检批次\s*[：:]\s*(.+)", first)
+        if batch_match:
+            if batch_match.group(1).strip() != normalized_run_id:
+                raise ValueError("巡检报告批次与 run_id 不一致")
+            lines.pop(0)
+            continue
+        if re.match(r"(?:完成时间|执行结果)\s*[：:]", first):
+            lines.pop(0)
+            continue
+        break
+
+    normalized_report = "\n".join(lines).strip()
+    if not normalized_report:
+        raise ValueError("巡检报告不能为空")
+    if _STRATEGY_INSPECTION_DRAFT_MARKER.search(normalized_report):
+        raise ValueError("巡检报告包含未完成的草稿占位内容")
+
+    values: dict[str, str] = {}
+    for line in normalized_report.splitlines():
+        candidate = line.strip().lstrip("#").strip()
+        candidate = re.sub(r"^[-*]\s+", "", candidate)
+        candidate = candidate.replace("**", "").replace("__", "")
+        field_match = re.fullmatch(r"(.+?)\s*[：:]\s*(.*)", candidate)
+        if field_match and field_match.group(1).strip() in _STRATEGY_INSPECTION_REQUIRED_FIELDS:
+            values[field_match.group(1).strip()] = field_match.group(2).strip()
+
+    missing = [
+        field
+        for field in _STRATEGY_INSPECTION_REQUIRED_FIELDS
+        if not values.get(field)
+        or re.fullmatch(r"[.\s…?？_-]+", values[field]) is not None
+    ]
+    if missing:
+        raise ValueError("巡检报告缺少必填项：" + "、".join(missing))
+    return normalized_report
+
+
 @dataclass(frozen=True)
 class EmailNotificationConfig:
     enabled: bool = False
@@ -726,15 +822,10 @@ class EmailNotifier:
         if normalized_status not in status_details:
             raise ValueError("status 必须是 no_change、changed 或 failed")
         normalized_run_id = str(run_id).strip()
-        if not re.fullmatch(r"[A-Za-z0-9_.:+-]{1,80}", normalized_run_id):
-            raise ValueError("run_id 格式无效")
-        normalized_report = redact_url_credentials(str(report)).strip()
-        if not normalized_report:
-            raise ValueError("巡检报告不能为空")
-        if "\x00" in normalized_report:
-            raise ValueError("巡检报告不能包含 NUL 字符")
-        if len(normalized_report.encode("utf-8")) > 64 * 1024:
-            raise ValueError("巡检报告不能超过 64 KiB")
+        normalized_report = prepare_strategy_inspection_report(
+            report,
+            run_id=normalized_run_id,
+        )
 
         local_now = self._now_fn().astimezone(ZoneInfo(self.config.timezone))
         subject_status, status_text = status_details[normalized_status]

@@ -10,13 +10,28 @@ import pytest
 
 from btc_futures_bot import audit_email
 from btc_futures_bot import main as main_module
+from btc_futures_bot.http_client import redact_url_credentials
 
 
-_REPORT = """BTC 整点巡检报告
-行情分析：1h 下降趋势放缓，最近空单入场偏迟。
-策略修改：无，当前样本不足。
-调试链接：https://example.invalid/order?signature=report-signature-secret
-"""
+_REPORT = """巡检时间与覆盖窗口：2026-09-04 00:00–01:00（Asia/Shanghai）
+Git：main 与 origin/main 同步，工作区干净
+页面服务：HTTP 200，页面正常
+交易引擎：running=true，last_error 为空
+交易所连接：公私链路正常；调试：https://example.invalid/order?signature=report-signature-secret
+仓位与挂单：无仓位，无挂单
+新增平仓交易：0 笔，本窗口无新增样本
+K线环境（1m/5m/1h/4h）：1h 下降趋势放缓，各周期数据完整
+多单入场质量：未出现合格形态
+空单入场质量：最近空单入场偏迟，继续观察
+手续费后期望：无新样本，不调整期望估计
+MFE/MAE、退出原因与回撤：无新交易，各项指标不变
+本轮结论：保持当前策略
+策略/代码/配置修改：无修改，当前样本不足
+测试结果：无修改，无需运行代码测试
+重启与验证：无需重启，引擎正常
+提交与推送：无提交，无需推送
+失败与用户处理：无失败，无需用户处理
+""".strip()
 _SMTP_PASSWORD = "smtp-password-must-not-leak"
 _API_SECRET = "exchange-api-secret-must-not-leak"
 
@@ -183,6 +198,51 @@ def test_stdin_report_is_decoded_as_utf8_in_a_child_process() -> None:
     assert completed.stdout.decode("utf-8") == report
 
 
+def test_validate_only_checks_report_without_loading_config_or_sending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    report_path = tmp_path / "complete-report.md"
+    report_path.write_text(_REPORT, encoding="utf-8")
+    harness = _Harness(monkeypatch, tmp_path)
+
+    result = audit_email.main(
+        [*_arguments(harness, report_path), "--validate-only"]
+    )
+
+    assert result == 0
+    assert harness.events == []
+    assert harness.send_calls == []
+    assert harness.closed == 0
+    assert "巡检报告校验通过" in _combined_output(capsys)
+
+
+def test_main_rejects_incomplete_draft_before_loading_config_or_sending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    report_path = tmp_path / "draft-report.md"
+    report_path.write_text(
+        "BTC 自动交易整点巡检报告\n"
+        "巡检批次：hourly-20260904T010000+0800\n"
+        "... wait wrong?\n",
+        encoding="utf-8",
+    )
+    harness = _Harness(monkeypatch, tmp_path)
+
+    result = audit_email.main(_arguments(harness, report_path))
+
+    assert result != 0
+    assert harness.events == []
+    assert harness.send_calls == []
+    assert harness.closed == 0
+    output = _combined_output(capsys)
+    assert "阶段：校验报告" in output
+    assert "wait wrong" not in output
+
+
 @pytest.mark.parametrize("status", ["no_change", "changed", "failed"])
 def test_main_reads_utf8_report_loads_config_and_sends_it(
     tmp_path: Path,
@@ -214,7 +274,7 @@ def test_main_reads_utf8_report_loads_config_and_sends_it(
     assert Path(config_event[2]["default_state_path"]) == expected_state
     assert len(harness.send_calls) == 1
     sent_report, sent_status, sent_run_id, timeout = harness.send_calls[0]
-    assert sent_report == _REPORT
+    assert sent_report == redact_url_credentials(_REPORT)
     assert sent_status == status
     assert sent_run_id == run_id
     assert timeout >= harness.email_config.timeout_seconds

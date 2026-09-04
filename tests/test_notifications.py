@@ -20,6 +20,27 @@ from btc_futures_bot.risk import RiskManager
 from btc_futures_bot.strategy import StrategyConfig
 
 
+_VALID_INSPECTION_REPORT = """巡检时间与覆盖窗口：2026-09-04 12:00–13:00（Asia/Shanghai）
+Git：main 与 origin/main 同步，工作区干净
+页面服务：HTTP 200，页面正常
+交易引擎：running=true，last_error 为空
+交易所连接：Binance 公私链路正常；行情：https://example.test/kline?api_key=visible&signature=hidden
+仓位与挂单：无仓位，无挂单
+新增平仓交易：0 笔，本窗口无新增样本
+K线环境（1m/5m/1h/4h）：各周期数据完整，大周期偏多
+多单入场质量：未出现同时满足形态与量能的入场
+空单入场质量：趋势否决有效，不宜逆势追空
+手续费后期望：无合格信号，不计算新的实盘期望
+MFE/MAE、退出原因与回撤：无新交易，MFE/MAE 和退出原因不适用，回撤不变
+本轮结论：保持当前策略
+策略/代码/配置修改：无修改，样本不足以支持调参
+测试结果：本轮无修改，无需运行代码测试
+重启与验证：无需重启，引擎持续正常
+提交与推送：无提交，无需推送
+失败与用户处理：无失败，无需用户处理
+""".strip()
+
+
 def _email_config(tmp_path: Path) -> EmailNotificationConfig:
     return EmailNotificationConfig(
         enabled=True,
@@ -368,10 +389,18 @@ def test_strategy_inspection_report_confirms_its_own_delivery(tmp_path: Path) ->
         now_fn=lambda: now,
     )
 
+    report = "\n".join(
+        (
+            "BTC 自动交易策略整点巡检报告",
+            "巡检批次：2026-09-04T13:00:00+08:00",
+            "完成时间：2026-09-04 13:07:08 CST",
+            "执行结果：本次巡检完成，策略保持不变",
+            "",
+            _VALID_INSPECTION_REPORT,
+        )
+    )
     assert notifier.send_strategy_inspection_report(
-        "执行情况：服务正常\n策略分析：本小时没有新增平仓交易\n"
-        "行情：https://example.test/kline?api_key=visible&signature=hidden\n"
-        "策略修改：无修改；样本不足。\n验证结果：无需重启。",
+        report,
         status="no_change",
         run_id="2026-09-04T13:00:00+08:00",
         timeout=1,
@@ -381,14 +410,103 @@ def test_strategy_inspection_report_confirms_its_own_delivery(tmp_path: Path) ->
     assert len(messages) == 1
     assert messages[0]["Subject"] == "【整点巡检】无策略修改｜2026-09-04 13:00"
     content = messages[0].get_content()
+    assert content.count("BTC 自动交易策略整点巡检报告") == 1
+    assert content.count("巡检批次：") == 1
     assert "巡检批次：2026-09-04T13:00:00+08:00" in content
-    assert "执行情况：服务正常" in content
-    assert "策略分析：本小时没有新增平仓交易" in content
-    assert "策略修改：无修改；样本不足" in content
+    assert "巡检时间与覆盖窗口：" in content
+    assert "策略/代码/配置修改：无修改" in content
     assert "api_key=[REDACTED]" in content
     assert "signature=[REDACTED]" in content
     assert "visible" not in content
     assert "hidden" not in content
+
+
+def test_strategy_inspection_report_rejects_the_accidental_draft(
+    tmp_path: Path,
+) -> None:
+    messages = []
+    notifier = EmailNotifier(_email_config(tmp_path), send_fn=messages.append)
+    report = "\n".join(
+        (
+            "BTC 自动交易整点巡检报告",
+            "巡检批次：2026-09-04T17:00:00+08:00",
+            "巡检执行时间：2026-09-04 17:01–17:09（Asia/Shanghai）",
+            "... wait wrong?",
+        )
+    )
+
+    try:
+        notifier.send_strategy_inspection_report(
+            report,
+            status="no_change",
+            run_id="2026-09-04T17:00:00+08:00",
+            timeout=1,
+        )
+    except ValueError as error:
+        assert "草稿占位" in str(error)
+    else:
+        raise AssertionError("an unfinished draft must be rejected before delivery")
+    finally:
+        notifier.close()
+
+    assert messages == []
+
+
+def test_strategy_inspection_report_requires_every_contract_field(
+    tmp_path: Path,
+) -> None:
+    messages = []
+    notifier = EmailNotifier(_email_config(tmp_path), send_fn=messages.append)
+    incomplete = _VALID_INSPECTION_REPORT.replace(
+        "测试结果：本轮无修改，无需运行代码测试\n",
+        "",
+    )
+
+    try:
+        notifier.send_strategy_inspection_report(
+            incomplete,
+            status="no_change",
+            run_id="2026-09-04T17:00:00+08:00",
+            timeout=1,
+        )
+    except ValueError as error:
+        assert "测试结果" in str(error)
+    else:
+        raise AssertionError("a report with a missing contract field must be rejected")
+    finally:
+        notifier.close()
+
+    assert messages == []
+
+
+def test_strategy_inspection_report_rejects_a_mismatched_embedded_run_id(
+    tmp_path: Path,
+) -> None:
+    messages = []
+    notifier = EmailNotifier(_email_config(tmp_path), send_fn=messages.append)
+    report = "\n".join(
+        (
+            "BTC 自动交易策略整点巡检报告",
+            "巡检批次：2026-09-04T16:00:00+08:00",
+            _VALID_INSPECTION_REPORT,
+        )
+    )
+
+    try:
+        notifier.send_strategy_inspection_report(
+            report,
+            status="no_change",
+            run_id="2026-09-04T17:00:00+08:00",
+            timeout=1,
+        )
+    except ValueError as error:
+        assert "批次与 run_id 不一致" in str(error)
+    else:
+        raise AssertionError("a stale embedded run id must be rejected")
+    finally:
+        notifier.close()
+
+    assert messages == []
 
 
 def test_strategy_inspection_report_surfaces_smtp_failure(
@@ -403,7 +521,7 @@ def test_strategy_inspection_report_surfaces_smtp_failure(
     notifier = EmailNotifier(_email_config(tmp_path), send_fn=fail_send)
     try:
         notifier.send_strategy_inspection_report(
-            "执行情况：巡检完成\n策略分析：无\n策略修改：无",
+            _VALID_INSPECTION_REPORT,
             status="failed",
             run_id="2026-09-04T14:00:00+08:00",
             timeout=1,
@@ -428,7 +546,7 @@ def test_strategy_inspection_report_times_out_per_message(tmp_path: Path) -> Non
     notifier = EmailNotifier(_email_config(tmp_path), send_fn=blocked_send)
     try:
         notifier.send_strategy_inspection_report(
-            "执行情况：巡检完成\n策略分析：无\n策略修改：无",
+            _VALID_INSPECTION_REPORT,
             status="no_change",
             run_id="2026-09-04T15:00:00+08:00",
             timeout=0.01,
@@ -454,7 +572,7 @@ def test_strategy_inspection_report_rejects_partial_recipient_delivery(
     notifier = EmailNotifier(_email_config(tmp_path), send_fn=partially_rejected)
     try:
         notifier.send_strategy_inspection_report(
-            "执行情况：巡检完成\n策略分析：无\n策略修改：无",
+            _VALID_INSPECTION_REPORT,
             status="no_change",
             run_id="2026-09-04T16:00:00+08:00",
             timeout=1,

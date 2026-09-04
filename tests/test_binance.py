@@ -130,8 +130,8 @@ def test_binance_live_preflight_resumes_only_matching_bot_protected_position(mon
             "side": "short",
             "quantity": 0.001,
             "entry_price": 77_852.6,
-            "stop_price": 78_203.0,
-            "initial_stop_price": 78_203.0,
+            "stop_price": 78_203.06405,
+            "initial_stop_price": 78_203.06405,
             "stop_order_id": stop_id,
             "stop_client_id": stop_client_id,
         }
@@ -158,7 +158,7 @@ def test_binance_live_preflight_resumes_only_matching_bot_protected_position(mon
                 "positionSide": "BOTH",
                 "workingType": "MARK_PRICE",
                 "closePosition": True,
-                "triggerPrice": "78203.0",
+                "triggerPrice": "78203.1",
                 "algoStatus": "NEW",
             }
         ],
@@ -173,6 +173,63 @@ def test_binance_live_preflight_resumes_only_matching_bot_protected_position(mon
 
     managed["position"]["stop_client_id"] = "manual-stop"
     with pytest.raises(RuntimeError, match="not bot-owned"):
+        adapter.prepare_live(max_leverage=20, managed_position=managed)
+
+    managed["position"]["stop_client_id"] = stop_client_id
+    managed["position"]["initial_stop_price"] = 78_203.16405
+    with pytest.raises(RuntimeError, match="unexpected trigger price"):
+        adapter.prepare_live(max_leverage=20, managed_position=managed)
+
+
+def test_binance_live_resume_normalizes_long_stop_without_widening_tolerance(monkeypatch) -> None:
+    adapter = _adapter()
+    adapter._private_stream = None
+    _set_symbol_rules(adapter)
+    monkeypatch.setenv("TEST_BINANCE_KEY", "configured")
+    monkeypatch.setenv("TEST_BINANCE_SECRET", "configured")
+    managed = {
+        "position": {
+            "side": "long",
+            "quantity": 0.001,
+            "entry_price": 81_119.1,
+            "stop_price": 80_754.06405,
+            "initial_stop_price": 80_754.06405,
+            "stop_order_id": "2000001408477909",
+            "stop_client_id": "btcbot-stop-resume-long",
+        }
+    }
+    stop = {
+        "algoId": "2000001408477909",
+        "clientAlgoId": "btcbot-stop-resume-long",
+        "symbol": "BTCUSDT",
+        "algoType": "CONDITIONAL",
+        "orderType": "STOP_MARKET",
+        "side": "SELL",
+        "positionSide": "BOTH",
+        "workingType": "MARK_PRICE",
+        "closePosition": True,
+        "triggerPrice": "80754.0",
+        "algoStatus": "NEW",
+    }
+    private = {
+        "positions": [
+            {
+                "symbol": "BTCUSDT",
+                "positionSide": "BOTH",
+                "positionAmt": "0.001",
+                "entryPrice": "81119.1",
+                "leverage": "20",
+            }
+        ],
+        "orders": [],
+        "algo_orders": [stop],
+    }
+    monkeypatch.setattr(adapter, "_private_snapshot", lambda **_kwargs: private)
+
+    assert adapter.prepare_live(max_leverage=20, managed_position=managed)["resumed"] is True
+
+    stop["triggerPrice"] = "80754.1"
+    with pytest.raises(RuntimeError, match="unexpected trigger price"):
         adapter.prepare_live(max_leverage=20, managed_position=managed)
 
 

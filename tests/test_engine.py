@@ -5,6 +5,8 @@ import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from btc_futures_bot.engine import EngineConfig, TradingEngine
 from btc_futures_bot.costs import CostConfig
 from btc_futures_bot.http_client import ApiError
@@ -671,6 +673,130 @@ def test_binance_managed_position_is_restored_after_safe_restart(tmp_path) -> No
     engine.close()
     saved = json.loads(state_path.read_text(encoding="utf-8"))
     assert saved["managed_position"]["position"]["stop_order_id"] == "20"
+
+
+def test_failed_live_preflight_does_not_erase_saved_managed_position(tmp_path) -> None:
+    state_path = tmp_path / "live_reconciliation_state.json"
+    managed = {
+        "exchange": "binance",
+        "symbol": "BTCUSDT",
+        "environment": "production",
+        "position": {
+            "side": "long",
+            "quantity": 0.001,
+            "entry_price": 81_119.1,
+            "stop_price": 80_754.06405,
+            "take_profit_price": 82_031.69,
+            "opened_at": 1_788_513_122_845,
+            "initial_stop_price": 80_754.06405,
+            "best_price": 81_119.1,
+            "stop_reason": "stop_loss",
+            "worst_price": 81_119.1,
+            "entry_order_id": "10",
+            "entry_client_id": "btcbot-entry-test",
+            "stop_order_id": "20",
+            "stop_client_id": "btcbot-stop-test",
+            "take_profit_order_id": "",
+            "take_profit_client_id": "",
+        },
+        "signal": None,
+        "position_equity_before": 25.0,
+        "last_position_candle_timestamp": 1_788_513_120_000,
+    }
+    state_path.write_text(
+        json.dumps({"unmanaged_position": None, "managed_position": managed}),
+        encoding="utf-8",
+    )
+
+    class Adapter:
+        name = "binance"
+        settings = SimpleNamespace(symbol="BTCUSDT", environment="production")
+
+        @staticmethod
+        def prepare_live(*, max_leverage: float, managed_position: dict | None = None):
+            assert max_leverage == 3
+            assert managed_position == managed
+            raise RuntimeError("preflight rejected")
+
+        @staticmethod
+        def close() -> None:
+            return None
+
+    engine = TradingEngine(
+        Adapter(),
+        MultiTimeframeStrategy(StrategyConfig()),
+        RiskManager(),
+        EngineConfig(mode="live", reconciliation_state_path=str(state_path)),
+    )
+
+    with pytest.raises(RuntimeError, match="preflight rejected"):
+        engine.prepare_live()
+    engine.close()
+
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved["managed_position"] == managed
+
+
+def test_failed_managed_position_restore_does_not_erase_saved_state(tmp_path) -> None:
+    state_path = tmp_path / "live_reconciliation_state.json"
+    managed = {
+        "exchange": "binance",
+        "symbol": "BTCUSDT",
+        "environment": "production",
+        "position": {
+            "side": "long",
+            "quantity": 0.001,
+            "entry_price": 81_119.1,
+            "stop_price": 80_754.06405,
+            "take_profit_price": 82_031.689875,
+            "opened_at": 1_788_513_092_000,
+            "initial_stop_price": 80_754.06405,
+            "best_price": 81_119.1,
+            "stop_reason": "stop_loss",
+            "worst_price": 81_119.1,
+            "entry_order_id": "10",
+            "entry_client_id": "btcbot-entry-test",
+            "stop_order_id": "20",
+            "stop_client_id": "btcbot-stop-test",
+            "take_profit_order_id": "",
+            "take_profit_client_id": "",
+        },
+        "signal": {"side": "long", "score": "invalid", "timestamp": 1},
+        "position_equity_before": 25.0,
+        "last_position_candle_timestamp": 0,
+    }
+    state_path.write_text(
+        json.dumps({"unmanaged_position": None, "managed_position": managed}),
+        encoding="utf-8",
+    )
+
+    class Adapter:
+        name = "binance"
+        settings = SimpleNamespace(symbol="BTCUSDT", environment="production")
+
+        @staticmethod
+        def prepare_live(*, max_leverage: float, managed_position: dict | None = None):
+            assert managed_position == managed
+            return {"prepared": True, "resumed": True, "flat": False}
+
+        @staticmethod
+        def close() -> None:
+            return None
+
+    engine = TradingEngine(
+        Adapter(),
+        MultiTimeframeStrategy(StrategyConfig()),
+        RiskManager(),
+        EngineConfig(mode="live", reconciliation_state_path=str(state_path)),
+    )
+
+    with pytest.raises(RuntimeError, match="saved managed position is invalid"):
+        engine.prepare_live()
+    assert engine.position is not None
+    engine.close()
+
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved["managed_position"] == managed
 
 
 def test_live_entry_rolls_back_when_stop_is_not_confirmed() -> None:

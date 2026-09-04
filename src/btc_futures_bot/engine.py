@@ -81,6 +81,10 @@ class TradingEngine:
         self.notifier = notifier
         self._close_notifier = bool(close_notifier)
         self.live_preflight: dict[str, Any] = {}
+        # A loaded managed position must survive a failed startup preflight.
+        # Once prepare_live completes, normal saves may clear it after a real
+        # close or replace it with the restored in-memory position.
+        self._live_preflight_completed = False
         self.unmanaged_live_position = self._load_unmanaged_live_position()
         self._managed_live_position_state = self._load_managed_live_position()
         self._last_live_reconciliation_at = 0.0
@@ -111,6 +115,7 @@ class TradingEngine:
             # historical and must not be eligible for a later restart.
             self._managed_live_position_state = None
             self._save_live_reconciliation_state()
+        self._live_preflight_completed = True
         return self.live_preflight
 
     def _restore_managed_live_position(self) -> None:
@@ -2111,7 +2116,13 @@ class TradingEngine:
                 LOG.exception("close email notification failed; position remains closed")
 
     def close(self) -> None:
-        self._save_live_reconciliation_state()
+        preserve_failed_preflight_state = (
+            self.config.mode == "live"
+            and self._managed_live_position_state is not None
+            and not self._live_preflight_completed
+        )
+        if not preserve_failed_preflight_state:
+            self._save_live_reconciliation_state()
         close_adapter = getattr(self.adapter, "close", None)
         if close_adapter is not None:
             close_adapter()

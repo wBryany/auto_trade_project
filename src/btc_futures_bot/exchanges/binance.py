@@ -643,12 +643,19 @@ class BinanceAdapter(ExchangeAdapter):
         stop = algo_orders[0]
         if str(stop.get("algoId") or "") != stop_order_id:
             raise RuntimeError("Binance live resume refused: saved hard-stop id does not match exchange")
+        exit_side = "SELL" if remote_side == "long" else "BUY"
+        # ``Position.initial_stop_price`` keeps the strategy's unrounded risk
+        # level, while Binance stores the submitted trigger at symbol tick
+        # precision. Compare against the exact price that would have been
+        # submitted; widening the tolerance could accept a genuinely different
+        # protection order.
+        normalized_stop_price = self.normalize_trigger_price(stop_price, exit_side)
         self._validate_open_algo_order(
             stop,
             client_id=stop_client_id,
             order_type="STOP_MARKET",
-            exit_side="SELL" if remote_side == "long" else "BUY",
-            trigger_price=stop_price,
+            exit_side=exit_side,
+            trigger_price=normalized_stop_price,
         )
         return {
             "exchange": "binance",

@@ -5,7 +5,11 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .notifications import EmailNotificationConfig, EmailNotifier
+from .notifications import (
+    EmailNotificationConfig,
+    EmailNotifier,
+    prepare_strategy_inspection_report,
+)
 
 
 _MAX_REPORT_BYTES = 64 * 1024
@@ -76,11 +80,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="本次巡检结果",
     )
     parser.add_argument("--run-id", required=True, help="本次巡检的唯一批次标识")
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="仅校验报告完整性，不加载邮件配置也不发送",
+    )
     args = parser.parse_args(argv)
 
     notifier: EmailNotifier | None = None
-    stage = "加载配置"
+    stage = "读取报告"
     try:
+        report = _read_report(args.report_file)
+        stage = "校验报告"
+        report = prepare_strategy_inspection_report(report, run_id=args.run_id)
+        if args.validate_only:
+            print("巡检报告校验通过")
+            return 0
+
+        stage = "加载配置"
         load_runtime_dotenv(args.config)
         config = load_config(args.config)
         exchange = _active_exchange(config)
@@ -95,8 +112,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise RuntimeError("邮件通知未启用")
         if not notifier.ready:
             raise RuntimeError("邮件通知配置不完整")
-        stage = "读取报告"
-        report = _read_report(args.report_file)
         stage = "投递邮件"
         delivered = notifier.send_strategy_inspection_report(
             report,
