@@ -471,6 +471,126 @@ def test_binance_aggregates_recent_position_close_fills(monkeypatch) -> None:
     assert fill["commission_assets"] == ["USDT"]
 
 
+def test_binance_aggregates_exact_managed_entry_fills(monkeypatch) -> None:
+    adapter = _adapter()
+    rows = [
+        {
+            "orderId": 77,
+            "side": "BUY",
+            "qty": "0.001",
+            "quoteQty": "79.0",
+            "price": "79000",
+            "commission": "0.0158",
+            "commissionAsset": "USDT",
+            "time": 1_788_525_001_000,
+        },
+        {
+            "orderId": 78,
+            "side": "SELL",
+            "qty": "0.001",
+            "quoteQty": "80.0",
+            "price": "80000",
+            "commission": "0.0160",
+            "commissionAsset": "USDT",
+            "time": 1_788_525_001_500,
+        },
+        {
+            "orderId": 77,
+            "side": "BUY",
+            "qty": "0.002",
+            "quoteQty": "158.4",
+            "price": "79200",
+            "commission": "0.03168",
+            "commissionAsset": "USDT",
+            "time": 1_788_525_002_000,
+        },
+    ]
+
+    def signed(method: str, path: str, params: dict | None = None) -> list[dict]:
+        assert method == "GET"
+        assert path == "/fapi/v1/userTrades"
+        assert params == {"symbol": "BTCUSDT", "orderId": "77", "limit": 1000}
+        return rows
+
+    monkeypatch.setattr(adapter, "_signed", signed)
+    fill = adapter.fetch_entry_fill(
+        Position(
+            "long",
+            0.003,
+            79_133.0,
+            78_000.0,
+            82_000.0,
+            1_788_525_000_000,
+            entry_order_id="77",
+        )
+    )
+
+    assert fill is not None
+    assert fill["side"] == "BUY"
+    assert fill["quantity"] == pytest.approx(0.003)
+    assert fill["price"] == pytest.approx((79.0 + 158.4) / 0.003)
+    assert fill["timestamp"] == 1_788_525_001_000
+    assert fill["commission"] == pytest.approx(0.04748)
+    assert fill["commission_assets"] == ["USDT"]
+
+
+@pytest.mark.parametrize(
+    ("row", "message"),
+    [
+        (
+            {"orderId": 77, "side": "SELL", "qty": "0.003", "price": "79000", "time": 1},
+            "side",
+        ),
+        (
+            {"orderId": 77, "side": "BUY", "qty": "0.002", "price": "79000", "time": 1},
+            "full managed position quantity",
+        ),
+    ],
+)
+def test_binance_rejects_invalid_managed_entry_fills(monkeypatch, row, message) -> None:
+    adapter = _adapter()
+    monkeypatch.setattr(adapter, "_signed", lambda *args, **kwargs: [row])
+    position = Position(
+        "long",
+        0.003,
+        79_000.0,
+        78_000.0,
+        82_000.0,
+        1,
+        entry_order_id="77",
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        adapter.fetch_entry_fill(position)
+
+
+def test_binance_does_not_invent_zero_when_entry_commission_is_missing(monkeypatch) -> None:
+    adapter = _adapter()
+    monkeypatch.setattr(
+        adapter,
+        "_signed",
+        lambda *args, **kwargs: [
+            {
+                "orderId": 77,
+                "side": "BUY",
+                "qty": "0.003",
+                "quoteQty": "237",
+                "price": "79000",
+                "commissionAsset": "USDT",
+                "time": 1_788_525_001_000,
+            }
+        ],
+    )
+
+    fill = adapter.fetch_entry_fill(
+        Position("long", 0.003, 79_000.0, 78_000.0, 82_000.0, 1, entry_order_id="77")
+    )
+
+    assert fill is not None
+    assert fill["commission_assets"] == ["USDT"]
+    assert fill["commission"] is None
+
+
 def test_binance_protection_uses_only_server_side_stop(monkeypatch) -> None:
     adapter = _adapter()
     _set_symbol_rules(adapter)

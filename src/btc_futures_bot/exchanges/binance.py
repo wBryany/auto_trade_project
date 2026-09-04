@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import math
 import threading
 import time
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
@@ -954,6 +955,75 @@ class BinanceAdapter(ExchangeAdapter):
             "commission_assets": commission_assets,
             "timestamp": max(int(row.get("time") or 0) for row in selected),
             "order_ids": [order_id for order_id in order_ids if order_id],
+            "source": "Binance /fapi/v1/userTrades",
+        }
+
+    def fetch_entry_fill(self, position: Position) -> dict[str, Any] | None:
+        """Aggregate the exact Binance fills for one managed entry order."""
+        order_id = str(position.entry_order_id or "").strip()
+        if not order_id:
+            raise RuntimeError("Binance managed entry has no exchange order id")
+        rows = self._signed(
+            "GET",
+            "/fapi/v1/userTrades",
+            {
+                "symbol": self.settings.symbol,
+                "orderId": order_id,
+                "limit": 1000,
+            },
+        )
+        if not isinstance(rows, list):
+            raise RuntimeError("Binance entry user-trades response is not a list")
+        selected = [
+            row for row in rows if str(row.get("orderId") or "") == order_id
+        ]
+        if not selected:
+            return None
+
+        expected_side = "BUY" if position.side == "long" else "SELL"
+        sides = {str(row.get("side") or "").upper() for row in selected}
+        if sides != {expected_side}:
+            raise RuntimeError(
+                "Binance entry fills do not match the managed position side"
+            )
+        quantity = sum(float(row.get("qty") or 0) for row in selected)
+        quantity_tolerance = max(1e-12, position.quantity * 1e-9)
+        if not math.isfinite(quantity) or abs(quantity - position.quantity) > quantity_tolerance:
+            raise RuntimeError(
+                "Binance entry fills do not cover the full managed position quantity"
+            )
+        quote_quantity = sum(
+            float(row.get("quoteQty") or 0)
+            or float(row.get("qty") or 0) * float(row.get("price") or 0)
+            for row in selected
+        )
+        timestamps = [int(row.get("time") or 0) for row in selected]
+        if not math.isfinite(quote_quantity) or quantity <= 0 or quote_quantity <= 0:
+            raise RuntimeError("Binance entry fills have no valid weighted price")
+        if not timestamps or min(timestamps) <= 0:
+            raise RuntimeError("Binance entry fills have no valid timestamp")
+        commission_assets = sorted(
+            {
+                str(row.get("commissionAsset") or "").strip().upper()
+                for row in selected
+                if row.get("commissionAsset")
+            }
+        )
+        commission = (
+            sum(float(row["commission"]) for row in selected)
+            if all(row.get("commission") is not None for row in selected)
+            else None
+        )
+        if commission is not None and not math.isfinite(commission):
+            raise RuntimeError("Binance entry fills have invalid commission metadata")
+        return {
+            "side": expected_side,
+            "quantity": quantity,
+            "price": quote_quantity / quantity,
+            "timestamp": min(timestamps),
+            "commission": commission,
+            "commission_assets": commission_assets,
+            "order_id": order_id,
             "source": "Binance /fapi/v1/userTrades",
         }
 

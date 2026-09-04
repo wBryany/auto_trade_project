@@ -5,7 +5,7 @@ import os
 import sqlite3
 import threading
 import uuid
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -151,6 +151,8 @@ class TradeRecord:
             position.quantity,
             holding_hours=holding_hours,
         )
+        if position.entry_fee is not None and position.entry_fee_asset.upper() == "USDT":
+            breakdown = replace(breakdown, entry_fee=float(position.entry_fee))
         net_pnl = gross_pnl - breakdown.total_cost
         return cls(
             trade_id=uuid.uuid4().hex,

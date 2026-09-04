@@ -675,6 +675,255 @@ def test_binance_managed_position_is_restored_after_safe_restart(tmp_path) -> No
     assert saved["managed_position"]["position"]["stop_order_id"] == "20"
 
 
+def test_live_entry_reconciles_only_after_protected_state_is_saved(tmp_path) -> None:
+    state_path = tmp_path / "live_reconciliation_state.json"
+    fill_timestamp = 1_788_525_001_234
+
+    class Adapter:
+        name = "binance"
+        settings = SimpleNamespace(symbol="BTCUSDT", environment="production")
+
+        def __init__(self) -> None:
+            self.events: list[str] = []
+            self.requested_quantity = 0.0
+
+        @staticmethod
+        def fetch_candles(interval: str, limit: int) -> list[Candle]:
+            return [
+                Candle(1, 100.0, 100.1, 99.9, 100.0, 10.0),
+                Candle(2, 100.0, 100.1, 99.9, 100.0, 1.0),
+            ]
+
+        @staticmethod
+        def fetch_live_position() -> None:
+            return None
+
+        @staticmethod
+        def fetch_equity() -> float:
+            return 10_000.0
+
+        @staticmethod
+        def normalize_order_quantity(quantity: float, reference_price: float) -> float:
+            return quantity
+
+        def place_market_order(self, request: object) -> dict:
+            self.events.append("entry")
+            self.requested_quantity = float(request.quantity)
+            return {
+                "orderId": 11,
+                "status": "FILLED",
+                "executedQty": str(self.requested_quantity),
+                "avgPrice": "100",
+            }
+
+        @staticmethod
+        def market_fill(payload: dict, *, fallback_price: float) -> tuple[float, float]:
+            return float(payload["executedQty"]), float(payload["avgPrice"])
+
+        def place_protection_orders(self, position: Position, **kwargs: object) -> dict:
+            self.events.append("protection")
+            return {"stop": {"algoId": 21}, "take_profit": None, "confirmed": True}
+
+        def fetch_entry_fill(self, position: Position) -> dict:
+            self.events.append("entry_fill")
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            persisted = saved["managed_position"]["position"]
+            assert persisted["entry_order_id"] == "11"
+            assert persisted["stop_order_id"] == "21"
+            assert persisted["entry_price"] == 100.0
+            return {
+                "side": "BUY",
+                "quantity": position.quantity,
+                "price": 100.25,
+                "timestamp": fill_timestamp,
+                "commission": 0.0,
+                "commission_assets": ["USDT"],
+            }
+
+    class Strategy:
+        config = StrategyConfig(trigger_timeframe="5m", regime_timeframe="1h")
+
+        @staticmethod
+        def evaluate(candles_by_timeframe: object) -> Signal:
+            return Signal("long", 6, 1, ("fixed",))
+
+    class Notifier:
+        def __init__(self) -> None:
+            self.opened: list[Position] = []
+
+        def notify_open(self, position: Position, *args: object, **kwargs: object) -> None:
+            self.opened.append(position)
+
+    adapter = Adapter()
+    notifier = Notifier()
+    engine = TradingEngine(
+        adapter,
+        Strategy(),
+        RiskManager(RiskConfig(stop_loss_pct=0.005)),
+        EngineConfig(mode="live", reconciliation_state_path=str(state_path)),
+        notifier=notifier,
+    )
+
+    result = engine.evaluate_once()
+
+    assert result.status == "live_order_protected"
+    assert adapter.events == ["entry", "protection", "entry_fill"]
+    assert result.position is not None
+    assert result.position.entry_price == 100.25
+    assert result.position.opened_at == fill_timestamp
+    assert result.position.entry_fee == 0.0
+    assert result.position.entry_fee_asset == "USDT"
+    assert notifier.opened == [result.position]
+    saved_position = json.loads(state_path.read_text(encoding="utf-8"))["managed_position"]["position"]
+    assert saved_position["opened_at"] == fill_timestamp
+    assert saved_position["entry_fee"] == 0.0
+
+
+def test_restart_entry_fill_failure_keeps_restored_protected_position_and_alerts(tmp_path) -> None:
+    lookup_error = RuntimeError("entry trades are temporarily unavailable")
+    state_path = tmp_path / "live_reconciliation_state.json"
+    managed = {
+        "exchange": "binance",
+        "symbol": "BTCUSDT",
+        "environment": "production",
+        "position": {
+            "side": "long",
+            "quantity": 0.001,
+            "entry_price": 79_000.0,
+            "stop_price": 78_600.0,
+            "take_profit_price": 80_000.0,
+            "opened_at": 1_788_525_000_000,
+            "entry_order_id": "77",
+            "stop_order_id": "88",
+            "stop_client_id": "btcbot-stop-test",
+        },
+        "signal": None,
+        "position_equity_before": 25.0,
+        "last_position_candle_timestamp": 1_788_524_980_000,
+    }
+    state_path.write_text(
+        json.dumps({"unmanaged_position": None, "managed_position": managed}),
+        encoding="utf-8",
+    )
+
+    class Adapter:
+        name = "binance"
+        settings = SimpleNamespace(symbol="BTCUSDT", environment="production")
+
+        @staticmethod
+        def prepare_live(*, max_leverage: float, managed_position: dict | None = None) -> dict:
+            assert managed_position == managed
+            return {"prepared": True, "resumed": True, "flat": False}
+
+        @staticmethod
+        def fetch_entry_fill(position: Position) -> dict:
+            raise lookup_error
+
+        @staticmethod
+        def emergency_close(*args: object, **kwargs: object) -> None:
+            raise AssertionError("entry reconciliation must not close exposure")
+
+        @staticmethod
+        def cancel_protection_orders(*args: object, **kwargs: object) -> None:
+            raise AssertionError("entry reconciliation must not cancel protection")
+
+    notifier = _EmergencyNotifier()
+    engine = TradingEngine(
+        Adapter(),
+        _FixedLongSignalStrategy(),
+        RiskManager(),
+        EngineConfig(mode="live", reconciliation_state_path=str(state_path)),
+        notifier=notifier,
+    )
+
+    preflight = engine.prepare_live()
+
+    assert preflight["resumed"] is True
+    assert engine.position is not None
+    assert engine.position.opened_at == managed["position"]["opened_at"]
+    assert engine.position.stop_order_id == "88"
+    assert engine.position.entry_fee is None
+    assert len(notifier.emergencies) == 1
+    assert notifier.emergencies[0]["error"] is lookup_error
+    assert notifier.emergencies[0]["category"] == "order_failure"
+    assert notifier.emergencies[0]["incident"] == "managed_entry_fill:77"
+    saved_position = json.loads(state_path.read_text(encoding="utf-8"))["managed_position"]["position"]
+    assert saved_position["opened_at"] == managed["position"]["opened_at"]
+    assert saved_position["stop_order_id"] == "88"
+
+
+def test_safe_restart_backfills_exact_entry_metadata_after_restore(tmp_path) -> None:
+    state_path = tmp_path / "live_reconciliation_state.json"
+    original_opened_at = 1_788_525_000_000
+    exact_opened_at = 1_788_525_001_234
+    managed = {
+        "exchange": "binance",
+        "symbol": "BTCUSDT",
+        "environment": "production",
+        "position": {
+            "side": "short",
+            "quantity": 0.001,
+            "entry_price": 79_000.0,
+            "stop_price": 79_500.0,
+            "take_profit_price": 78_000.0,
+            "opened_at": original_opened_at,
+            "entry_order_id": "77",
+            "entry_client_id": "btcbot-entry-test",
+            "stop_order_id": "88",
+            "stop_client_id": "btcbot-stop-test",
+        },
+        "signal": None,
+        "position_equity_before": 25.0,
+        "last_position_candle_timestamp": 1_788_524_980_000,
+    }
+    state_path.write_text(
+        json.dumps({"unmanaged_position": None, "managed_position": managed}),
+        encoding="utf-8",
+    )
+
+    class Adapter:
+        name = "binance"
+        settings = SimpleNamespace(symbol="BTCUSDT", environment="production")
+
+        @staticmethod
+        def prepare_live(*, max_leverage: float, managed_position: dict | None = None) -> dict:
+            assert managed_position == managed
+            return {"prepared": True, "resumed": True, "flat": False}
+
+        @staticmethod
+        def fetch_entry_fill(position: Position) -> dict:
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))["managed_position"]["position"]
+            assert persisted["opened_at"] == original_opened_at
+            assert persisted["stop_order_id"] == "88"
+            return {
+                "side": "SELL",
+                "quantity": position.quantity,
+                "price": 79_012.5,
+                "timestamp": exact_opened_at,
+                "commission": 0.031605,
+                "commission_assets": ["USDT"],
+            }
+
+    engine = TradingEngine(
+        Adapter(),
+        MultiTimeframeStrategy(StrategyConfig()),
+        RiskManager(),
+        EngineConfig(mode="live", reconciliation_state_path=str(state_path)),
+    )
+
+    preflight = engine.prepare_live()
+
+    assert preflight["resumed"] is True
+    assert engine.position is not None
+    assert engine.position.entry_price == 79_012.5
+    assert engine.position.opened_at == exact_opened_at
+    assert engine.position.entry_fee == pytest.approx(0.031605)
+    saved_position = json.loads(state_path.read_text(encoding="utf-8"))["managed_position"]["position"]
+    assert saved_position["entry_price"] == 79_012.5
+    assert saved_position["opened_at"] == exact_opened_at
+    assert saved_position["entry_fee_asset"] == "USDT"
+
+
 def test_failed_live_preflight_does_not_erase_saved_managed_position(tmp_path) -> None:
     state_path = tmp_path / "live_reconciliation_state.json"
     managed = {

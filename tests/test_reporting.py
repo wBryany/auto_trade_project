@@ -80,6 +80,75 @@ def test_report_uses_actual_holding_time_for_funding() -> None:
     assert record.holding_minutes == 486.0
 
 
+def test_report_uses_confirmed_usdt_entry_fee_including_zero() -> None:
+    costs = CostConfig(
+        taker_fee_pct=0.001,
+        slippage_pct=0.0,
+        funding_rate_pct_per_8h=0.0,
+    )
+    position = Position(
+        "long",
+        1.0,
+        100.0,
+        95.0,
+        110.0,
+        1_763_200_000_000,
+        entry_fee=0.0,
+        entry_fee_asset="USDT",
+    )
+
+    record = TradeRecord.from_position(
+        exchange="binance",
+        symbol="BTCUSDT",
+        mode="live",
+        position=position,
+        exit_price=101.0,
+        exit_time_ms=position.opened_at + 60_000,
+        exit_reason="trend_invalidation",
+        costs=costs,
+        equity_before=100.0,
+        environment="production",
+    )
+
+    assert record.entry_fee == 0.0
+    assert record.exit_fee == 0.101
+    assert record.trading_fee == 0.101
+
+
+def test_report_estimates_entry_fee_when_actual_commission_is_not_usdt() -> None:
+    costs = CostConfig(
+        taker_fee_pct=0.001,
+        slippage_pct=0.0,
+        funding_rate_pct_per_8h=0.0,
+    )
+    position = Position(
+        "long",
+        1.0,
+        100.0,
+        95.0,
+        110.0,
+        1_763_200_000_000,
+        entry_fee=2.5,
+        entry_fee_asset="BNB",
+    )
+
+    record = TradeRecord.from_position(
+        exchange="binance",
+        symbol="BTCUSDT",
+        mode="live",
+        position=position,
+        exit_price=101.0,
+        exit_time_ms=position.opened_at + 60_000,
+        exit_reason="trend_invalidation",
+        costs=costs,
+        equity_before=100.0,
+        environment="production",
+    )
+
+    assert record.entry_fee == 0.1
+    assert record.entry_fee != position.entry_fee
+
+
 def test_reporter_tracks_environment_and_filters_real_trades(tmp_path: Path) -> None:
     position = Position(
         "long",

@@ -144,6 +144,14 @@ class ExchangeAdapter(ABC):
         """
         return None
 
+    def fetch_entry_fill(self, position: Position) -> dict[str, Any] | None:
+        """Return exact fills for the managed position's entry order.
+
+        Adapters without private fill history can return ``None``. Live
+        engines call this only after exchange-side protection is confirmed.
+        """
+        return None
+
     def has_credentials(self) -> bool:
         if not self.settings.api_key_env or not self.settings.api_secret_env:
             return False

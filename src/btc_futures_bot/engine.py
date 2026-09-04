@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass, field, replace
@@ -109,7 +110,11 @@ class TradingEngine:
         self.resolve_emergency("engine_runtime", "start")
         if self.live_preflight.get("resumed"):
             self._restore_managed_live_position()
+            # Preserve the already verified, exchange-protected position before
+            # any optional history lookup. A failed reconciliation must never
+            # make a safe restart lose the local exposure record.
             self._save_live_reconciliation_state()
+            self._reconcile_managed_entry_fill()
         elif self._managed_live_position_state is not None:
             # The exchange is flat, so a previously saved managed position is
             # historical and must not be eligible for a later restart.
@@ -143,6 +148,12 @@ class TradingEngine:
                 stop_client_id=str(raw_position["stop_client_id"]),
                 take_profit_order_id=str(raw_position.get("take_profit_order_id") or ""),
                 take_profit_client_id=str(raw_position.get("take_profit_client_id") or ""),
+                entry_fee=(
+                    float(raw_position["entry_fee"])
+                    if raw_position.get("entry_fee") is not None
+                    else None
+                ),
+                entry_fee_asset=str(raw_position.get("entry_fee_asset") or ""),
             )
             raw_signal = state.get("signal") or {}
             self.position_signal = (
@@ -607,6 +618,8 @@ class TradingEngine:
                 )
                 self.position = position
                 self._save_live_reconciliation_state()
+                self._reconcile_managed_entry_fill()
+                position = self.position or position
                 self.resolve_emergency("order_failure", "entry_submit")
                 self.resolve_emergency("order_failure", "protection_submit")
                 status = "live_order_protected"
@@ -1128,6 +1141,8 @@ class TradingEngine:
                 "stop_client_id": position.stop_client_id,
                 "take_profit_order_id": position.take_profit_order_id,
                 "take_profit_client_id": position.take_profit_client_id,
+                "entry_fee": position.entry_fee,
+                "entry_fee_asset": position.entry_fee_asset,
             },
             "signal": (
                 {
@@ -1167,6 +1182,78 @@ class TradingEngine:
             # Persistence must never turn a confirmed, protected live entry
             # into an emergency close. The exchange hard stop remains active.
             LOG.exception("failed to persist live reconciliation state")
+
+    def _reconcile_managed_entry_fill(self) -> None:
+        """Backfill exact Binance entry metadata without touching exposure."""
+        position = self.position
+        if position is None or self.adapter.name != "binance":
+            return
+        fetch_entry_fill = getattr(self.adapter, "fetch_entry_fill", None)
+        if not callable(fetch_entry_fill):
+            return
+        incident = f"managed_entry_fill:{position.entry_order_id or 'missing'}"
+        try:
+            fill = fetch_entry_fill(position)
+            if not fill:
+                raise RuntimeError("Binance has not returned the complete managed entry fills")
+            expected_side = "BUY" if position.side == "long" else "SELL"
+            if str(fill.get("side") or "").upper() != expected_side:
+                raise RuntimeError("Binance entry-fill side validation failed")
+            quantity = float(fill.get("quantity") or 0)
+            tolerance = max(1e-12, position.quantity * 1e-9)
+            if not math.isfinite(quantity) or abs(quantity - position.quantity) > tolerance:
+                raise RuntimeError("Binance entry-fill quantity validation failed")
+            price = float(fill.get("price") or 0)
+            timestamp = int(fill.get("timestamp") or 0)
+            if not math.isfinite(price) or price <= 0:
+                raise RuntimeError("Binance entry-fill weighted price validation failed")
+            if timestamp <= 0:
+                raise RuntimeError("Binance entry-fill timestamp validation failed")
+            old_entry_price = position.entry_price
+            assets = tuple(
+                sorted(
+                    {
+                        str(asset).strip().upper()
+                        for asset in (fill.get("commission_assets") or ())
+                        if str(asset).strip()
+                    }
+                )
+            )
+            quote_fee = (
+                float(fill["commission"])
+                if assets == ("USDT",) and fill.get("commission") is not None
+                else None
+            )
+            if quote_fee is not None and not math.isfinite(quote_fee):
+                raise RuntimeError("Binance entry-fill commission validation failed")
+            self.position = replace(
+                position,
+                entry_price=price,
+                opened_at=timestamp,
+                best_price=(
+                    price if position.best_price == old_entry_price else position.best_price
+                ),
+                worst_price=(
+                    price if position.worst_price == old_entry_price else position.worst_price
+                ),
+                entry_fee=quote_fee,
+                entry_fee_asset=("USDT" if quote_fee is not None else "/".join(assets)),
+            )
+            self._save_live_reconciliation_state()
+            self.resolve_emergency("order_failure", incident)
+        except Exception as error:
+            LOG.warning("managed Binance entry-fill reconciliation failed: %s", error)
+            self.notify_emergency(
+                error,
+                category="order_failure",
+                context="受保护仓位的开仓成交明细对账失败；保留现有仓位与硬止损，不重下单",
+                incident=incident,
+                details={
+                    "方向": position.side,
+                    "数量": position.quantity,
+                    "开仓订单ID": position.entry_order_id or "缺失",
+                },
+            )
 
     def _manage_live_position(
         self,

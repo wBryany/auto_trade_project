@@ -44,6 +44,11 @@ class Position:
     stop_client_id: str = ""
     take_profit_order_id: str = ""
     take_profit_client_id: str = ""
+    # Exact entry commission is populated only when Binance reports every
+    # fill in the quote asset. ``None`` deliberately distinguishes an
+    # unavailable/non-quote fee from a confirmed zero commission.
+    entry_fee: float | None = None
+    entry_fee_asset: str = ""
 
 
 @dataclass(frozen=True)
