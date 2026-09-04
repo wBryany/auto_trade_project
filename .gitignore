@@ -12,6 +12,7 @@ logs/
 reports/
 backups/
 .tmp*/
+/.tmp_effective_live_config.json
 node_modules/
 *.sqlite3
 dist/
