@@ -645,6 +645,21 @@ def test_v_recovery_shadow_config_is_opt_in_and_keeps_reversal_long_disabled() -
     assert example["traditional_ultra_short_reversal_allow_long"] is False
 
 
+def test_tracked_configs_use_60m_soft_and_90m_hard_time_exit_policy() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    tracked = json.loads(
+        (project_root / "config.binance.testnet.json").read_text(encoding="utf-8")
+    )["strategy"]
+    example = json.loads(
+        (project_root / "config.example.json").read_text(encoding="utf-8")
+    )["strategy"]
+
+    for config in (tracked, example):
+        assert config["time_exit_min_r"] == 0.2
+        assert config["max_hold_seconds"] == 3600
+        assert config["hard_max_hold_seconds"] == 5400
+
+
 def test_ultra_short_reversal_direction_switches_are_independent() -> None:
     config = StrategyConfig(
         traditional_ultra_short_reversal_allow_long=False,
