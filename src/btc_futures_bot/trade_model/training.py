@@ -9,7 +9,6 @@ import tempfile
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
-from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
 
@@ -972,7 +971,9 @@ class _CandleWindow(Sequence[Candle]):
         return self._stop - self._start
 
     def __iter__(self) -> Iterator[Candle]:
-        return islice(self._source, self._start, self._stop)
+        source = self._source
+        for position in range(self._start, self._stop):
+            yield source[position]
 
     def __getitem__(self, index: int | slice) -> Candle | Sequence[Candle]:
         if isinstance(index, slice):

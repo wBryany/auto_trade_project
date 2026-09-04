@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from btc_futures_bot.trade_model.training import (
     BarrierConfig,
     FundingRate,
     SplitConfig,
+    _CandleWindow,
     _iter_replay_signals,
     assess_live_approval,
     choose_validation_threshold,
@@ -305,6 +307,47 @@ def _small_traditional_config() -> StrategyConfig:
         traditional_v_recovery_long_shadow=False,
         traditional_allow_1m_impulse=False,
     )
+
+
+def test_candle_window_iteration_matches_the_exact_source_slice() -> None:
+    source = [_candle(index * 60_000, close=100.0 + index) for index in range(20)]
+    window = _CandleWindow(source, 7, 13)
+
+    assert list(window) == source[7:13]
+
+
+class _AccessCountingCandles(Sequence[Candle]):
+    def __init__(self, size: int) -> None:
+        self.size = size
+        self.accessed_indices: list[int] = []
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, index: int | slice) -> Candle | Sequence[Candle]:
+        if isinstance(index, slice):
+            start, stop, step = index.indices(self.size)
+            return [self[position] for position in range(start, stop, step)]
+        selected = int(index)
+        if selected < 0:
+            selected += self.size
+        if selected < 0 or selected >= self.size:
+            raise IndexError("candle index out of range")
+        self.accessed_indices.append(selected)
+        return _candle(selected * 60_000, close=100.0 + selected)
+
+
+def test_candle_window_iteration_does_not_scan_the_source_prefix() -> None:
+    source = _AccessCountingCandles(20_000)
+    window = _CandleWindow(source, 15_000, 15_007)
+
+    candles = list(window)
+
+    assert [candle.timestamp for candle in candles] == [
+        position * 60_000 for position in range(15_000, 15_007)
+    ]
+    assert source.accessed_indices == list(range(15_000, 15_007))
+    assert len(source.accessed_indices) == len(window)
 
 
 def test_cached_and_uncached_replay_emit_identical_full_signals_on_synthetic_data() -> None:
