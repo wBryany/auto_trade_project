@@ -30,7 +30,7 @@ try {
     $env:PYTHONPATH = Join-Path $sourceRoot "src"
     $configurationIdentityJson = (
         & $resolvedPythonPath -c `
-            "import json, sys; from btc_futures_bot.main import load_config; c = load_config(sys.argv[1]); m = c.get('trade_model') or {}; print(json.dumps({'mode': str(c.get('mode', 'paper')), 'instance_id': str(c.get('instance_id', '')), 'trade_model_mode': str(m.get('mode', 'off'))}))" `
+            "import json, sys; from btc_futures_bot.main import load_config; c = load_config(sys.argv[1]); m = c.get('trade_model') or {}; print(json.dumps({'mode': str(c.get('mode', 'paper')), 'instance_id': str(c.get('instance_id', '')), 'exchange': str(c.get('active_exchange', '')), 'trade_model_mode': str(m.get('mode', 'off'))}))" `
             $configPath
     ).Trim()
 } finally {
@@ -43,9 +43,13 @@ try {
 $configurationIdentity = $configurationIdentityJson | ConvertFrom-Json
 $configuredMode = ([string]$configurationIdentity.mode).Trim().ToLowerInvariant()
 $configuredInstanceId = ([string]$configurationIdentity.instance_id).Trim()
+$configuredExchange = ([string]$configurationIdentity.exchange).Trim().ToLowerInvariant()
 $configuredTradeModelMode = ([string]$configurationIdentity.trade_model_mode).Trim().ToLowerInvariant()
 if ($configuredInstanceId -ne "trade-model-2") {
     throw "Model 2 config must declare instance_id=trade-model-2; got '$configuredInstanceId'"
+}
+if ($configuredExchange -notin @("binance", "okx", "gate")) {
+    throw "Model 2 config must select a supported active_exchange; got '$configuredExchange'"
 }
 
 function Get-Model2Listener {
@@ -115,6 +119,7 @@ if ($configuredMode -eq "live") {
         $existingTradeModel = $existingLiveStatus.PSObject.Properties["trade_model"]
         if (
             [string]$existingLiveStatus.instance_id -ne "trade-model-2" -or
+            [string]$existingLiveStatus.exchange -ne $configuredExchange -or
             $null -eq $existingTradeModel -or
             [string]$existingTradeModel.Value.type -ne "lightgbm_meta"
         ) {
@@ -125,7 +130,7 @@ if ($configuredMode -eq "live") {
     # live approval is checked independently by Engine.prepare_live().
     $arguments = @{
         ConfigPath = $configPath
-        Exchange = "binance"
+        Exchange = $configuredExchange
         BindAddress = $BindAddress
         Port = $Port
         PythonPath = $resolvedPythonPath
@@ -183,6 +188,19 @@ if ($listener) {
     if ([string]$status.instance_id -ne "trade-model-2") {
         throw "Existing dashboard on port $Port is not the trade-model-2 instance"
     }
+    if ([string]$status.exchange -ne $configuredExchange) {
+        throw "Existing Model 2 dashboard uses exchange '$($status.exchange)', expected '$configuredExchange'"
+    }
+    $lastResultProperty = $status.PSObject.Properties["last_result"]
+    if (
+        [bool]$status.running -and
+        $null -ne $lastResultProperty -and
+        $null -ne $lastResultProperty.Value -and
+        -not [string]::IsNullOrWhiteSpace([string]$lastResultProperty.Value.exchange) -and
+        [string]$lastResultProperty.Value.exchange -ne $configuredExchange
+    ) {
+        throw "Existing Model 2 engine uses exchange '$($lastResultProperty.Value.exchange)', expected '$configuredExchange'; restart the dashboard process"
+    }
     $tradeModelProperty = $status.PSObject.Properties["trade_model"]
     if ($null -eq $tradeModelProperty -or [string]$tradeModelProperty.Value.type -ne "lightgbm_meta") {
         throw "Existing dashboard on port $Port is not the Model 2 service"
@@ -205,7 +223,7 @@ if ($listener) {
             -ArgumentList @(
                 "-m", "btc_futures_bot.main",
                 "--config", $configPath,
-                "--exchange", "binance",
+                "--exchange", $configuredExchange,
                 "--web",
                 "--host", $BindAddress,
                 "--port", "$Port"
@@ -240,7 +258,7 @@ if ($DashboardOnly) {
 
 $status = Invoke-RestMethod "$serviceUrl/api/status" -TimeoutSec 10
 if (-not [bool]$status.running) {
-    $body = @{exchange = "binance"} | ConvertTo-Json -Compress
+    $body = @{exchange = $configuredExchange} | ConvertTo-Json -Compress
     Invoke-RestMethod `
         "$serviceUrl/api/start" `
         -Method Post `
