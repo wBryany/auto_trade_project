@@ -819,6 +819,47 @@ def test_dashboard_live_private_failure_never_falls_back_to_paper_equity() -> No
     assert status["order_sizing"]["available"] is False
 
 
+def test_dashboard_never_reports_private_connection_when_snapshot_has_error() -> None:
+    service = DashboardService.__new__(DashboardService)
+    service._thread = None
+    service._lock = threading.RLock()
+    service.engine = None
+    service.last_result = None
+    service.last_error = ""
+    service.last_cycle_at = 0.0
+    service.started_at = 0.0
+    service._config = lambda: {
+        "instance_id": "trade-model-2",
+        "mode": "paper",
+        "paper_equity": 10_000.0,
+        "active_exchange": "okx",
+        "exchanges": {
+            "okx": {
+                "symbol": "BTC-USDT-SWAP",
+                "environment": "demo",
+                "base_url": "https://openapi.okx.com",
+            }
+        },
+    }
+    service._exchange = lambda _config: "okx"
+    service._market_snapshot = lambda _config, _exchange: {
+        "market": {"mark_price": 100.0},
+        "positions": [],
+        "open_orders": [],
+        "private_available": True,
+        "private_error": "Invalid OK-ACCESS-KEY",
+    }
+    service._with_live_market = lambda _config, _exchange, snapshot: snapshot
+
+    status = service.status()
+
+    assert status["connection"]["market"] is True
+    assert status["connection"]["private"] is False
+    assert status["connection"]["private_error"] == "Invalid OK-ACCESS-KEY"
+    with pytest.raises(RuntimeError, match="Invalid OK-ACCESS-KEY"):
+        service.private_check()
+
+
 def test_private_check_rejects_a_stale_cached_account() -> None:
     service = DashboardService.__new__(DashboardService)
     service._config = lambda: {"active_exchange": "binance", "exchanges": {"binance": {}}}

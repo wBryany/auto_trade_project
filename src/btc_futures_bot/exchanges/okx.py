@@ -209,6 +209,7 @@ class OkxAdapter(ExchangeAdapter):
                 for row in orders_payload.get("data", [])
             ]
         except Exception as error:
+            snapshot["private_available"] = False
             snapshot["private_error"] = str(error)
         return snapshot
 

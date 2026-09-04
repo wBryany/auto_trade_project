@@ -819,7 +819,11 @@ class DashboardService:
         config = self._config()
         exchange_name = self._exchange(config)
         snapshot = self._market_snapshot(config, exchange_name)
-        if not snapshot.get("private_available") or snapshot.get("private_stale"):
+        if (
+            not snapshot.get("private_available")
+            or snapshot.get("private_stale")
+            or snapshot.get("private_error")
+        ):
             raise RuntimeError(str(snapshot.get("private_error") or "私有 API 未连接"))
         account = snapshot.get("account") or {}
         equity_raw = str(account.get("wallet_balance_raw") or account.get("wallet_balance") or "0")
@@ -991,7 +995,8 @@ class DashboardService:
             "connection": {
                 "market": bool(snapshot.get("market")),
                 "private": bool(snapshot.get("private_available"))
-                and not bool(snapshot.get("private_stale")),
+                and not bool(snapshot.get("private_stale"))
+                and not bool(snapshot.get("private_error")),
                 "private_source": snapshot.get("private_source", "rest"),
                 "private_stream": snapshot.get("private_stream", {}),
                 "private_error": snapshot.get("private_error", ""),
