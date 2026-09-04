@@ -5,6 +5,8 @@ import hashlib
 import hmac
 import json
 import logging
+import threading
+import time
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 from typing import Any
@@ -22,6 +24,11 @@ class OkxAdapter(ExchangeAdapter):
         super().__init__(settings)
         self.base_url = settings.base_url.rstrip("/")
         self._scalp_cache: dict[int, Candle] = {}
+        self._server_time_offset_ms = 0
+        self._server_time_anchor_ms = 0
+        self._server_time_anchor_monotonic = 0.0
+        self._server_time_synced_at = 0.0
+        self._server_time_lock = threading.RLock()
 
     def fetch_candles(self, interval: str, limit: int) -> list[Candle]:
         if interval == "30s":
@@ -255,22 +262,115 @@ class OkxAdapter(ExchangeAdapter):
 
     def _private(self, method: str, path: str, *, params: dict[str, Any] | None = None, body: dict[str, Any] | None = None) -> Any:
         key, secret, passphrase = self.credentials()
-        timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         body_string = json.dumps(body, separators=(",", ":"), ensure_ascii=False) if body else ""
-        query = urlencode(params or {})
+        query = urlencode(
+            [(name, value) for name, value in (params or {}).items() if value is not None]
+        )
         request_path = f"{path}?{query}" if query else path
-        message = f"{timestamp}{method.upper()}{request_path}{body_string}".encode("utf-8")
-        signature = base64.b64encode(hmac.new(secret.encode(), message, hashlib.sha256).digest()).decode()
-        headers = {
-            "Content-Type": "application/json",
-            "OK-ACCESS-KEY": key,
-            "OK-ACCESS-SIGN": signature,
-            "OK-ACCESS-TIMESTAMP": timestamp,
-            "OK-ACCESS-PASSPHRASE": passphrase,
-        }
-        if self.settings.environment == "demo":
-            headers["x-simulated-trading"] = "1"
-        return request_json(method, f"{self.base_url}{path}", params=params, headers=headers, body=body_string or None)
+        self._ensure_server_time()
+        for attempt in range(2):
+            timestamp = self._server_timestamp()
+            message = f"{timestamp}{method.upper()}{request_path}{body_string}".encode("utf-8")
+            signature = base64.b64encode(
+                hmac.new(secret.encode(), message, hashlib.sha256).digest()
+            ).decode()
+            headers = {
+                "Content-Type": "application/json",
+                "OK-ACCESS-KEY": key,
+                "OK-ACCESS-SIGN": signature,
+                "OK-ACCESS-TIMESTAMP": timestamp,
+                "OK-ACCESS-PASSPHRASE": passphrase,
+            }
+            if self.settings.environment == "demo":
+                headers["x-simulated-trading"] = "1"
+            try:
+                payload = request_json(
+                    method,
+                    f"{self.base_url}{path}",
+                    params=params,
+                    headers=headers,
+                    body=body_string or None,
+                )
+            except ApiError as error:
+                if attempt == 0 and self._is_timestamp_error(error):
+                    self._sync_server_time(force=True)
+                    continue
+                raise
+            if attempt == 0 and self._is_timestamp_payload(payload):
+                self._sync_server_time(force=True)
+                continue
+            return payload
+        raise ApiError("OKX private request failed after server-time synchronization")
+
+    def _server_timestamp(self) -> str:
+        timestamp_ms = self._server_timestamp_ms()
+        return (
+            datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+
+    def _server_timestamp_ms(self) -> int:
+        with self._server_time_lock:
+            if self._server_time_anchor_ms > 0:
+                elapsed_ms = int(
+                    max(0.0, time.monotonic() - self._server_time_anchor_monotonic)
+                    * 1000
+                )
+                return self._server_time_anchor_ms + elapsed_ms
+            return self.now_ms() + self._server_time_offset_ms
+
+    def _ensure_server_time(self) -> None:
+        with self._server_time_lock:
+            fresh = (
+                self._server_time_anchor_ms > 0
+                and time.monotonic() - self._server_time_synced_at < 900.0
+            )
+        if fresh:
+            return
+        try:
+            self._sync_server_time(force=False)
+        except ApiError:
+            with self._server_time_lock:
+                if self._server_time_anchor_ms <= 0:
+                    raise
+
+    def _sync_server_time(self, *, force: bool = True) -> int:
+        with self._server_time_lock:
+            if (
+                not force
+                and self._server_time_anchor_ms > 0
+                and time.monotonic() - self._server_time_synced_at < 900.0
+            ):
+                return self._server_time_offset_ms
+            payload = request_json(
+                "GET",
+                f"{self.base_url}/api/v5/public/time",
+                timeout=5.0,
+                max_attempts=3,
+            )
+            finished_at = self.now_ms()
+            finished_monotonic = time.monotonic()
+            if not isinstance(payload, dict) or str(payload.get("code", "0")) != "0":
+                raise ApiError(f"OKX server-time response is invalid: {payload}")
+            rows = payload.get("data") or []
+            server_time = int(rows[0].get("ts") or 0) if rows else 0
+            if server_time <= 0:
+                raise ApiError("OKX server-time response has no valid timestamp")
+            self._server_time_offset_ms = server_time - finished_at
+            self._server_time_anchor_ms = server_time
+            self._server_time_anchor_monotonic = finished_monotonic
+            self._server_time_synced_at = finished_monotonic
+            return self._server_time_offset_ms
+
+    @staticmethod
+    def _is_timestamp_error(error: ApiError) -> bool:
+        message = str(error).lower()
+        return str(error.api_code or "") == "50102" or "50102" in message or "timestamp request expired" in message
+
+    @staticmethod
+    def _is_timestamp_payload(payload: Any) -> bool:
+        return isinstance(payload, dict) and str(payload.get("code") or "") == "50102"
 
     @staticmethod
     def _check_response(payload: Any) -> None:
