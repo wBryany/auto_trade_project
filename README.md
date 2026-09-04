@@ -38,6 +38,8 @@ python .\scripts\train_meta_model.py --config .\config.binance.model2.json --dat
 
 训练和实时推理共用同一特征实现。制品会校验特征顺序、模型文件、完整策略配置以及风险/费用/标签/历史窗口政策；任一指纹不一致都会拒绝加载。当前固定 TP/SL 三重障碍标签与实盘动态退出并不完全等价，因此生成的模型仅供 `paper` 对比，不会自动获得 `approved_for_live`。
 
+仓库当前附带的 `meta-20250901-20260904-v1` 是管线验证制品，不是已证明盈利的模型：其冻结阈值在 holdout 只选择 10/650 个候选，扣成本期望为 -0.003054、Profit Factor 为 0.266，因此明确标记为 `statistically_qualified=false` 和 `approved_for_live=false`。8788 可以用它验证门控、审计和 A/B 数据采集，但不能据此切换真实账户。
+
 在独立端口启动 2.0 纸面交易：
 
 ```powershell
