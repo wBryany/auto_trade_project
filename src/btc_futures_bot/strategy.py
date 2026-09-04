@@ -100,6 +100,23 @@ class StrategyConfig:
     traditional_ultra_short_1m_min_range_atr: float = 0.8
     traditional_ultra_short_1m_max_extension_atr: float = 1.0
     traditional_ultra_short_1m_execution_max_extension_atr: float = 1.5
+    traditional_v_recovery_long_shadow: bool = False
+    traditional_v_recovery_long_pivot_lookback: int = 6
+    traditional_v_recovery_long_pivot_min_range_atr: float = 1.25
+    traditional_v_recovery_long_pivot_min_volume_ratio: float = 1.5
+    traditional_v_recovery_long_pivot_min_close_location: float = 0.65
+    traditional_v_recovery_long_5m_rsi_min: float = 48.0
+    traditional_v_recovery_long_5m_rsi_max: float = 68.0
+    traditional_v_recovery_long_5m_min_body_ratio: float = 0.5
+    traditional_v_recovery_long_5m_min_close_location: float = 0.7
+    traditional_v_recovery_long_5m_min_range_atr: float = 0.6
+    traditional_v_recovery_long_5m_min_volume_ratio: float = 0.8
+    traditional_v_recovery_long_5m_max_extension_atr: float = 1.3
+    traditional_v_recovery_long_5m_max_ema_gap_pct: float = 0.0015
+    traditional_v_recovery_long_1m_rsi_min: float = 48.0
+    traditional_v_recovery_long_1m_rsi_max: float = 70.0
+    traditional_v_recovery_long_1m_min_volume_ratio: float = 0.4
+    traditional_v_recovery_long_1m_max_extension_atr: float = 1.0
     traditional_ultra_short_reversal_enabled: bool = False
     traditional_ultra_short_reversal_allow_long: bool = True
     traditional_ultra_short_reversal_allow_short: bool = True
@@ -127,6 +144,9 @@ class StrategyConfig:
     traditional_ultra_short_pullback_resumption_1m_rsi_long_max: float = 55.0
     traditional_ultra_short_pullback_resumption_1m_rsi_short_min: float = 45.0
     traditional_ultra_short_pullback_resumption_max_volume_ratio: float = 3.0
+    traditional_pullback_resumption_maturity_shadow_enabled: bool = False
+    traditional_pullback_resumption_maturity_shadow_lookback: int = 12
+    traditional_pullback_resumption_maturity_shadow_max_progress_atr: float = 4.0
     traditional_ultra_short_break_even_trigger_r: float = 0.7
     traditional_ultra_short_break_even_lock_r: float = 0.15
     traditional_ultra_short_break_even_activation_buffer_r: float = 0.05
@@ -1254,7 +1274,7 @@ class MultiTimeframeStrategy:
                     else f"{regime_name}_ultra_short_context_long"
                 )
             )
-            return Signal(
+            signal = Signal(
                 "long",
                 6,
                 one_minute_candles[-1].timestamp,
@@ -1271,6 +1291,12 @@ class MultiTimeframeStrategy:
                     "1m_execution_up",
                 ),
             )
+            return _traditional_pullback_resumption_maturity_shadow_signal(
+                signal,
+                trigger_candles,
+                trigger,
+                self.config,
+            )
         if ultra_short_short and not ultra_short_long:
             regime_reason = (
                 f"{regime_name}_ultra_short_countertrend_short"
@@ -1281,7 +1307,7 @@ class MultiTimeframeStrategy:
                     else f"{regime_name}_ultra_short_context_short"
                 )
             )
-            return Signal(
+            signal = Signal(
                 "short",
                 6,
                 one_minute_candles[-1].timestamp,
@@ -1297,6 +1323,12 @@ class MultiTimeframeStrategy:
                     "1m_ultra_short_trigger_short",
                     "1m_execution_down",
                 ),
+            )
+            return _traditional_pullback_resumption_maturity_shadow_signal(
+                signal,
+                trigger_candles,
+                trigger,
+                self.config,
             )
         long_missing = ",".join(name for name, ready in long_checks.items() if not ready)
         short_missing = ",".join(name for name, ready in short_checks.items() if not ready)
@@ -1340,6 +1372,25 @@ class MultiTimeframeStrategy:
             quality_rejections.extend(
                 f"shadow_{reason}" for reason in failed_breakout_short.reasons
             )
+        if self.config.traditional_v_recovery_long_shadow:
+            v_recovery_timing = _traditional_v_recovery_long_shadow_candidate(
+                trigger_candles,
+                one_minute_candles,
+                trigger=trigger,
+                execution=execution,
+                strong_trend_long=strong_trend_long,
+                config=self.config,
+            )
+            if v_recovery_timing is not None:
+                candidate_timestamp, observed_at = v_recovery_timing
+                quality_rejections.extend(
+                    (
+                        "shadow_candidate=long",
+                        "shadow_v_recovery_long",
+                        f"shadow_v_recovery_long_timestamp={candidate_timestamp}",
+                        f"shadow_v_recovery_long_observed_at={observed_at}",
+                    )
+                )
         return Signal(
             "flat",
             max(long_score, short_score),
@@ -2874,6 +2925,224 @@ def _traditional_ultra_short_execution_quality(
         return not rsi_cap or feature.rsi <= rsi_cap
     rsi_floor = max(0.0, float(config.traditional_execution_rsi_short_min))
     return not rsi_floor or feature.rsi >= rsi_floor
+
+
+def _traditional_pullback_resumption_maturity_shadow_signal(
+    signal: Signal,
+    trigger_candles: Sequence[Candle],
+    trigger: _TraditionalFeatures,
+    config: StrategyConfig,
+) -> Signal:
+    """Annotate an executable late-resumption candidate without blocking it."""
+
+    if (
+        not config.traditional_pullback_resumption_maturity_shadow_enabled
+        or signal.side not in {"long", "short"}
+        or f"5m_macd_pullback_resumption_{signal.side}" not in signal.reasons
+        or trigger.atr is None
+        or trigger.atr <= 0
+    ):
+        return signal
+    lookback = max(
+        1,
+        int(config.traditional_pullback_resumption_maturity_shadow_lookback),
+    )
+    if len(trigger_candles) < lookback + 1:
+        return signal
+    prior_closed = trigger_candles[-lookback - 1 : -1]
+    if signal.side == "long":
+        progress = float(trigger.close) - min(float(candle.low) for candle in prior_closed)
+    else:
+        progress = max(float(candle.high) for candle in prior_closed) - float(trigger.close)
+    progress_atr = max(0.0, progress / float(trigger.atr))
+    maximum = max(
+        0.0,
+        float(config.traditional_pullback_resumption_maturity_shadow_max_progress_atr),
+    )
+    if progress_atr <= maximum:
+        return signal
+    reasons = signal.reasons + (
+        f"shadow_5m_pullback_resumption_maturity_{signal.side}",
+        f"shadow_5m_pullback_resumption_maturity_progress_atr={progress_atr:.3f}",
+        f"shadow_5m_pullback_resumption_maturity_max_atr={maximum:.3f}",
+    )
+    return Signal(signal.side, signal.score, signal.timestamp, reasons)
+
+
+def _traditional_v_recovery_long_shadow_candidate(
+    trigger_candles: Sequence[Candle],
+    one_minute_candles: Sequence[Candle],
+    *,
+    trigger: _TraditionalFeatures,
+    execution: _TraditionalFeatures,
+    strong_trend_long: bool,
+    config: StrategyConfig,
+) -> tuple[int, int] | None:
+    """Return closed-bar timing for a non-tradeable V-recovery long candidate.
+
+    The engine removes each timeframe's forming candle before strategy
+    evaluation.  This detector therefore only combines a completed 5m pivot
+    and two-bar recovery with the latest completed 1m confirmation.  Returning
+    timestamps instead of a ``Signal`` keeps the branch diagnostic-only.
+    """
+
+    pivot_lookback = max(1, int(config.traditional_v_recovery_long_pivot_lookback))
+    indicator_history = max(
+        int(config.traditional_signal_slow),
+        int(config.traditional_macd_slow) + int(config.traditional_macd_signal),
+        int(config.traditional_rsi_period) + 1,
+        int(config.traditional_atr_period),
+        int(config.traditional_volume_sma_period) + 1,
+    )
+    if (
+        not strong_trend_long
+        or config.trigger_timeframe != "5m"
+        or len(trigger_candles) < max(indicator_history, pivot_lookback + 3)
+        or len(one_minute_candles) < indicator_history
+    ):
+        return None
+
+    five_minute_window = trigger_candles[-max(indicator_history, pivot_lookback + 3) :]
+    one_minute_window = one_minute_candles[-indicator_history:]
+    if not _candles_are_contiguous(
+        five_minute_window,
+        300_000,
+    ) or not _candles_are_contiguous(one_minute_window, 60_000):
+        return None
+
+    current_index = len(trigger_candles) - 1
+    pivot_index = current_index - 2
+    recovery_index = current_index - 1
+    current_five_minute = trigger_candles[current_index]
+    recovery = trigger_candles[recovery_index]
+    pivot = trigger_candles[pivot_index]
+    prior_pivot_window = trigger_candles[pivot_index - pivot_lookback : pivot_index]
+
+    confirmation = one_minute_candles[-1]
+    observed_at = int(confirmation.timestamp) + 60_000
+    setup_available_at = int(current_five_minute.timestamp) + 300_000
+    setup_expires_at = setup_available_at + 300_000
+    if not setup_available_at <= observed_at < setup_expires_at:
+        return None
+
+    pivot_feature = _traditional_features(
+        trigger_candles[: pivot_index + 1],
+        config.traditional_signal_fast,
+        config.traditional_signal_slow,
+        config.traditional_rsi_period,
+        config.traditional_macd_fast,
+        config.traditional_macd_slow,
+        config.traditional_macd_signal,
+        config.traditional_atr_period,
+        config.traditional_volume_sma_period,
+    )
+    recovery_feature = _traditional_features(
+        trigger_candles[: recovery_index + 1],
+        config.traditional_signal_fast,
+        config.traditional_signal_slow,
+        config.traditional_rsi_period,
+        config.traditional_macd_fast,
+        config.traditional_macd_slow,
+        config.traditional_macd_signal,
+        config.traditional_atr_period,
+        config.traditional_volume_sma_period,
+    )
+    required_values = (
+        pivot_feature.atr,
+        pivot_feature.volume_ratio,
+        recovery_feature.macd_histogram,
+        trigger.ema_fast,
+        trigger.ema_slow,
+        trigger.rsi,
+        trigger.macd_histogram,
+        trigger.atr,
+        trigger.volume_ratio,
+        execution.ema_fast,
+        execution.ema_slow,
+        execution.rsi,
+        execution.macd_histogram,
+        execution.atr,
+        execution.volume_ratio,
+    )
+    if any(value is None for value in required_values):
+        return None
+    if (
+        float(pivot_feature.atr or 0.0) <= 0
+        or float(trigger.atr or 0.0) <= 0
+        or float(execution.atr or 0.0) <= 0
+        or float(trigger.ema_slow or 0.0) == 0
+    ):
+        return None
+
+    pivot_range = float(pivot.high) - float(pivot.low)
+    current_range = float(current_five_minute.high) - float(current_five_minute.low)
+    if pivot_range <= 0 or current_range <= 0:
+        return None
+
+    pivot_close_location = (float(pivot.close) - float(pivot.low)) / pivot_range
+    current_body_ratio = abs(
+        float(current_five_minute.close) - float(current_five_minute.open)
+    ) / current_range
+    current_close_location = (
+        float(current_five_minute.close) - float(current_five_minute.low)
+    ) / current_range
+    current_range_atr = current_range / float(trigger.atr or 1.0)
+    current_extension_atr = abs(
+        float(trigger.close) - float(trigger.ema_fast or trigger.close)
+    ) / float(trigger.atr or 1.0)
+    current_ema_gap_pct = abs(
+        float(trigger.ema_fast or 0.0) - float(trigger.ema_slow or 0.0)
+    ) / abs(float(trigger.ema_slow or 1.0))
+    execution_extension_atr = abs(
+        float(execution.close) - float(execution.ema_fast or execution.close)
+    ) / float(execution.atr or 1.0)
+
+    five_minute_ready = (
+        float(pivot.low) <= min(float(candle.low) for candle in prior_pivot_window)
+        and pivot_range / float(pivot_feature.atr or 1.0)
+        >= max(0.0, float(config.traditional_v_recovery_long_pivot_min_range_atr))
+        and float(pivot_feature.volume_ratio or 0.0)
+        >= max(0.0, float(config.traditional_v_recovery_long_pivot_min_volume_ratio))
+        and pivot_close_location
+        >= max(0.0, float(config.traditional_v_recovery_long_pivot_min_close_location))
+        and float(recovery.close) > float(pivot.close)
+        and float(current_five_minute.close) > float(recovery.close)
+        and float(current_five_minute.close) > float(pivot.high)
+        and float(trigger.close) > float(trigger.ema_fast or trigger.close)
+        and float(config.traditional_v_recovery_long_5m_rsi_min)
+        <= float(trigger.rsi or 0.0)
+        <= float(config.traditional_v_recovery_long_5m_rsi_max)
+        and float(trigger.macd_histogram or 0.0) > 0
+        and float(trigger.macd_histogram or 0.0)
+        > float(recovery_feature.macd_histogram or 0.0)
+        and current_body_ratio
+        >= max(0.0, float(config.traditional_v_recovery_long_5m_min_body_ratio))
+        and current_close_location
+        >= max(0.0, float(config.traditional_v_recovery_long_5m_min_close_location))
+        and current_range_atr
+        >= max(0.0, float(config.traditional_v_recovery_long_5m_min_range_atr))
+        and float(trigger.volume_ratio or 0.0)
+        >= max(0.0, float(config.traditional_v_recovery_long_5m_min_volume_ratio))
+        and current_extension_atr
+        <= max(0.0, float(config.traditional_v_recovery_long_5m_max_extension_atr))
+        and current_ema_gap_pct
+        <= max(0.0, float(config.traditional_v_recovery_long_5m_max_ema_gap_pct))
+    )
+    one_minute_ready = (
+        float(config.traditional_v_recovery_long_1m_rsi_min)
+        <= float(execution.rsi or 0.0)
+        <= float(config.traditional_v_recovery_long_1m_rsi_max)
+        and float(execution.close) >= float(execution.ema_fast or execution.close)
+        >= float(execution.ema_slow or execution.close)
+        and float(execution.macd_histogram or 0.0) > 0
+        and float(execution.volume_ratio or 0.0)
+        >= max(0.0, float(config.traditional_v_recovery_long_1m_min_volume_ratio))
+        and execution_extension_atr
+        <= max(0.0, float(config.traditional_v_recovery_long_1m_max_extension_atr))
+    )
+    if not five_minute_ready or not one_minute_ready:
+        return None
+    return int(confirmation.timestamp), observed_at
 
 
 def _traditional_ultra_short_reversal_one_minute_trigger(

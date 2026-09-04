@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
 from btc_futures_bot.exchanges.base import ExchangeSettings
@@ -32,8 +34,10 @@ from btc_futures_bot.strategy import (
     _traditional_ultra_short_timeframe_support,
     _traditional_ultra_short_one_minute_trigger,
     _traditional_ultra_short_pullback_reversal_context,
+    _traditional_pullback_resumption_maturity_shadow_signal,
     _traditional_ultra_short_reversal_one_minute_trigger,
     _traditional_ultra_short_reversal_side_enabled,
+    _traditional_v_recovery_long_shadow_candidate,
     _traditional_setup_macd_handoff,
     _traditional_setup_volume_handoff,
     adverse_dynamic_exit_reason,
@@ -328,6 +332,319 @@ def test_ultra_short_reversal_reclaims_a_fresh_one_minute_extreme() -> None:
     )
 
 
+def _v_recovery_shadow_case() -> tuple[
+    list[Candle],
+    list[Candle],
+    _TraditionalFeatures,
+    _TraditionalFeatures,
+    _TraditionalFeatures,
+    _TraditionalFeatures,
+    StrategyConfig,
+]:
+    candidate_timestamp = 1_788_510_060_000
+    current_five_minute_timestamp = candidate_timestamp - 360_000
+    trigger_start = current_five_minute_timestamp - 39 * 300_000
+    trigger_candles = [
+        Candle(
+            trigger_start + index * 300_000,
+            99.25,
+            99.60,
+            99.00,
+            99.30,
+            10.0,
+        )
+        for index in range(40)
+    ]
+    pivot = Candle(
+        current_five_minute_timestamp - 600_000,
+        99.20,
+        99.50,
+        97.00,
+        98.80,
+        16.0,
+    )
+    recovery = Candle(
+        current_five_minute_timestamp - 300_000,
+        98.80,
+        99.30,
+        98.60,
+        99.20,
+        10.0,
+    )
+    current_five_minute = Candle(
+        current_five_minute_timestamp,
+        99.06,
+        100.01,
+        99.00,
+        100.00,
+        14.0,
+    )
+    trigger_candles[-3:] = [pivot, recovery, current_five_minute]
+
+    execution_start = candidate_timestamp - 39 * 60_000
+    one_minute_candles = [
+        Candle(
+            execution_start + index * 60_000,
+            99.45,
+            99.60,
+            99.40,
+            99.50,
+            10.0,
+        )
+        for index in range(40)
+    ]
+    one_minute_candles[-1] = Candle(
+        candidate_timestamp,
+        99.70,
+        100.05,
+        99.65,
+        100.00,
+        4.0528,
+    )
+
+    five_minute_atr = 1.01 / 1.0393
+    five_minute_ema_fast = 100.00 - five_minute_atr * 1.0766
+    five_minute_ema_slow = five_minute_ema_fast / (1.0 - 0.0003837)
+    trigger = _TraditionalFeatures(
+        open=99.06,
+        high=100.01,
+        low=99.00,
+        close=100.00,
+        previous_close=99.20,
+        ema_fast=five_minute_ema_fast,
+        previous_ema_fast=five_minute_ema_fast - 0.1,
+        ema_slow=five_minute_ema_slow,
+        previous_ema_slow=five_minute_ema_slow,
+        rsi=54.5834,
+        macd_histogram=6.0396,
+        previous_macd_histogram=2.0,
+        atr=five_minute_atr,
+        volume_ratio=1.429498,
+    )
+    pivot_feature = replace(
+        trigger,
+        open=pivot.open,
+        high=pivot.high,
+        low=pivot.low,
+        close=pivot.close,
+        atr=1.5,
+        volume_ratio=1.6,
+        macd_histogram=-3.0,
+    )
+    recovery_feature = replace(
+        trigger,
+        open=recovery.open,
+        high=recovery.high,
+        low=recovery.low,
+        close=recovery.close,
+        macd_histogram=2.0,
+    )
+    execution = _TraditionalFeatures(
+        open=99.70,
+        high=100.05,
+        low=99.65,
+        close=100.00,
+        previous_close=99.70,
+        ema_fast=99.60,
+        previous_ema_fast=99.55,
+        ema_slow=99.50,
+        previous_ema_slow=99.50,
+        rsi=65.4588,
+        macd_histogram=18.2972,
+        previous_macd_histogram=12.0,
+        atr=0.40 / 0.83492,
+        volume_ratio=0.40528,
+    )
+    config = StrategyConfig(
+        mode="traditional_kline",
+        trigger_timeframe="5m",
+        regime_timeframe="1h",
+        traditional_v_recovery_long_shadow=True,
+    )
+    return (
+        trigger_candles,
+        one_minute_candles,
+        pivot_feature,
+        recovery_feature,
+        trigger,
+        execution,
+        config,
+    )
+
+
+def test_v_recovery_long_shadow_uses_only_a_closed_confirmation_bar() -> None:
+    (
+        trigger_candles,
+        one_minute_candles,
+        pivot_feature,
+        recovery_feature,
+        trigger,
+        execution,
+        config,
+    ) = _v_recovery_shadow_case()
+
+    def historical_feature(candles: list[Candle], *_: object) -> _TraditionalFeatures:
+        selected = {
+            trigger_candles[-3].timestamp: pivot_feature,
+            trigger_candles[-2].timestamp: recovery_feature,
+        }
+        return selected[candles[-1].timestamp]
+
+    before_confirmation = replace(
+        execution,
+        close=99.55,
+        rsi=47.0,
+        macd_histogram=-0.1,
+    )
+    with patch(
+        "btc_futures_bot.strategy._traditional_features",
+        side_effect=historical_feature,
+    ):
+        assert _traditional_v_recovery_long_shadow_candidate(
+            trigger_candles,
+            one_minute_candles[:-1],
+            trigger=trigger,
+            execution=before_confirmation,
+            strong_trend_long=True,
+            config=config,
+        ) is None
+        assert _traditional_v_recovery_long_shadow_candidate(
+            trigger_candles,
+            one_minute_candles,
+            trigger=trigger,
+            execution=execution,
+            strong_trend_long=True,
+            config=config,
+        ) == (1_788_510_060_000, 1_788_510_120_000)
+
+
+def test_v_recovery_long_shadow_rejects_trend_extension_and_volume_failures() -> None:
+    (
+        trigger_candles,
+        one_minute_candles,
+        pivot_feature,
+        recovery_feature,
+        trigger,
+        execution,
+        config,
+    ) = _v_recovery_shadow_case()
+    selected_pivot_feature = pivot_feature
+
+    def historical_feature(candles: list[Candle], *_: object) -> _TraditionalFeatures:
+        selected = {
+            trigger_candles[-3].timestamp: selected_pivot_feature,
+            trigger_candles[-2].timestamp: recovery_feature,
+        }
+        return selected[candles[-1].timestamp]
+
+    with patch(
+        "btc_futures_bot.strategy._traditional_features",
+        side_effect=historical_feature,
+    ):
+        assert _traditional_v_recovery_long_shadow_candidate(
+            trigger_candles,
+            one_minute_candles,
+            trigger=trigger,
+            execution=execution,
+            strong_trend_long=False,
+            config=config,
+        ) is None
+        assert _traditional_v_recovery_long_shadow_candidate(
+            trigger_candles,
+            one_minute_candles,
+            trigger=trigger,
+            execution=replace(execution, close=100.20),
+            strong_trend_long=True,
+            config=config,
+        ) is None
+        assert _traditional_v_recovery_long_shadow_candidate(
+            trigger_candles,
+            one_minute_candles,
+            trigger=trigger,
+            execution=replace(execution, volume_ratio=0.399),
+            strong_trend_long=True,
+            config=config,
+        ) is None
+        assert _traditional_v_recovery_long_shadow_candidate(
+            trigger_candles,
+            one_minute_candles,
+            trigger=trigger,
+            execution=execution,
+            strong_trend_long=True,
+            config=replace(
+                config,
+                traditional_v_recovery_long_1m_min_volume_ratio=0.5,
+            ),
+        ) is None
+        selected_pivot_feature = replace(pivot_feature, volume_ratio=1.49)
+        assert _traditional_v_recovery_long_shadow_candidate(
+            trigger_candles,
+            one_minute_candles,
+            trigger=trigger,
+            execution=execution,
+            strong_trend_long=True,
+            config=config,
+        ) is None
+
+
+def test_v_recovery_long_shadow_adds_flat_telemetry_without_a_trade_signal() -> None:
+    def flat_series(count: int, interval_ms: int) -> list[Candle]:
+        return [
+            Candle(index * interval_ms, 100.0, 100.1, 99.9, 100.0, 10.0)
+            for index in range(count)
+        ]
+
+    market = {
+        "5m": flat_series(40, 300_000),
+        "1m": flat_series(40, 60_000),
+        "1h": flat_series(210, 3_600_000),
+    }
+    config = StrategyConfig(
+        mode="traditional_kline",
+        trigger_timeframe="5m",
+        regime_timeframe="1h",
+        traditional_v_recovery_long_shadow=True,
+        traditional_ultra_short_reversal_allow_long=False,
+    )
+    with patch(
+        "btc_futures_bot.strategy._traditional_v_recovery_long_shadow_candidate",
+        return_value=(1_788_510_060_000, 1_788_510_120_000),
+    ):
+        shadow = MultiTimeframeStrategy(config).evaluate(market)
+
+    assert shadow.side == "flat"
+    assert "shadow_candidate=long" in shadow.reasons
+    assert "shadow_v_recovery_long" in shadow.reasons
+    assert "shadow_v_recovery_long_timestamp=1788510060000" in shadow.reasons
+    assert "shadow_v_recovery_long_observed_at=1788510120000" in shadow.reasons
+
+    with patch(
+        "btc_futures_bot.strategy._traditional_v_recovery_long_shadow_candidate",
+        side_effect=AssertionError("disabled shadow detector must not run"),
+    ):
+        disabled = MultiTimeframeStrategy(
+            replace(config, traditional_v_recovery_long_shadow=False)
+        ).evaluate(market)
+    assert disabled.side == "flat"
+    assert "shadow_candidate=long" not in disabled.reasons
+
+
+def test_v_recovery_shadow_config_is_opt_in_and_keeps_reversal_long_disabled() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    tracked = json.loads(
+        (project_root / "config.binance.testnet.json").read_text(encoding="utf-8")
+    )["strategy"]
+    example = json.loads(
+        (project_root / "config.example.json").read_text(encoding="utf-8")
+    )["strategy"]
+
+    assert StrategyConfig().traditional_v_recovery_long_shadow is False
+    assert tracked["traditional_v_recovery_long_shadow"] is True
+    assert example["traditional_v_recovery_long_shadow"] is False
+    assert tracked["traditional_ultra_short_reversal_allow_long"] is False
+    assert example["traditional_ultra_short_reversal_allow_long"] is False
+
+
 def test_ultra_short_reversal_direction_switches_are_independent() -> None:
     config = StrategyConfig(
         traditional_ultra_short_reversal_allow_long=False,
@@ -595,6 +912,13 @@ def test_ultra_short_pullback_resumption_accepts_quiet_break_and_caps_volume() -
         replace(config, traditional_ultra_short_pullback_resumption_enabled=False)
     ).evaluate(market)
     accepted = MultiTimeframeStrategy(config).evaluate(market)
+    shadowed = MultiTimeframeStrategy(
+        replace(
+            config,
+            traditional_pullback_resumption_maturity_shadow_enabled=True,
+            traditional_pullback_resumption_maturity_shadow_max_progress_atr=0.0,
+        )
+    ).evaluate(market)
     loud_execution = execution[:-1] + [replace(execution[-1], volume=31.0)]
     rejected = MultiTimeframeStrategy(config).evaluate(
         {**market, "1m": loud_execution}
@@ -603,7 +927,157 @@ def test_ultra_short_pullback_resumption_accepts_quiet_break_and_caps_volume() -
     assert disabled.side == "flat"
     assert accepted.side == "long"
     assert "5m_macd_pullback_resumption_long" in accepted.reasons
+    assert (shadowed.side, shadowed.score, shadowed.timestamp) == (
+        accepted.side,
+        accepted.score,
+        accepted.timestamp,
+    )
+    assert "shadow_5m_pullback_resumption_maturity_long" in shadowed.reasons
     assert rejected.side == "flat"
+
+
+def test_pullback_resumption_maturity_shadow_never_changes_executable_signal() -> None:
+    prior = [
+        Candle(index * 300_000, 101.0, 102.0, 100.0, 101.0, 10.0)
+        for index in range(12)
+    ]
+    current = Candle(12 * 300_000, 104.0, 106.0, 103.0, 105.5, 10.0)
+    signal = Signal(
+        "long",
+        6,
+        current.timestamp,
+        ("5m_macd_pullback_resumption_long", "1m_execution_up"),
+    )
+    trigger = _TraditionalFeatures(
+        open=current.open,
+        high=current.high,
+        low=current.low,
+        close=current.close,
+        previous_close=101.0,
+        ema_fast=104.0,
+        previous_ema_fast=103.8,
+        ema_slow=103.0,
+        previous_ema_slow=102.8,
+        rsi=60.0,
+        macd_histogram=1.0,
+        previous_macd_histogram=2.0,
+        atr=1.0,
+        volume_ratio=1.0,
+    )
+    config = StrategyConfig(
+        traditional_pullback_resumption_maturity_shadow_enabled=True,
+        traditional_pullback_resumption_maturity_shadow_lookback=12,
+        traditional_pullback_resumption_maturity_shadow_max_progress_atr=4.0,
+    )
+
+    annotated = _traditional_pullback_resumption_maturity_shadow_signal(
+        signal,
+        prior + [current],
+        trigger,
+        config,
+    )
+
+    assert (annotated.side, annotated.score, annotated.timestamp) == ("long", 6, current.timestamp)
+    assert "shadow_5m_pullback_resumption_maturity_long" in annotated.reasons
+    assert "shadow_5m_pullback_resumption_maturity_progress_atr=5.500" in annotated.reasons
+    assert "shadow_5m_pullback_resumption_maturity_max_atr=4.000" in annotated.reasons
+
+
+def test_pullback_resumption_maturity_shadow_respects_threshold_and_invalid_atr() -> None:
+    prior = [
+        Candle(index * 300_000, 101.0, 102.0, 100.0, 101.0, 10.0)
+        for index in range(12)
+    ]
+    current = Candle(12 * 300_000, 103.0, 105.0, 102.0, 104.0, 10.0)
+    signal = Signal("long", 6, current.timestamp, ("5m_macd_pullback_resumption_long",))
+    trigger = _TraditionalFeatures(
+        open=current.open,
+        high=current.high,
+        low=current.low,
+        close=current.close,
+        previous_close=101.0,
+        ema_fast=103.0,
+        previous_ema_fast=102.8,
+        ema_slow=102.0,
+        previous_ema_slow=101.8,
+        rsi=60.0,
+        macd_histogram=1.0,
+        previous_macd_histogram=2.0,
+        atr=1.0,
+        volume_ratio=1.0,
+    )
+    config = StrategyConfig(
+        traditional_pullback_resumption_maturity_shadow_enabled=True,
+        traditional_pullback_resumption_maturity_shadow_lookback=12,
+        traditional_pullback_resumption_maturity_shadow_max_progress_atr=4.0,
+    )
+
+    at_threshold = _traditional_pullback_resumption_maturity_shadow_signal(
+        signal,
+        prior + [current],
+        trigger,
+        config,
+    )
+    invalid_atr = _traditional_pullback_resumption_maturity_shadow_signal(
+        signal,
+        prior + [current],
+        replace(trigger, atr=0.0, close=106.0),
+        config,
+    )
+    unrelated = _traditional_pullback_resumption_maturity_shadow_signal(
+        Signal("long", 6, current.timestamp, ("5m_macd_positive",)),
+        prior + [replace(current, close=106.0)],
+        replace(trigger, close=106.0),
+        config,
+    )
+
+    assert at_threshold == signal
+    assert invalid_atr == signal
+    assert unrelated.reasons == ("5m_macd_positive",)
+    assert StrategyConfig().traditional_pullback_resumption_maturity_shadow_enabled is False
+
+
+def test_pullback_resumption_maturity_shadow_is_symmetric_and_uses_closed_window() -> None:
+    closed_prior = [
+        Candle(index * 300_000, 99.0, 100.0, 98.0, 99.0, 10.0)
+        for index in range(12)
+    ]
+    current = Candle(12 * 300_000, 96.0, 97.0, 94.0, 94.5, 10.0)
+    forming_not_supplied = Candle(13 * 300_000, 110.0, 120.0, 90.0, 115.0, 10.0)
+    signal = Signal("short", 6, current.timestamp, ("5m_macd_pullback_resumption_short",))
+    trigger = _TraditionalFeatures(
+        open=current.open,
+        high=current.high,
+        low=current.low,
+        close=current.close,
+        previous_close=99.0,
+        ema_fast=96.0,
+        previous_ema_fast=96.2,
+        ema_slow=97.0,
+        previous_ema_slow=97.2,
+        rsi=40.0,
+        macd_histogram=-1.0,
+        previous_macd_histogram=-2.0,
+        atr=1.0,
+        volume_ratio=1.0,
+    )
+    config = StrategyConfig(
+        traditional_pullback_resumption_maturity_shadow_enabled=True,
+        traditional_pullback_resumption_maturity_shadow_lookback=12,
+        traditional_pullback_resumption_maturity_shadow_max_progress_atr=4.0,
+    )
+
+    annotated = _traditional_pullback_resumption_maturity_shadow_signal(
+        signal,
+        closed_prior + [current],
+        trigger,
+        config,
+    )
+
+    assert forming_not_supplied.timestamp > current.timestamp
+    assert (annotated.side, annotated.score, annotated.timestamp) == ("short", 6, current.timestamp)
+    assert "shadow_5m_pullback_resumption_maturity_short" in annotated.reasons
+    assert "shadow_5m_pullback_resumption_maturity_progress_atr=5.500" in annotated.reasons
 
 
 def test_ultra_short_countertrend_uses_smaller_size_and_one_minute_stop() -> None:
