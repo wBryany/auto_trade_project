@@ -61,6 +61,7 @@ class TradingEngine:
         macro_risk: MacroRiskController | None = None,
         notifier: EmailNotifier | None = None,
         close_notifier: bool = True,
+        entry_gate: Any = None,
     ) -> None:
         self.adapter = adapter
         self.strategy = strategy
@@ -80,6 +81,7 @@ class TradingEngine:
         self.pending_macro_signal: Signal | None = None
         self.notifier = notifier
         self._close_notifier = bool(close_notifier)
+        self.entry_gate = entry_gate
         self.live_preflight: dict[str, Any] = {}
         # A loaded managed position must survive a failed startup preflight.
         # Once prepare_live completes, normal saves may clear it after a real
@@ -101,6 +103,9 @@ class TradingEngine:
         if self.config.mode != "live":
             self.live_preflight = {"prepared": False, "mode": self.config.mode}
             return self.live_preflight
+        ensure_model_ready = getattr(self.entry_gate, "ensure_live_ready", None)
+        if callable(ensure_model_ready):
+            ensure_model_ready()
         self.live_preflight = self.adapter.prepare_live(
             max_leverage=self.risk.max_leverage,
             managed_position=self._managed_live_position_state,
@@ -151,6 +156,11 @@ class TradingEngine:
                     int(raw_signal["score"]),
                     int(raw_signal["timestamp"]),
                     tuple(str(reason) for reason in raw_signal.get("reasons") or ()),
+                    model_name=str(raw_signal.get("model_name") or ""),
+                    model_version=str(raw_signal.get("model_version") or ""),
+                    meta_score=float(raw_signal.get("meta_score") or 0.0),
+                    meta_threshold=float(raw_signal.get("meta_threshold") or 0.0),
+                    meta_decision=str(raw_signal.get("meta_decision") or ""),
                 )
                 if raw_signal
                 else None
@@ -312,6 +322,12 @@ class TradingEngine:
                 signal,
             )
             if active_exit is not None:
+                # An exit-triggering primary signal is consumed at the candle
+                # where it appeared.  Reusing the same old signal after the
+                # close would evaluate/open with a later feature window than
+                # the one represented in the training population.
+                if signal.side != "flat":
+                    self.last_signal_timestamp = signal.timestamp
                 return active_exit
         if signal.side == "flat" or (
             signal.timestamp == self.last_signal_timestamp and not retry_pending
@@ -326,8 +342,10 @@ class TradingEngine:
         current_price = live_mark_price or execution_candles[-1].close
         if self.position is not None:
             if self.position.side == signal.side:
+                self.last_signal_timestamp = signal.timestamp
                 return TradeResult(self.adapter.name, "position_held", signal=signal, position=self.position)
             if not self._should_reverse(self.position, current_price, signal):
+                self.last_signal_timestamp = signal.timestamp
                 return TradeResult(self.adapter.name, "position_held_for_costs", signal=signal, position=self.position)
             if self.config.mode == "live":
                 self._close_live_position(current_price, "opposite_signal")
@@ -336,7 +354,17 @@ class TradingEngine:
             self.position = None
 
         if macro_decision.blocked:
-            self.pending_macro_signal = signal
+            gate_mode = str(
+                getattr(getattr(self.entry_gate, "config", None), "mode", "off")
+            ).lower()
+            if gate_mode == "enforce":
+                # Enforced Model 2 never chases an old setup after a blackout.
+                # Wait for a fresh primary signal whose decision-time features
+                # and entry time still agree with the replay contract.
+                self.pending_macro_signal = None
+                self.last_signal_timestamp = signal.timestamp
+            else:
+                self.pending_macro_signal = signal
             blocked_signal = Signal(
                 signal.side,
                 signal.score,
@@ -354,6 +382,36 @@ class TradingEngine:
         # A macro-blocked closed-bar signal remains eligible for re-evaluation
         # when the blackout ends. Other entry gates still consume it once.
         self.pending_macro_signal = None
+        if self.entry_gate is not None:
+            gate_decision = self.entry_gate.evaluate(signal, candles_by_timeframe)
+            signal = gate_decision.signal
+            LOG.info(
+                "%s entry_model decision=%s score=%s threshold=%s reason=%s",
+                self.adapter.name,
+                gate_decision.decision,
+                gate_decision.score,
+                gate_decision.threshold,
+                gate_decision.reason,
+            )
+            if not gate_decision.accepted:
+                # Consume the primary candidate even when the meta model
+                # rejects it. Re-evaluating the same closed-bar signal every
+                # poll would let later 1m bars silently change the decision.
+                self.last_signal_timestamp = signal.timestamp
+                return TradeResult(
+                    self.adapter.name,
+                    "model_rejected",
+                    signal=signal,
+                    position=self.position,
+                    raw={
+                        "trade_model": {
+                            "decision": gate_decision.decision,
+                            "score": gate_decision.score,
+                            "threshold": gate_decision.threshold,
+                            "reason": gate_decision.reason,
+                        }
+                    },
+                )
         self.last_signal_timestamp = signal.timestamp
         if not self._entry_allowed():
             return TradeResult(self.adapter.name, "risk_blocked", signal=signal, position=self.position)
@@ -1101,6 +1159,11 @@ class TradingEngine:
                     "score": signal.score,
                     "timestamp": signal.timestamp,
                     "reasons": list(signal.reasons),
+                    "model_name": signal.model_name,
+                    "model_version": signal.model_version,
+                    "meta_score": signal.meta_score,
+                    "meta_threshold": signal.meta_threshold,
+                    "meta_decision": signal.meta_decision,
                 }
                 if signal is not None
                 else None
@@ -2123,6 +2186,9 @@ class TradingEngine:
         )
         if not preserve_failed_preflight_state:
             self._save_live_reconciliation_state()
+        close_entry_gate = getattr(self.entry_gate, "close", None)
+        if callable(close_entry_gate):
+            close_entry_gate()
         close_adapter = getattr(self.adapter, "close", None)
         if close_adapter is not None:
             close_adapter()

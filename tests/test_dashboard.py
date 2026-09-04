@@ -126,6 +126,8 @@ def test_dashboard_uses_saved_live_configuration_without_duplicate_confirmation(
     assert "productionPhrase" not in DASHBOARD_HTML
     assert "BINANCE LIVE BTCUSDT" not in DASHBOARD_HTML
     assert 'id="orderSizingBox"' in DASHBOARD_HTML
+    assert 'id="tradeModelBox"' in DASHBOARD_HTML
+    assert "s.trade_model||{}" in DASHBOARD_HTML
     assert "const exact=" in DASHBOARD_HTML
     assert "启动权限直接采用“配置”中已保存的交易模式和网络" in DASHBOARD_HTML
     assert "理论最大可开金额使用比例 (%)" in DASHBOARD_HTML
@@ -226,6 +228,41 @@ def test_dashboard_market_snapshot_is_single_flight_across_tabs() -> None:
     assert adapter.calls == 1
     assert len(results) == 8
     assert all(result["market"]["mark_price"] == 100.0 for result in results)
+
+
+def test_stopped_dashboard_builds_only_an_adapter_not_a_trade_engine() -> None:
+    service = DashboardService.__new__(DashboardService)
+    service._lock = threading.RLock()
+    service.engine = None
+    service._dashboard_adapter = None
+    service._dashboard_adapter_key = None
+    expected_adapter = object()
+    config = {
+        "account": {"margin_mode": "isolated", "position_mode": "net"},
+        "exchanges": {
+            "binance": {
+                "environment": "production",
+                "base_url": "https://fapi.binance.com",
+                "symbol": "BTCUSDT",
+            }
+        },
+    }
+
+    with patch(
+        "btc_futures_bot.dashboard.make_adapter",
+        return_value=expected_adapter,
+    ) as adapter_factory, patch(
+        "btc_futures_bot.dashboard.build_engine",
+        side_effect=AssertionError("a dashboard snapshot must not build an engine"),
+    ):
+        result = service._adapter(config, "binance")
+
+    assert result is expected_adapter
+    adapter_factory.assert_called_once_with(
+        "binance",
+        config["exchanges"]["binance"],
+        config["account"],
+    )
 
 
 def test_dashboard_run_loop_alerts_on_error_then_resolves_after_success() -> None:
@@ -752,6 +789,7 @@ def test_dashboard_live_private_failure_never_falls_back_to_paper_equity() -> No
     service.last_cycle_at = 0.0
     service.started_at = 0.0
     service._config = lambda: {
+        "instance_id": "trade-model-2",
         "mode": "live",
         "paper_equity": 10_000.0,
         "active_exchange": "binance",
@@ -774,6 +812,7 @@ def test_dashboard_live_private_failure_never_falls_back_to_paper_equity() -> No
 
     status = service.status()
 
+    assert status["instance_id"] == "trade-model-2"
     assert status["account"]["source"] == "unavailable"
     assert status["account"]["wallet_balance_raw"] == ""
     assert status["account"]["wallet_balance_raw"] != "10000"

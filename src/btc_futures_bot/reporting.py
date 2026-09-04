@@ -102,6 +102,11 @@ class TradeRecord:
     realized_r: float
     holding_minutes: float
     environment: str = "testnet"
+    model_name: str = ""
+    model_version: str = ""
+    meta_score: float = 0.0
+    meta_threshold: float = 0.0
+    meta_decision: str = ""
 
     @classmethod
     def from_position(
@@ -188,6 +193,11 @@ class TradeRecord:
             realized_r=realized_distance / risk_distance if risk_distance else 0.0,
             holding_minutes=holding_hours * 60,
             environment=canonical_trade_environment(environment),
+            model_name=signal.model_name if signal else "",
+            model_version=signal.model_version if signal else "",
+            meta_score=signal.meta_score if signal else 0.0,
+            meta_threshold=signal.meta_threshold if signal else 0.0,
+            meta_decision=signal.meta_decision if signal else "",
         )
 
 

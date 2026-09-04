@@ -24,6 +24,15 @@ class Signal:
     score: int
     timestamp: int
     reasons: tuple[str, ...] = field(default_factory=tuple)
+    # Optional entry-model audit fields.  The primary strategy leaves these
+    # empty; an entry gate fills them only after it has made a new-entry
+    # decision.  Keeping them on the signal lets reports, email and restart
+    # state retain the exact model decision without changing the exit logic.
+    model_name: str = ""
+    model_version: str = ""
+    meta_score: float = 0.0
+    meta_threshold: float = 0.0
+    meta_decision: str = ""
 
 
 @dataclass(frozen=True)

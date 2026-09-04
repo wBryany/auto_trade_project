@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from btc_futures_bot.main import (
+    build_engine,
     credential_values,
     ensure_exchange_defaults,
     load_config,
@@ -137,6 +138,110 @@ def test_config_without_a_local_companion_is_unchanged(tmp_path) -> None:
 
     assert config["mode"] == "paper"
     assert config["exchanges"]["binance"]["environment"] == "testnet"
+
+
+def test_config_extends_parent_without_copying_parent_credentials(tmp_path) -> None:
+    parent = tmp_path / "base.json"
+    parent.write_text(
+        json.dumps(
+            {
+                "mode": "live",
+                "report_dir": "reports/base",
+                "credentials": {"binance": {"production": {"api_key": "base-key"}}},
+                "exchanges": {"binance": {"enabled": True, "environment": "production"}},
+                "strategy": {"mode": "traditional_kline", "min_score": 6},
+            }
+        ),
+        encoding="utf-8",
+    )
+    child = tmp_path / "model2.json"
+    child.write_text(
+        json.dumps(
+            {
+                "extends": "base.json",
+                "mode": "paper",
+                "report_dir": "reports/model2",
+                "credentials": {
+                    "binance": {"production": {"api_key": "", "api_secret": ""}}
+                },
+                "strategy": {"min_score": 7},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(str(child))
+
+    assert config["mode"] == "paper"
+    assert config["report_dir"] == "reports/model2"
+    assert config["strategy"]["mode"] == "traditional_kline"
+    assert config["strategy"]["min_score"] == 7
+    assert credential_values(config, "binance").get("api_key", "") == ""
+
+
+def test_config_extends_cycle_is_rejected(tmp_path) -> None:
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(json.dumps({"extends": "second.json"}), encoding="utf-8")
+    second.write_text(json.dumps({"extends": "first.json"}), encoding="utf-8")
+
+    try:
+        load_config(str(first))
+    except ValueError as error:
+        assert "extends cycle" in str(error)
+    else:
+        raise AssertionError("recursive config inheritance was accepted")
+
+
+def test_build_engine_attaches_configured_entry_gate(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "model2.json"
+    source.write_text(
+        json.dumps(
+            {
+                "mode": "paper",
+                "report_dir": str(tmp_path / "reports"),
+                "active_exchange": "binance",
+                "account": {"max_leverage": 3},
+                "risk": {},
+                "exchanges": {
+                    "binance": {"enabled": True, "environment": "testnet"}
+                },
+                "strategy": {"mode": "traditional_kline"},
+                "trade_model": {"type": "lightgbm_meta", "mode": "off"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Adapter:
+        name = "binance"
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("btc_futures_bot.main.make_adapter", lambda *_args: Adapter())
+    engine = build_engine("binance", load_config(str(source)))
+    try:
+        assert engine.entry_gate.status()["mode"] == "off"
+        assert engine.entry_gate.config.strategy_config_hash
+    finally:
+        engine.close()
+
+
+def test_binance_custom_credential_prefix_isolated_from_standard_environment() -> None:
+    config = {
+        "exchanges": {
+            "binance": {
+                "environment": "production",
+                "credential_env_prefix": "BINANCE_MODEL2",
+            }
+        }
+    }
+
+    exchange = ensure_exchange_defaults(config, "binance")
+
+    assert exchange["api_key_env"] == "BINANCE_MODEL2_API_KEY"
+    assert exchange["api_secret_env"] == "BINANCE_MODEL2_API_SECRET"
 
 
 def test_binance_cross_exchange_symbol_and_old_endpoint_are_corrected() -> None:

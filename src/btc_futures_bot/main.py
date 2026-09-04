@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from .notifications import EmailNotificationConfig, EmailNotifier
 from .risk import RiskConfig, RiskManager
 from .reporting import TradeReporter
 from .strategy import MultiTimeframeStrategy, StrategyConfig
+from .trade_model import EntryGate, MetaModelConfig
 
 
 EXCHANGE_DEFAULTS: dict[str, dict[str, Any]] = {
@@ -56,6 +58,7 @@ BINANCE_CREDENTIAL_ENVS = {
     "production": ("BINANCE_LIVE_API_KEY", "BINANCE_LIVE_API_SECRET"),
 }
 _CREDENTIAL_FIELDS = ("api_key", "api_secret", "passphrase")
+_CREDENTIAL_ENV_PREFIX = re.compile(r"^[A-Z][A-Z0-9_]{1,48}$")
 
 
 def canonical_binance_environment(value: Any) -> str:
@@ -138,7 +141,18 @@ def ensure_exchange_defaults(config: dict[str, Any], name: str) -> dict[str, Any
         # dashboard-supplied host for a credential-bearing Binance request.
         exchange["base_url"] = BINANCE_ENVIRONMENTS[environment]
         exchange["symbol"] = normalize_binance_symbol(exchange.get("symbol", "BTCUSDT"))
-        exchange["api_key_env"], exchange["api_secret_env"] = BINANCE_CREDENTIAL_ENVS[environment]
+        credential_prefix = str(exchange.get("credential_env_prefix") or "").strip().upper()
+        if credential_prefix:
+            if not _CREDENTIAL_ENV_PREFIX.fullmatch(credential_prefix):
+                raise ValueError(
+                    "Binance credential_env_prefix must contain only uppercase letters, "
+                    "numbers and underscores"
+                )
+            exchange["credential_env_prefix"] = credential_prefix
+            exchange["api_key_env"] = f"{credential_prefix}_API_KEY"
+            exchange["api_secret_env"] = f"{credential_prefix}_API_SECRET"
+        else:
+            exchange["api_key_env"], exchange["api_secret_env"] = BINANCE_CREDENTIAL_ENVS[environment]
     return exchange
 
 
@@ -179,13 +193,52 @@ def _merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, A
     return merged
 
 
+def _load_config_file(path: Path, ancestors: tuple[Path, ...] = ()) -> dict[str, Any]:
+    """Load one JSON config and its optional parent configs.
+
+    ``extends`` may be a string or a list of strings.  Parent paths are
+    resolved relative to the child file and merged left-to-right.  This lets a
+    second, isolated bot instance reuse the ordinary strategy/UI settings
+    without copying credentials or runtime state.
+    """
+    resolved = path.resolve()
+    if resolved in ancestors:
+        chain = " -> ".join(str(item) for item in (*ancestors, resolved))
+        raise ValueError(f"config extends cycle: {chain}")
+    with resolved.open("r", encoding="utf-8") as file:
+        raw = json.load(file)
+    if not isinstance(raw, dict):
+        raise ValueError(f"config root must be a JSON object: {resolved}")
+    requested_parents = raw.pop("extends", ())
+    if isinstance(requested_parents, str):
+        requested_parents = (requested_parents,)
+    elif isinstance(requested_parents, list):
+        requested_parents = tuple(requested_parents)
+    elif requested_parents in (None, ()):
+        requested_parents = ()
+    else:
+        raise ValueError("config extends must be a path string or a list of path strings")
+    merged: dict[str, Any] = {}
+    for requested_parent in requested_parents:
+        parent_text = str(requested_parent or "").strip()
+        if not parent_text:
+            raise ValueError("config extends contains an empty path")
+        parent = Path(parent_text)
+        if not parent.is_absolute():
+            parent = resolved.parent / parent
+        merged = _merge_config(
+            merged,
+            _load_config_file(parent, (*ancestors, resolved)),
+        )
+    return _merge_config(merged, raw)
+
+
 def load_config(path: str) -> dict[str, Any]:
     requested_path = Path(path)
     selected_path = local_config_path(requested_path)
     if not selected_path.exists():
         selected_path = requested_path
-    with selected_path.open("r", encoding="utf-8") as file:
-        config = json.load(file)
+    config = _load_config_file(selected_path)
     # The local file carries credentials and machine-specific overrides, but it
     # is written key-by-key by the dashboard and drifts behind the tracked
     # config.  Loading it standalone made any newly added strategy key fall
@@ -194,8 +247,8 @@ def load_config(path: str) -> dict[str, Any]:
     # config keeps the override semantics while inheriting new keys.
     tracked_path = tracked_config_path(selected_path)
     if tracked_path != selected_path and tracked_path.exists():
-        with tracked_path.open("r", encoding="utf-8") as file:
-            config = _merge_config(json.load(file), config)
+        config = _merge_config(_load_config_file(tracked_path), config)
+    config["_config_dir"] = str(requested_path.resolve().parent)
     config.setdefault("live_reconciliation_seconds", 5)
     config.setdefault("dashboard_snapshot_seconds", 15)
     config.setdefault("dashboard_private_stale_seconds", 90)
@@ -432,6 +485,11 @@ def build_engine(
         default_cache_path=default_macro_cache,
     )
     macro_risk = MacroRiskController(macro_config) if macro_config.enabled else None
+    trade_model_config = MetaModelConfig.from_mapping(
+        raw,
+        raw.get("_config_dir") or Path.cwd(),
+    )
+    entry_gate = EntryGate(trade_model_config)
     notifier_owned = False
     if reporter is not None and notifier is None:
         try:
@@ -458,6 +516,7 @@ def build_engine(
         macro_risk=macro_risk,
         notifier=notifier,
         close_notifier=notifier_owned,
+        entry_gate=entry_gate,
     )
 
 

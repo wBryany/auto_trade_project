@@ -303,6 +303,120 @@ def test_paper_entry_uses_latest_execution_close_not_stale_trigger_close() -> No
     assert result.position.entry_price == 105.0
 
 
+def test_entry_gate_rejection_consumes_candidate_without_opening_position() -> None:
+    class Adapter:
+        name = "test"
+        settings = SimpleNamespace(symbol="BTC-USDT")
+
+        @staticmethod
+        def fetch_candles(interval: str, limit: int) -> list[Candle]:
+            interval_ms = {"5m": 300_000, "1m": 60_000, "1h": 3_600_000}[interval]
+            return [
+                Candle(0, 100.0, 100.1, 99.9, 100.0, 10.0),
+                Candle(interval_ms, 100.0, 100.1, 99.9, 100.0, 1.0),
+            ]
+
+    class Strategy:
+        config = StrategyConfig(trigger_timeframe="5m", regime_timeframe="1h")
+
+        @staticmethod
+        def evaluate(candles_by_timeframe: object) -> Signal:
+            return Signal("long", 6, 1, ("fixed",))
+
+    class RejectingGate:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def evaluate(self, signal: Signal, candles_by_timeframe: object):
+            self.calls += 1
+            enhanced = Signal(
+                signal.side,
+                signal.score,
+                signal.timestamp,
+                signal.reasons,
+                model_name="lightgbm_meta",
+                model_version="test-v1",
+                meta_score=0.2,
+                meta_threshold=0.6,
+                meta_decision="enforce_reject",
+            )
+            return SimpleNamespace(
+                accepted=False,
+                signal=enhanced,
+                score=0.2,
+                threshold=0.6,
+                decision="enforce_reject",
+                reason="below threshold",
+            )
+
+    gate = RejectingGate()
+    engine = TradingEngine(
+        Adapter(),
+        Strategy(),
+        RiskManager(),
+        EngineConfig(mode="paper"),
+        entry_gate=gate,
+    )
+
+    first = engine.evaluate_once()
+    second = engine.evaluate_once()
+
+    assert first.status == "model_rejected"
+    assert first.position is None
+    assert first.signal is not None
+    assert first.signal.meta_decision == "enforce_reject"
+    assert engine.last_signal_timestamp == 1
+    assert second.status == "no_action"
+    assert gate.calls == 1
+
+
+def test_same_side_signal_is_consumed_while_position_is_held() -> None:
+    class Adapter:
+        name = "test"
+        settings = SimpleNamespace(symbol="BTC-USDT")
+
+        @staticmethod
+        def fetch_candles(interval: str, limit: int) -> list[Candle]:
+            interval_ms = {"5m": 300_000, "1m": 60_000, "1h": 3_600_000}[interval]
+            return [
+                Candle(0, 100.0, 100.1, 99.9, 100.0, 10.0),
+                Candle(interval_ms, 100.0, 100.1, 99.9, 100.0, 1.0),
+            ]
+
+    class FixedLongStrategy:
+        config = StrategyConfig(trigger_timeframe="5m", regime_timeframe="1h")
+
+        @staticmethod
+        def evaluate(candles_by_timeframe: object) -> Signal:
+            return Signal("long", 6, 123, ("fixed",))
+
+    engine = TradingEngine(
+        Adapter(),
+        FixedLongStrategy(),
+        RiskManager(),
+        EngineConfig(mode="paper"),
+    )
+    engine.position = Position(
+        "long",
+        1.0,
+        100.0,
+        90.0,
+        110.0,
+        int(time.time() * 1000),
+        initial_stop_price=90.0,
+        best_price=100.0,
+    )
+
+    held = engine.evaluate_once()
+    engine.position = None
+    replayed = engine.evaluate_once()
+
+    assert held.status == "position_held"
+    assert engine.last_signal_timestamp == 123
+    assert replayed.status == "no_action"
+    assert replayed.position is None
+
+
 def test_paper_entry_candle_is_not_reprocessed_on_next_poll() -> None:
     class Adapter:
         name = "test"

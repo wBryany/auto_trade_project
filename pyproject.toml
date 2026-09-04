@@ -12,6 +12,15 @@ dependencies = [
     "websocket-client>=1.8,<2",
 ]
 
+[project.optional-dependencies]
+model2 = [
+    "lightgbm>=4.6,<5",
+    "numpy>=1.26,<3",
+]
+dev = [
+    "pytest>=8,<10",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

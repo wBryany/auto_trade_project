@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .engine import normalized_poll_seconds
+from .exchanges.factory import make_adapter
 from .http_client import ApiError, clear_rate_limits, is_rate_limit_error
 from .main import (
     build_engine,
@@ -193,7 +194,12 @@ class DashboardService:
         self._snapshot_condition = threading.Condition(self._lock)
         self._dashboard_adapter: Any = None
         self._dashboard_adapter_key: tuple[str, str, str, str] | None = None
-        self.operation_logger = OperationLogger(Path(self.config_path).parent / "logs" / "operation_log.jsonl")
+        operation_log_path = Path(
+            str(initial_config.get("operation_log_path") or "logs/operation_log.jsonl")
+        )
+        if not operation_log_path.is_absolute():
+            operation_log_path = Path(self.config_path).resolve().parent / operation_log_path
+        self.operation_logger = OperationLogger(operation_log_path)
         self.notifier = self._build_notifier(initial_config)
         self._first_cycle_logged = False
         self._last_logged_error = ""
@@ -644,7 +650,14 @@ class DashboardService:
         with self._lock:
             if self._dashboard_adapter is not None and self._dashboard_adapter_key == key:
                 return self._dashboard_adapter
-        adapter = build_engine(exchange_name, config, reporter=None).adapter
+        # A stopped dashboard only needs a read-only market/account adapter.
+        # Building a full engine here would also load the meta model and open
+        # its decision-log SQLite connection, then immediately discard it.
+        adapter = make_adapter(
+            exchange_name,
+            expected,
+            dict(config.get("account") or {}),
+        )
         with self._lock:
             self._dashboard_adapter = adapter
             self._dashboard_adapter_key = key
@@ -946,8 +959,27 @@ class DashboardService:
                 "cooldown_until": self.engine.cooldown_until,
                 "loss_streak_pause_minutes": pause_minutes,
             }
+        configured_trade_model = config.get("trade_model", {})
+        trade_model_status = {
+            "type": str(configured_trade_model.get("type") or "lightgbm_meta"),
+            "mode": str(configured_trade_model.get("mode") or "off"),
+            "ready": str(configured_trade_model.get("mode") or "off") == "off",
+            "model_version": "",
+            "threshold": None,
+            "approved_for_live": False,
+            "error": "" if self.engine is not None else "交易引擎尚未启动",
+        }
+        if self.engine is not None:
+            gate = getattr(self.engine, "entry_gate", None)
+            gate_status = getattr(gate, "status", None)
+            if callable(gate_status):
+                try:
+                    trade_model_status = gate_status()
+                except Exception as error:
+                    trade_model_status["error"] = f"读取交易模型状态失败：{error}"
         return {
             "running": self.running,
+            "instance_id": str(config.get("instance_id") or ""),
             "exchange": exchange_name,
             "symbol": exchange_config.get("symbol", ""),
             "mode": config.get("mode", "paper"),
@@ -971,10 +1003,21 @@ class DashboardService:
             "order_sizing": _order_sizing_view(config, snapshot, account),
             "positions": positions,
             "open_orders": snapshot.get("open_orders", []),
-            "signal": {"side": signal.side, "score": signal.score, "timestamp": signal.timestamp, "reasons": list(signal.reasons)} if signal else None,
+            "signal": {
+                "side": signal.side,
+                "score": signal.score,
+                "timestamp": signal.timestamp,
+                "reasons": list(signal.reasons),
+                "model_name": signal.model_name,
+                "model_version": signal.model_version,
+                "meta_score": signal.meta_score,
+                "meta_threshold": signal.meta_threshold,
+                "meta_decision": signal.meta_decision,
+            } if signal else None,
             "last_result": result_view,
             "macro_risk": self.engine.macro_risk.status() if self.engine and self.engine.macro_risk else {"enabled": False, "blocked": False},
             "risk_guard": risk_guard,
+            "trade_model": trade_model_status,
             "email_notifications": email_status,
         }
 
@@ -1179,7 +1222,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       <div class="panel metric"><div class="eyebrow">当前挂单</div><div id="orderCount" class="metric-value">—</div><div id="engineSub" class="small">引擎未启动</div></div>
     </div>
     <div class="grid layout" style="margin-top:14px">
-      <div class="panel"><h2>运行控制</h2><div class="toolbar"><div class="field"><label>交易平台</label><select id="runExchange"><option value="binance">Binance</option><option value="okx">OKX</option><option value="gate">Gate</option></select></div><div class="actions"><button id="startBtn">启动引擎</button><button id="stopBtn" class="danger">停止引擎</button><button id="privateBtn" class="secondary">检查私有 API</button></div></div><div class="note">启动权限直接采用“配置”中已保存的交易模式和网络；修改配置前必须先停止引擎。</div><div class="note">当前模式：<span id="modeLabel">paper</span>；最近周期：<span id="lastCycle">—</span></div><div id="runtimeNotice" class="notice">请先在“配置”中保存测试网 API Key。没有 Key 时仍可运行公开行情和模拟盘。</div><h3>合约下单额度</h3><div id="orderSizingBox" class="small">正在读取交易所限制…</div><h3>策略信号</h3><div id="signalBox" class="small">暂无信号</div></div>
+      <div class="panel"><h2>运行控制</h2><div class="toolbar"><div class="field"><label>交易平台</label><select id="runExchange"><option value="binance">Binance</option><option value="okx">OKX</option><option value="gate">Gate</option></select></div><div class="actions"><button id="startBtn">启动引擎</button><button id="stopBtn" class="danger">停止引擎</button><button id="privateBtn" class="secondary">检查私有 API</button></div></div><div class="note">启动权限直接采用“配置”中已保存的交易模式和网络；修改配置前必须先停止引擎。</div><div class="note">当前模式：<span id="modeLabel">paper</span>；最近周期：<span id="lastCycle">—</span></div><div id="runtimeNotice" class="notice">请先在“配置”中保存测试网 API Key。没有 Key 时仍可运行公开行情和模拟盘。</div><h3>交易模型</h3><div id="tradeModelBox" class="small">正在读取模型状态…</div><h3>合约下单额度</h3><div id="orderSizingBox" class="small">正在读取交易所限制…</div><h3>策略信号</h3><div id="signalBox" class="small">暂无信号</div></div>
       <div class="panel"><h2>连接状态</h2><div id="connectionBox" class="small">正在读取…</div><h3>最近一次结果</h3><div id="resultBox" class="small">—</div><h3>风险提示</h3><div class="note">5% 是价格止损距离，不等于账户亏损 5%。引擎会按风险比例、手续费、滑点和资金费估算仓位。</div></div>
     </div>
     <div class="grid columns" style="margin-top:14px"><div class="panel"><h2>当前合约持仓</h2><div class="table-wrap"><table><thead><tr><th>来源</th><th>方向</th><th>数量</th><th>开仓价</th><th>标记价</th><th>未实现盈亏</th><th>止损</th><th>止盈</th></tr></thead><tbody id="positionsBody"><tr><td colspan="8" class="empty">暂无持仓</td></tr></tbody></table></div></div><div class="panel"><h2>当前委托订单</h2><div class="table-wrap"><table><thead><tr><th>订单号</th><th>方向</th><th>类型</th><th>状态</th><th>数量</th><th>触发价</th><th>只减仓</th></tr></thead><tbody id="ordersBody"><tr><td colspan="7" class="empty">暂无挂单</td></tr></tbody></table></div></div></div>
@@ -1239,5 +1282,6 @@ loadReports=async function(){try{const q=new URLSearchParams();if($('fromDate').
 document.querySelectorAll('#reportScopeButtons button').forEach(button=>{button.onclick=()=>{reportScope=button.dataset.scope;document.querySelectorAll('#reportScopeButtons button').forEach(item=>item.classList.toggle('active',item===button));loadReports()}});$('reportBtn').onclick=loadReports;loadReports();
 if($('stopLoss'))$('stopLoss').insertAdjacentHTML('afterend','<div class="note">动态止损：30秒 ATR × 1.4，自动限制在 0.25%～0.60%；页面上的止损比例是 ATR 不可用时的备用值。</div>');
 if($('stopLoss'))$('stopLoss').insertAdjacentHTML('afterend','<div class="note">费用保护：按吃单 0.05% 双边、滑点 0.02%估算；反向信号不会在手续费后亏损时频繁平仓，除非出现满分强反转。</div>');
+const modelAwareRenderStatus=renderStatus;renderStatus=function(s){modelAwareRenderStatus(s);const m=s.trade_model||{};const ready=Boolean(m.ready);const threshold=m.threshold===null||m.threshold===undefined?'—':Number(m.threshold).toFixed(4);const approval=m.approved_for_live?'<span class="positive">已通过 live 审批</span>':'<span class="neutral">尚未通过 live 审批</span>';$('tradeModelBox').innerHTML=`模式：<b>${esc(m.mode||'off')}</b> · 状态：<span class="${ready?'positive':'neutral'}">${ready?'就绪':'未就绪'}</span><br>版本：${esc(m.model_version||'—')} · 阈值：${threshold}<br>${approval}${m.error?`<br><span class="negative">${esc(m.error)}</span>`:''}`;const sig=s.signal;if(sig&&sig.meta_decision){const score=Number(sig.meta_score).toFixed(4);const signalThreshold=Number(sig.meta_threshold).toFixed(4);$('signalBox').insertAdjacentHTML('beforeend',`<br>模型：${esc(sig.meta_decision)} · P=${score} / ${signalThreshold}`)}};
 const emailAwareRenderStatus=renderStatus;renderStatus=function(s){emailAwareRenderStatus(s);const e=s.email_notifications||{};if($('emailState'))$('emailState').textContent=`邮件：${e.enabled?'已启用':'未启用'} · ${e.ready?'发送就绪':'配置未就绪'} · 收件人 ${e.recipients_count||0}/5${e.last_error?' · 最近错误：'+e.last_error:''}`};
 </script></body></html>"""

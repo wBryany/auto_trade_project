@@ -1,10 +1,79 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from .indicators import atr, ema, macd, rsi, sma
 from .models import Candle, Position, Signal
+
+
+_REPLAY_CACHE_MISS = object()
+
+
+class _StrategyReplayCache:
+    """Bounded caches owned by one explicit offline replay context."""
+
+    def __init__(self, max_entries_per_helper: int) -> None:
+        self.max_entries_per_helper = max(1, int(max_entries_per_helper))
+        self._values: dict[str, OrderedDict[Any, Any]] = {}
+
+    def get(self, namespace: str, key: Any) -> Any:
+        values = self._values.get(namespace)
+        if values is None:
+            return _REPLAY_CACHE_MISS
+        try:
+            result = values.pop(key)
+        except KeyError:
+            return _REPLAY_CACHE_MISS
+        values[key] = result
+        return result
+
+    def put(self, namespace: str, key: Any, value: Any) -> Any:
+        values = self._values.setdefault(namespace, OrderedDict())
+        if key in values:
+            values.pop(key)
+        elif len(values) >= self.max_entries_per_helper:
+            values.popitem(last=False)
+        values[key] = value
+        return value
+
+
+_ACTIVE_STRATEGY_REPLAY_CACHE: ContextVar[_StrategyReplayCache | None] = ContextVar(
+    "active_strategy_replay_cache",
+    default=None,
+)
+
+
+@contextmanager
+def strategy_replay_cache(
+    *,
+    max_entries_per_helper: int = 1024,
+) -> Iterator[None]:
+    """Enable deterministic helper memoization for one offline replay only.
+
+    Live and ordinary strategy calls remain completely uncached. ``ContextVar``
+    keeps independently executed replay contexts isolated, and resetting the
+    token releases every cached history/result when the scope exits.
+    """
+
+    cache = _StrategyReplayCache(max_entries_per_helper)
+    token = _ACTIVE_STRATEGY_REPLAY_CACHE.set(cache)
+    try:
+        yield
+    finally:
+        _ACTIVE_STRATEGY_REPLAY_CACHE.reset(token)
+
+
+def _strategy_replay_sequence_key(candles: Sequence[Candle]) -> Any:
+    stable_key = getattr(candles, "strategy_replay_cache_key", None)
+    if stable_key is not None:
+        return "window", stable_key() if callable(stable_key) else stable_key
+    # A caller can still opt into the explicit replay scope with a normal list.
+    # Candle is frozen/hashable, so the complete tuple is an exact content key.
+    return "values", tuple(candles)
 
 
 @dataclass(frozen=True)
@@ -1490,6 +1559,24 @@ def _traditional_features(
     atr_period: int,
     volume_period: int,
 ) -> _TraditionalFeatures:
+    replay_cache = _ACTIVE_STRATEGY_REPLAY_CACHE.get()
+    cache_key: Any = None
+    if replay_cache is not None:
+        cache_key = (
+            _strategy_replay_sequence_key(candles),
+            int(fast_period),
+            int(slow_period),
+            int(rsi_period),
+            int(macd_fast_period),
+            int(macd_slow_period),
+            int(macd_signal_period),
+            int(atr_period),
+            int(volume_period),
+        )
+        cached = replay_cache.get("traditional_features", cache_key)
+        if cached is not _REPLAY_CACHE_MISS:
+            return cached
+
     closes = [candle.close for candle in candles]
     highs = [candle.high for candle in candles]
     lows = [candle.low for candle in candles]
@@ -1503,7 +1590,7 @@ def _traditional_features(
     previous_volumes = [_volume_value(candle) for candle in candles[volume_start:index]]
     average_volume = sum(previous_volumes) / len(previous_volumes) if previous_volumes else 0.0
     volume_ratio = _volume_value(candles[index]) / average_volume if average_volume > 0 else None
-    return _TraditionalFeatures(
+    result = _TraditionalFeatures(
         open=candles[index].open,
         high=highs[index],
         low=lows[index],
@@ -1519,6 +1606,9 @@ def _traditional_features(
         atr=atr_values[index],
         volume_ratio=volume_ratio,
     )
+    if replay_cache is not None:
+        replay_cache.put("traditional_features", cache_key, result)
+    return result
 
 
 def _traditional_setup_state(
@@ -2081,6 +2171,13 @@ def _aggregate_five_minute_candles(
     target_minutes = int(target_minutes)
     if target_minutes < 10 or target_minutes % 5:
         return []
+    replay_cache = _ACTIVE_STRATEGY_REPLAY_CACHE.get()
+    cache_key: Any = None
+    if replay_cache is not None:
+        cache_key = (_strategy_replay_sequence_key(candles), target_minutes)
+        cached = replay_cache.get("aggregate_five_minute", cache_key)
+        if cached is not _REPLAY_CACHE_MISS:
+            return cached
     source_ms = 5 * 60_000
     target_ms = target_minutes * 60_000
     expected = target_minutes // 5
@@ -2113,6 +2210,8 @@ def _aggregate_five_minute_candles(
                 quote_volume=quote_volume,
             )
         )
+    if replay_cache is not None:
+        replay_cache.put("aggregate_five_minute", cache_key, aggregated)
     return aggregated
 
 
@@ -2178,12 +2277,25 @@ def _traditional_higher_timeframe_average_levels(
 ) -> tuple[list[tuple[str, float]], str]:
     """Return locally synthesized 10m/15m EMA and SMA levels."""
 
+    replay_cache = _ACTIVE_STRATEGY_REPLAY_CACHE.get()
+    cache_key: Any = None
+    if replay_cache is not None:
+        cache_key = (_strategy_replay_sequence_key(trigger_candles), id(config))
+        cached = replay_cache.get("higher_timeframe_average_levels", cache_key)
+        if cached is not _REPLAY_CACHE_MISS:
+            return cached
+
+    def complete(result: tuple[list[tuple[str, float]], str]) -> tuple[list[tuple[str, float]], str]:
+        if replay_cache is not None:
+            replay_cache.put("higher_timeframe_average_levels", cache_key, result)
+        return result
+
     configured_timeframes = config.traditional_pressure_timeframes_minutes
     if isinstance(configured_timeframes, (int, float, str)):
         configured_timeframes = (int(configured_timeframes),)
     timeframes = tuple(sorted({int(value) for value in configured_timeframes}))
     if not timeframes:
-        return [], "invalid_pressure_configuration"
+        return complete(([], "invalid_pressure_configuration"))
     ema_period = max(1, int(config.traditional_pressure_ema_period))
     sma_period = max(1, int(config.traditional_pressure_sma_period))
     levels: list[tuple[str, float]] = []
@@ -2191,18 +2303,18 @@ def _traditional_higher_timeframe_average_levels(
         aggregated = _aggregate_five_minute_candles(trigger_candles, minutes)
         closes = [float(candle.close) for candle in aggregated]
         if len(closes) < max(ema_period, sma_period):
-            return [], f"{minutes}m_insufficient_history"
+            return complete(([], f"{minutes}m_insufficient_history"))
         ema_value = ema(closes, ema_period)[-1]
         sma_value = sma(closes, sma_period)[-1]
         if ema_value is None or sma_value is None:
-            return [], f"{minutes}m_average_unavailable"
+            return complete(([], f"{minutes}m_average_unavailable"))
         levels.extend(
             (
                 (f"{minutes}m_ema{ema_period}", float(ema_value)),
                 (f"{minutes}m_sma{sma_period}", float(sma_value)),
             )
         )
-    return levels, ""
+    return complete((levels, ""))
 
 
 def _traditional_predictive_reversal_short(

@@ -5,6 +5,7 @@ import csv
 from bisect import bisect_right
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 from .costs import CostConfig
 from .models import Candle, Position, Signal
@@ -67,6 +68,7 @@ def run_backtest(
     risk: RiskManager | None = None,
     reporter: TradeReporter | None = None,
     use_fixed_take_profit: bool = False,
+    entry_gate: Any = None,
 ) -> BacktestSummary:
     strategy = strategy or MultiTimeframeStrategy(StrategyConfig())
     trigger_timeframe = strategy.config.trigger_timeframe
@@ -321,6 +323,11 @@ def run_backtest(
 
         if position is None and signal.side != "flat" and signal.timestamp != last_signal_timestamp:
             last_signal_timestamp = signal.timestamp
+            if entry_gate is not None:
+                gate_decision = entry_gate.evaluate(signal, candles_by_timeframe)
+                signal = gate_decision.signal
+                if not gate_decision.accepted:
+                    continue
             if next_execution_open is None:
                 continue
             loss_streak_pause = max(0, int(getattr(risk.config, "loss_streak_pause_minutes", 0)))

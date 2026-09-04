@@ -1,0 +1,90 @@
+{
+  "extends": "config.binance.testnet.json",
+  "instance_id": "trade-model-2",
+  "mode": "paper",
+  "report_dir": "reports/binance_model2",
+  "operation_log_path": "logs/operation_log.model2.jsonl",
+  "active_exchange": "binance",
+  "account": {
+    "margin_mode": "isolated",
+    "position_mode": "net",
+    "max_leverage": 20
+  },
+  "risk": {
+    "risk_per_trade": 0.02,
+    "stop_loss_pct": 0.005,
+    "max_notional_pct": 0.3,
+    "max_daily_loss_pct": 0.02,
+    "max_consecutive_losses": 0,
+    "cooldown_minutes": 5,
+    "loss_streak_pause_minutes": 0
+  },
+  "strategy": {
+    "mode": "traditional_kline",
+    "trigger_timeframe": "5m",
+    "regime_timeframe": "1h",
+    "min_stop_loss_pct": 0.0045,
+    "max_stop_loss_pct": 0.006,
+    "time_exit_min_r": 0.2,
+    "max_hold_seconds": 3600,
+    "hard_max_hold_seconds": 5400,
+    "traditional_ultra_short_pressure_min_room_r": 0.15,
+    "traditional_ultra_short_1m_min_volume_ratio": 1.1,
+    "traditional_ultra_short_1m_min_body_ratio": 0.45,
+    "traditional_ultra_short_1m_min_close_location": 0.65,
+    "traditional_ultra_short_1m_min_range_atr": 0.8,
+    "traditional_ultra_short_1m_max_extension_atr": 0.8,
+    "traditional_ultra_short_break_even_lock_r": 0.15,
+    "traditional_failed_breakout_short_shadow": true,
+    "traditional_trend_fast": 50,
+    "traditional_trend_slow": 200,
+    "traditional_signal_fast": 9,
+    "traditional_signal_slow": 21,
+    "traditional_rsi_period": 14,
+    "traditional_rsi_long_min": 48.0,
+    "traditional_rsi_long_max": 72.0,
+    "traditional_rsi_short_min": 28.0,
+    "traditional_rsi_short_max": 52.0,
+    "traditional_macd_fast": 12,
+    "traditional_macd_slow": 26,
+    "traditional_macd_signal": 9,
+    "traditional_volume_sma_period": 20,
+    "traditional_require_1m_confirmation": true,
+    "traditional_setup_macd_handoff_max_extension_atr": 1.5,
+    "traditional_setup_volume_handoff_max_extension_atr": 0.8,
+    "traditional_allow_pullback": true,
+    "traditional_allow_breakout": true,
+    "traditional_breakout_lookback": 6,
+    "traditional_allow_early_regime": true,
+    "traditional_countertrend_cross_max_regime_gap_pct": 0.01,
+    "traditional_countertrend_pullback_max_regime_gap_pct": 0.01,
+    "traditional_neutral_transition_max_regime_gap_pct": 0.0075
+  },
+  "exchanges": {
+    "binance": {
+      "enabled": true,
+      "environment": "production",
+      "credential_env_prefix": "BINANCE_MODEL2"
+    }
+  },
+  "credentials": {
+    "binance": {
+      "testnet": {
+        "api_key": "",
+        "api_secret": ""
+      },
+      "production": {
+        "api_key": "",
+        "api_secret": ""
+      }
+    }
+  },
+  "trade_model": {
+    "type": "lightgbm_meta",
+    "mode": "enforce",
+    "artifact_path": "artifacts/trade_model_2_0/model.txt",
+    "manifest_path": "artifacts/trade_model_2_0/manifest.json",
+    "decision_log_path": "reports/binance_model2/model_decisions.sqlite3",
+    "require_approved_for_live": true
+  }
+}

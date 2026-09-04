@@ -19,6 +19,41 @@ Copy-Item .env.example .env
 py -m btc_futures_bot.main --config config.example.json --once
 ```
 
+## 交易模型 2.0（LightGBM Meta Gate）
+
+2.0 保留现有 `traditional_kline` 作为主策略，只在准备新开仓时用 LightGBM 对候选信号做放行或拒绝。仓位计算、硬止损、动态退出、报表、邮件和控制台仍使用原来的独立模块；模型不可用时，`enforce` 模式会禁止新开仓，但不会阻止已有仓位退出。
+
+安装可选模型依赖并下载 Binance USDⓈ-M 公共历史数据：
+
+```powershell
+pip install -e ".[model2]"
+python .\scripts\download_binance_klines.py --symbol BTCUSDT --start 2025-09-01T00:00:00Z --output-dir .\data\binance_meta_12m
+```
+
+按当前有效策略、风险和费用配置重放候选，训练模型并冻结验证集阈值：
+
+```powershell
+python .\scripts\train_meta_model.py --config .\config.binance.model2.json --data-dir .\data\binance_meta_12m --output-dir .\artifacts\trade_model_2_0
+```
+
+训练和实时推理共用同一特征实现。制品会校验特征顺序、模型文件、完整策略配置以及风险/费用/标签/历史窗口政策；任一指纹不一致都会拒绝加载。当前固定 TP/SL 三重障碍标签与实盘动态退出并不完全等价，因此生成的模型仅供 `paper` 对比，不会自动获得 `approved_for_live`。
+
+在独立端口启动 2.0 纸面交易：
+
+```powershell
+.\scripts\start_model2.ps1
+```
+
+打开 `http://127.0.0.1:8788`。2.0 使用独立的报表、操作日志、模型决策 SQLite 和邮件状态，不会复用 8787 的运行文件。`trade_model.mode` 支持 `off`、`shadow` 和 `enforce`；正式比较使用 `enforce`，阈值来自训练制品而不是手填概率。
+
+若以后改为两个真实账户 A/B 并跑，必须使用不同 Binance 账户或子账户、不同 API Key 和 `BINANCE_MODEL2_API_KEY` / `BINANCE_MODEL2_API_SECRET` 环境变量。同一个单向持仓账户不能同时运行两套机器人，因为它们会共同看到并操作同一净仓位和保护单。比较时优先看净 R、Profit Factor、扣费期望、最大回撤、候选覆盖率和执行错误率，而不是只看胜率。
+
+已有成交记录可先做实盘尸检：
+
+```powershell
+python .\scripts\analyze_trades.py .\reports\binance-production\trade_report.csv
+```
+
 ## 操作日志
 
 本地控制台新增“操作日志”页，记录配置保存、策略/代码变更、引擎启动、停止、重启、首次周期执行和周期错误。日志保存在 `logs/operation_log.jsonl`，支持按日期、类型和关键词筛选；API Key、API Secret、Passphrase、Token 等敏感字段会被过滤，不会写入日志。

@@ -7,6 +7,8 @@ param(
     [int]$Port = 8787,
     [string]$PythonPath = "",
     [string]$RuntimeWorkingDirectory = "",
+    [ValidatePattern("^[A-Za-z0-9._-]+$")]
+    [string]$LogPrefix = "dashboard.restart",
     [switch]$DashboardOnly,
     [switch]$CheckOnly
 )
@@ -254,8 +256,8 @@ if ($PythonPath) {
 $logDirectory = Join-Path $runtimeRoot "logs"
 New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$stdoutPath = Join-Path $logDirectory "dashboard.restart.$stamp.stdout.log"
-$stderrPath = Join-Path $logDirectory "dashboard.restart.$stamp.stderr.log"
+$stdoutPath = Join-Path $logDirectory "$LogPrefix.$stamp.stdout.log"
+$stderrPath = Join-Path $logDirectory "$LogPrefix.$stamp.stderr.log"
 $previousPythonPath = $env:PYTHONPATH
 
 try {

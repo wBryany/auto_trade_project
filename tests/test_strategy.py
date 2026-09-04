@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -19,6 +20,7 @@ from btc_futures_bot.strategy import (
     _TraditionalFeatures,
     _TraditionalSetupState,
     _aggregate_five_minute_candles,
+    _traditional_features,
     _traditional_countertrend_cross_regime,
     _traditional_countertrend_pullback_regime,
     _traditional_cross_quality,
@@ -47,6 +49,7 @@ from btc_futures_bot.strategy import (
     signal_stop_loss_overrides,
     signal_stop_timeframe,
     signal_trade_management_overrides,
+    strategy_replay_cache,
 )
 
 
@@ -81,6 +84,50 @@ def _adverse_exit_config(**overrides: object) -> StrategyConfig:
     }
     values.update(overrides)
     return StrategyConfig(**values)
+
+
+def test_replay_cache_is_explicit_scoped_and_default_strategy_path_stays_uncached() -> None:
+    candles = _adverse_exit_candles((100.1, 100.2, 100.3, 100.4))
+    arguments = (2, 3, 3, 2, 4, 2, 3, 5)
+
+    # _traditional_features calls the strategy module's EMA twice. Ordinary
+    # (including live) calls must recompute, while only the explicit offline
+    # scope may reuse the deterministic result.
+    with patch("btc_futures_bot.strategy.ema", wraps=ema) as mocked_ema:
+        first = _traditional_features(candles, *arguments)
+        second = _traditional_features(candles, *arguments)
+        assert mocked_ema.call_count == 4
+
+        with strategy_replay_cache():
+            cached_first = _traditional_features(candles, *arguments)
+            cached_second = _traditional_features(candles, *arguments)
+        assert mocked_ema.call_count == 6
+
+        after_scope = _traditional_features(candles, *arguments)
+        assert mocked_ema.call_count == 8
+
+    assert first == second == cached_first == cached_second == after_scope
+
+
+def test_replay_cache_context_does_not_leak_into_another_thread() -> None:
+    candles = _adverse_exit_candles((100.1, 100.2, 100.3, 100.4))
+    arguments = (2, 3, 3, 2, 4, 2, 3, 5)
+
+    def evaluate_twice() -> None:
+        _traditional_features(candles, *arguments)
+        _traditional_features(candles, *arguments)
+
+    with patch("btc_futures_bot.strategy.ema", wraps=ema) as mocked_ema:
+        with strategy_replay_cache():
+            evaluate_twice()
+            assert mocked_ema.call_count == 2
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                executor.submit(evaluate_twice).result()
+            # A fresh thread has no active ContextVar value, so both calls use
+            # the normal uncached path rather than sharing the parent's cache.
+            assert mocked_ema.call_count == 6
+            evaluate_twice()
+            assert mocked_ema.call_count == 6
 
 
 def test_adverse_dynamic_exit_requires_price_loss_and_two_closed_confirmations() -> None:
