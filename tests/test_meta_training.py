@@ -26,6 +26,7 @@ from btc_futures_bot.trade_model.training import (
     load_candles,
     replay_primary_candidates,
     resolve_replay_history_window,
+    predict_samples,
     threshold_metrics,
     train_lightgbm_native,
     triple_barrier_label,
@@ -458,7 +459,7 @@ def test_cached_and_uncached_replay_emit_identical_full_signals_on_real_slice() 
 
 
 class _FakeDataset:
-    def __init__(self, data: list[list[float]], **kwargs: object) -> None:
+    def __init__(self, data: object, **kwargs: object) -> None:
         self.data = data
         self.kwargs = kwargs
 
@@ -466,13 +467,17 @@ class _FakeDataset:
 class _FakeBooster:
     best_iteration = 3
 
+    def __init__(self) -> None:
+        self.last_predict_matrix: object | None = None
+
     def save_model(self, path: str, num_iteration: int) -> None:
         Path(path).write_text(
             f"tree\nnum_iteration={num_iteration}\n", encoding="utf-8"
         )
 
-    def predict(self, matrix: list[list[float]], num_iteration: int) -> list[float]:
-        return [0.75 for _ in matrix]
+    def predict(self, matrix: object, num_iteration: int) -> list[float]:
+        self.last_predict_matrix = matrix
+        return [0.75 for _ in range(len(matrix))]  # type: ignore[arg-type]
 
 
 class _FakeLightGBM:
@@ -487,17 +492,18 @@ class _FakeLightGBM:
         return _FakeBooster()
 
 
-def _model_sample(identifier: str, label: int) -> object:
+def _model_sample(identifier: str, label: int, feature_value: float = 0.0) -> object:
     @dataclass(frozen=True)
     class Sample:
         candidate_id: str
         features: tuple[float, ...]
         label: int
 
-    return Sample(identifier, tuple(0.0 for _ in FEATURE_NAMES), label)
+    return Sample(identifier, tuple(feature_value for _ in FEATURE_NAMES), label)
 
 
 def test_native_lightgbm_writer_can_be_tested_without_lightgbm_dependency(tmp_path: Path) -> None:
+    numpy = pytest.importorskip("numpy")
     output = tmp_path / "model.txt"
     booster, digest = train_lightgbm_native(
         [_model_sample("loss", 0), _model_sample("win", 1)],  # type: ignore[arg-type]
@@ -508,5 +514,52 @@ def test_native_lightgbm_writer_can_be_tested_without_lightgbm_dependency(tmp_pa
     )
 
     assert isinstance(booster, _FakeBooster)
+    assert predict_samples(
+        booster,
+        [_model_sample("prediction", 1)],  # type: ignore[arg-type]
+    ) == [0.75]
+    assert isinstance(booster.last_predict_matrix, numpy.ndarray)
+    assert booster.last_predict_matrix.shape == (1, len(FEATURE_NAMES))
     assert output.read_text(encoding="utf-8").startswith("tree\n")
     assert len(digest) == 64
+
+
+def test_native_lightgbm_real_round_trip(tmp_path: Path) -> None:
+    lightgbm = pytest.importorskip("lightgbm")
+    train_samples = [
+        _model_sample(f"train-{index}", index % 2, float(index % 2))
+        for index in range(12)
+    ]
+    validation_samples = [
+        _model_sample(f"validation-{index}", index % 2, float(index % 2))
+        for index in range(4)
+    ]
+    output = tmp_path / "model.txt"
+
+    booster, digest = train_lightgbm_native(
+        train_samples,  # type: ignore[arg-type]
+        validation_samples,  # type: ignore[arg-type]
+        output,
+        lightgbm_module=lightgbm,
+        params={
+            "min_data_in_leaf": 1,
+            "min_data_in_bin": 1,
+            "num_leaves": 3,
+            "feature_fraction": 1.0,
+            "bagging_fraction": 1.0,
+            "bagging_freq": 0,
+        },
+        num_boost_round=3,
+        early_stopping_rounds=0,
+    )
+    loaded = lightgbm.Booster(model_file=str(output))
+    probabilities = predict_samples(
+        loaded,
+        validation_samples,  # type: ignore[arg-type]
+    )
+
+    assert isinstance(booster, lightgbm.Booster)
+    assert output.is_file()
+    assert len(digest) == 64
+    assert len(probabilities) == len(validation_samples)
+    assert all(0.0 <= probability <= 1.0 for probability in probabilities)

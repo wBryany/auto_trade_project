@@ -826,6 +826,23 @@ def samples_to_matrix(samples: Sequence[TrainingSample]) -> tuple[list[list[floa
     return matrix, labels
 
 
+def _samples_to_numpy(samples: Sequence[TrainingSample]) -> tuple[Any, Any]:
+    """Return the dense arrays accepted by LightGBM's native API."""
+
+    try:
+        import numpy as np
+    except ImportError as error:
+        raise RuntimeError(
+            "NumPy is optional; install with `pip install -e .[model2]` before training"
+        ) from error
+    matrix, labels = samples_to_matrix(samples)
+    feature_array = np.asarray(matrix, dtype=np.float64, order="C").reshape(
+        len(matrix), len(FEATURE_NAMES)
+    )
+    label_array = np.asarray(labels, dtype=np.int32)
+    return feature_array, label_array
+
+
 def train_lightgbm_native(
     train_samples: Sequence[TrainingSample],
     validation_samples: Sequence[TrainingSample],
@@ -850,8 +867,8 @@ def train_lightgbm_native(
             raise RuntimeError(
                 "LightGBM is optional; install with `pip install -e .[model2]` before training"
             ) from error
-    train_x, train_y = samples_to_matrix(train_samples)
-    validation_x, validation_y = samples_to_matrix(validation_samples)
+    train_x, train_y = _samples_to_numpy(train_samples)
+    validation_x, validation_y = _samples_to_numpy(validation_samples)
     train_set = lightgbm_module.Dataset(
         train_x,
         label=train_y,
@@ -899,9 +916,9 @@ def train_lightgbm_native(
 
 
 def predict_samples(booster: Any, samples: Sequence[TrainingSample]) -> list[float]:
-    matrix, _labels = samples_to_matrix(samples)
-    if not matrix:
+    if not samples:
         return []
+    matrix, _labels = _samples_to_numpy(samples)
     best_iteration = int(getattr(booster, "best_iteration", 0) or 0)
     values = booster.predict(matrix, num_iteration=best_iteration or -1)
     result = [float(value) for value in values]
