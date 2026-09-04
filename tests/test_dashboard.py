@@ -94,6 +94,12 @@ def test_dashboard_uses_saved_live_configuration_without_duplicate_confirmation(
     assert "不改变 K 线周期" in DASHBOARD_HTML
 
 
+def test_dashboard_trade_report_displays_entry_and_exit_times() -> None:
+    assert "<th>开仓时间</th><th>平仓时间</th>" in DASHBOARD_HTML
+    assert "formatBeijing(r.entry_time)" in DASHBOARD_HTML
+    assert "formatBeijing(r.exit_time)" in DASHBOARD_HTML
+
+
 def test_dashboard_marks_live_take_profit_as_dynamic() -> None:
     position = Position("long", 0.001, 100.0, 99.0, 102.5, 1)
 

@@ -78,7 +78,7 @@ CSV 使用 UTF-8 BOM，Excel 可以直接打开。当前纸面/回测会完整�
 
 `traditional_predictive_reversal_short_enabled` 用于处理 5m K 线尚未收盘时已经出现的冲高失败。它只读取已收盘的 1m K 线：先识别靠近 10m/15m 均线簇的放量、超买和 ATR 扩张尖峰，再要求随后首根 1m 同时跌回 EMA9/EMA21 下方、MACD 柱转负、RSI 明显回落且卖出确认量不低于近期均量的配置比例。信号仍然非重绘，不会使用正在形成的 K 线；默认按半风险开空，止损锚定最近 8 根 1m 的冲高结构并受最大止损比例限制。若 1m 时间戳不连续，分支直接保持空仓。
 
-超短分支可按方向停用不稳定的例外入场：`traditional_ultra_short_reversal_allow_long/short` 控制 1m 极值收复/拒绝反转，`traditional_ultra_short_countertrend_allow_long/short` 控制是否允许逆已收盘 1h 强趋势入场。关闭逆势某一方不会影响同方向、且不与 1h 强趋势冲突的延续与回调续走信号。
+超短分支可按方向停用不稳定的例外入场：`traditional_ultra_short_reversal_allow_long/short` 控制 1m 极值收复/拒绝反转，`traditional_ultra_short_countertrend_allow_long/short` 控制是否允许逆已收盘 1h 强趋势入场。正式配置关闭多空两个方向的逆 1h 强趋势入场；这不会影响顺势延续，也不会影响通过独立反转结构确认的信号。
 
 超短线默认使用 `traditional_ultra_short_trailing_trigger_r/distance_r` 管理追踪止盈；`traditional_ultra_short_reversal_short_trailing_trigger_r/distance_r` 可为 `1m_ultra_short_reversal_short` 单独设置更早、更紧的保护，不影响趋势延续等其他信号。
 
@@ -147,5 +147,13 @@ $env:PYTHONPATH="src"
 ```
 
 打开 `http://127.0.0.1:8787`。页面可以保存测试网 API Key、启动/停止引擎、查看实时行情/账户/持仓/挂单，以及按日期筛选逐笔和日/月报表。凭据保存到被 Git 忽略的 `config.binance.testnet.local.json`；默认模式仍是 `paper`。
+
+Windows 手动重启可以直接双击 `scripts\restart_bot.cmd`，也可以在 PowerShell 中运行：
+
+```powershell
+.\scripts\restart_bot.ps1
+```
+
+脚本会先安全停止交易引擎、保存受管仓位状态，再停止并重启页面进程，等待页面就绪后按当前配置恢复交易引擎。仅重启页面而不启动交易引擎时，使用 `.\scripts\restart_bot.ps1 -DashboardOnly`。如果切换了网络节点，必须运行此脚本或重启进程，旧进程内保存的 Binance 限频倒计时不会因为出口 IP 改变而自动消失。
 
 `*.local.json` 只是覆盖层：加载时先读同名的已提交配置，再把本地文件逐键覆盖上去。页面保存只写它认识的字段，所以本地文件总会落后于仓库配置；如果不做合并，新增的策略开关会静默退回代码默认值（通常是关闭），仓库里明明打开的分支在实盘中并不会执行。合并后本地文件仍然优先，但没写到的键会继承已提交配置。真实测试网下单前仍需完成订单成交回报对账，不要直接把 `live` 当作实盘部署。
