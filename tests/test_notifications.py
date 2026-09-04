@@ -359,6 +359,115 @@ def test_closed_notifier_rejects_new_emails(tmp_path: Path) -> None:
     assert messages == []
 
 
+def test_strategy_inspection_report_confirms_its_own_delivery(tmp_path: Path) -> None:
+    messages = []
+    now = datetime(2026, 9, 4, 13, 7, 8, tzinfo=ZoneInfo("Asia/Shanghai"))
+    notifier = EmailNotifier(
+        _email_config(tmp_path),
+        send_fn=messages.append,
+        now_fn=lambda: now,
+    )
+
+    assert notifier.send_strategy_inspection_report(
+        "执行情况：服务正常\n策略分析：本小时没有新增平仓交易\n"
+        "行情：https://example.test/kline?api_key=visible&signature=hidden\n"
+        "策略修改：无修改；样本不足。\n验证结果：无需重启。",
+        status="no_change",
+        run_id="2026-09-04T13:00:00+08:00",
+        timeout=1,
+    )
+    notifier.close()
+
+    assert len(messages) == 1
+    assert messages[0]["Subject"] == "【整点巡检】无策略修改｜2026-09-04 13:00"
+    content = messages[0].get_content()
+    assert "巡检批次：2026-09-04T13:00:00+08:00" in content
+    assert "执行情况：服务正常" in content
+    assert "策略分析：本小时没有新增平仓交易" in content
+    assert "策略修改：无修改；样本不足" in content
+    assert "api_key=[REDACTED]" in content
+    assert "signature=[REDACTED]" in content
+    assert "visible" not in content
+    assert "hidden" not in content
+
+
+def test_strategy_inspection_report_surfaces_smtp_failure(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    secret_detail = "smtp unavailable with SECRET_REPORT_BODY"
+
+    def fail_send(message: object) -> None:
+        raise OSError(secret_detail)
+
+    notifier = EmailNotifier(_email_config(tmp_path), send_fn=fail_send)
+    try:
+        notifier.send_strategy_inspection_report(
+            "执行情况：巡检完成\n策略分析：无\n策略修改：无",
+            status="failed",
+            run_id="2026-09-04T14:00:00+08:00",
+            timeout=1,
+        )
+    except RuntimeError as error:
+        assert "smtp unavailable" in str(error)
+    else:
+        raise AssertionError("SMTP failure must be returned to the inspection task")
+    finally:
+        notifier.close()
+    assert secret_detail not in caplog.text
+    assert "SECRET_REPORT_BODY" not in caplog.text
+    assert "error_type=OSError" in caplog.text
+
+
+def test_strategy_inspection_report_times_out_per_message(tmp_path: Path) -> None:
+    release = threading.Event()
+
+    def blocked_send(message: object) -> None:
+        release.wait(timeout=2)
+
+    notifier = EmailNotifier(_email_config(tmp_path), send_fn=blocked_send)
+    try:
+        notifier.send_strategy_inspection_report(
+            "执行情况：巡检完成\n策略分析：无\n策略修改：无",
+            status="no_change",
+            run_id="2026-09-04T15:00:00+08:00",
+            timeout=0.01,
+        )
+    except RuntimeError as error:
+        assert "超时" in str(error)
+    else:
+        raise AssertionError("blocked delivery must time out")
+    finally:
+        release.set()
+        notifier.close()
+
+
+def test_strategy_inspection_report_rejects_partial_recipient_delivery(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    rejected_address = "two@example.com"
+
+    def partially_rejected(message: object) -> dict[str, tuple[int, bytes]]:
+        return {rejected_address: (550, b"mailbox unavailable")}
+
+    notifier = EmailNotifier(_email_config(tmp_path), send_fn=partially_rejected)
+    try:
+        notifier.send_strategy_inspection_report(
+            "执行情况：巡检完成\n策略分析：无\n策略修改：无",
+            status="no_change",
+            run_id="2026-09-04T16:00:00+08:00",
+            timeout=1,
+        )
+    except RuntimeError as error:
+        assert "拒绝了 1 个收件人" in str(error)
+    else:
+        raise AssertionError("partial recipient refusal must fail delivery confirmation")
+    finally:
+        notifier.close()
+    assert rejected_address not in caplog.text
+
+
 def test_emergency_delivery_survives_state_persistence_failure(
     tmp_path: Path,
     monkeypatch,

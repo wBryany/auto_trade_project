@@ -4,11 +4,12 @@ import json
 import logging
 import os
 import queue
+import re
 import smtplib
 import ssl
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time as datetime_time, timedelta
 from email.message import EmailMessage
 from email.utils import parseaddr
@@ -95,6 +96,14 @@ class _QueuedEmail:
     report_date: str = ""
     body_factory: Callable[[], str] | None = None
     incident_key: str = ""
+    receipt: "_DeliveryReceipt | None" = None
+
+
+@dataclass
+class _DeliveryReceipt:
+    completed: threading.Event = field(default_factory=threading.Event)
+    delivered: bool = False
+    error: str = ""
 
 
 class EmailNotifier:
@@ -106,7 +115,7 @@ class EmailNotifier:
         self,
         config: EmailNotificationConfig,
         *,
-        send_fn: Callable[[EmailMessage], None] | None = None,
+        send_fn: Callable[[EmailMessage], Mapping[str, Any] | None] | None = None,
         now_fn: Callable[[], datetime] | None = None,
         initial_error: str = "",
     ) -> None:
@@ -694,6 +703,77 @@ class EmailNotifier:
             )
         )
 
+    def send_strategy_inspection_report(
+        self,
+        report: str,
+        *,
+        status: str,
+        run_id: str,
+        timeout: float | None = None,
+    ) -> bool:
+        """Send one hourly strategy-inspection report and confirm its delivery."""
+
+        if not self.config.enabled:
+            raise RuntimeError("邮件通知未启用")
+        if self._send_fn is None and not self.ready:
+            raise RuntimeError("邮件通知配置不完整")
+        normalized_status = str(status).strip().lower()
+        status_details = {
+            "no_change": ("无策略修改", "本次巡检完成，策略保持不变"),
+            "changed": ("策略已更新", "本次巡检完成，策略或代码已经修改"),
+            "failed": ("执行异常", "本次巡检未完整成功，需要检查失败项"),
+        }
+        if normalized_status not in status_details:
+            raise ValueError("status 必须是 no_change、changed 或 failed")
+        normalized_run_id = str(run_id).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.:+-]{1,80}", normalized_run_id):
+            raise ValueError("run_id 格式无效")
+        normalized_report = redact_url_credentials(str(report)).strip()
+        if not normalized_report:
+            raise ValueError("巡检报告不能为空")
+        if "\x00" in normalized_report:
+            raise ValueError("巡检报告不能包含 NUL 字符")
+        if len(normalized_report.encode("utf-8")) > 64 * 1024:
+            raise ValueError("巡检报告不能超过 64 KiB")
+
+        local_now = self._now_fn().astimezone(ZoneInfo(self.config.timezone))
+        subject_status, status_text = status_details[normalized_status]
+        receipt = _DeliveryReceipt()
+        accepted = self._enqueue(
+            _QueuedEmail(
+                subject=f"【整点巡检】{subject_status}｜{local_now:%Y-%m-%d %H:00}",
+                body="\n".join(
+                    (
+                        "BTC 自动交易策略整点巡检报告",
+                        f"巡检批次：{normalized_run_id}",
+                        f"完成时间：{local_now:%Y-%m-%d %H:%M:%S %Z}",
+                        f"执行结果：{status_text}",
+                        "",
+                        normalized_report,
+                    )
+                ),
+                event_type="strategy_inspection",
+                receipt=receipt,
+            )
+        )
+        if not accepted:
+            raise RuntimeError("巡检报告邮件未进入发送队列")
+        wait_seconds = (
+            max(0.1, float(timeout))
+            if timeout is not None
+            else self.config.timeout_seconds + 2.0
+        )
+        if not receipt.completed.wait(wait_seconds):
+            raise RuntimeError("巡检报告邮件发送超时")
+        if not receipt.delivered:
+            detail = redact_url_credentials(receipt.error).strip()
+            raise RuntimeError(
+                f"巡检报告邮件发送失败：{detail}"
+                if detail
+                else "巡检报告邮件发送失败"
+            )
+        return True
+
     def flush(self, timeout: float = 3.0) -> bool:
         deadline = time.monotonic() + max(0.0, timeout)
         while (
@@ -775,6 +855,9 @@ class EmailNotifier:
                             self._last_emergency_alerts[item.incident_key] = self._now_fn().timestamp()
                     if item.report_date or item.incident_key:
                         self._save_state_safely()
+                if item.receipt is not None:
+                    item.receipt.delivered = True
+                    item.receipt.completed.set()
                 LOG.info("email notification sent type=%s recipients=%s", item.event_type, len(self.config.recipients))
             except Exception as error:  # Email outages must never stop trading.
                 with self._lock:
@@ -798,7 +881,16 @@ class EmailNotifier:
                             )
                         elif resolved_count == 1:
                             self._emergency_resolved_pending.pop(item.incident_key, None)
-                LOG.exception("email notification failed type=%s", item.event_type)
+                if item.receipt is not None:
+                    item.receipt.error = redact_url_credentials(str(error))
+                    item.receipt.completed.set()
+                    LOG.error(
+                        "email notification failed type=%s error_type=%s",
+                        item.event_type,
+                        type(error).__name__,
+                    )
+                else:
+                    LOG.exception("email notification failed type=%s", item.event_type)
             finally:
                 selected_queue.task_done()
 
@@ -819,7 +911,7 @@ class EmailNotifier:
         message["To"] = ", ".join(self.config.recipients)
         message.set_content(body)
         if self._send_fn is not None:
-            self._send_fn(message)
+            self._raise_for_refused_recipients(self._send_fn(message))
             return
         if not password:
             raise RuntimeError(f"未设置 SMTP 密码环境变量 {self.config.password_env}")
@@ -832,7 +924,7 @@ class EmailNotifier:
             ) as client:
                 if username:
                     client.login(username, password)
-                client.send_message(message)
+                self._raise_for_refused_recipients(client.send_message(message))
             return
         with smtplib.SMTP(
             self.config.smtp_host,
@@ -845,7 +937,12 @@ class EmailNotifier:
                 client.ehlo()
             if username:
                 client.login(username, password)
-            client.send_message(message)
+            self._raise_for_refused_recipients(client.send_message(message))
+
+    @staticmethod
+    def _raise_for_refused_recipients(refused: Mapping[str, Any] | None) -> None:
+        if refused:
+            raise RuntimeError(f"SMTP 拒绝了 {len(refused)} 个收件人")
 
     def _load_state(self) -> None:
         path = Path(self.config.state_path)
