@@ -1621,6 +1621,10 @@ def test_managed_stop_reconciliation_records_exchange_fill_price_and_time(tmp_pa
     assert rows[0]["exit_reason"] == "stop_loss"
     assert rows[0]["exit_price"] == pytest.approx(80777.1)
     assert rows[0]["exit_time"] == "2026-09-04T12:30:08Z"
+    assert rows[0]["mae_price"] == pytest.approx(81229.2 - 80777.1)
+    assert rows[0]["mae_r"] == pytest.approx(
+        (81229.2 - 80777.1) / (81229.2 - 80863.6686)
+    )
     assert rows[0]["holding_minutes"] == pytest.approx(
         (fill_timestamp - 1_788_521_161_832) / 60_000
     )

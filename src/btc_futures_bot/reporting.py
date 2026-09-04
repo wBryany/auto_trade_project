@@ -122,8 +122,14 @@ class TradeRecord:
         direction = 1 if position.side == "long" else -1
         initial_stop = position.initial_stop_price or position.stop_price
         risk_distance = abs(position.entry_price - initial_stop)
-        best_price = position.best_price or position.entry_price
-        worst_price = position.worst_price or position.entry_price
+        observed_best_price = position.best_price or position.entry_price
+        observed_worst_price = position.worst_price or position.entry_price
+        if position.side == "long":
+            best_price = max(observed_best_price, exit_price)
+            worst_price = min(observed_worst_price, exit_price)
+        else:
+            best_price = min(observed_best_price, exit_price)
+            worst_price = max(observed_worst_price, exit_price)
         mfe_price = (
             max(0.0, best_price - position.entry_price)
             if position.side == "long"
