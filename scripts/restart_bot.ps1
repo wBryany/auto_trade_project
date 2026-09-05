@@ -37,7 +37,6 @@ if (-not (Test-Path -LiteralPath $resolvedConfigPath -PathType Leaf)) {
 
 $probeAddress = if ($BindAddress -in @("0.0.0.0", "::")) { "127.0.0.1" } else { $BindAddress }
 $serviceUrl = "http://${probeAddress}:$Port"
-$runningPythonPath = $null
 
 function Get-DashboardListener {
     $listeners = @(
@@ -159,6 +158,9 @@ function Stop-EngineFailClosed {
     }
 }
 
+. (Join-Path $PSScriptRoot "independent_process.ps1")
+$resolvedPythonPath = Resolve-ServicePython -PythonPath $PythonPath -RuntimeRoot $runtimeRoot
+
 $servicePid = Get-DashboardListener
 $beforeSnapshot = $null
 if ($servicePid) {
@@ -175,7 +177,6 @@ if ($servicePid) {
     if ($serviceProcess.ProcessName -notmatch "^python(?:w)?$") {
         throw "Refusing to stop unexpected process on port ${Port}: $($serviceProcess.ProcessName) (PID $servicePid)"
     }
-    $runningPythonPath = $serviceProcess.Path
 
     try {
         $beforeStatus = Get-DashboardStatus -TimeoutSeconds 10
@@ -238,51 +239,15 @@ if ($servicePid) {
     Write-Host "No existing dashboard listener found; entering fail-closed cold-start validation."
 }
 
-if ($PythonPath) {
-    $resolvedPythonPath = (Resolve-Path -LiteralPath $PythonPath).Path
-} elseif ($runningPythonPath -and (Test-Path -LiteralPath $runningPythonPath -PathType Leaf)) {
-    $resolvedPythonPath = $runningPythonPath
-} elseif (Test-Path -LiteralPath (Join-Path $runtimeRoot ".venv\Scripts\python.exe") -PathType Leaf) {
-    $resolvedPythonPath = Join-Path $runtimeRoot ".venv\Scripts\python.exe"
-} elseif (Test-Path -LiteralPath (Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe") -PathType Leaf) {
-    $resolvedPythonPath = Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
-} else {
-    $pythonCommand = Get-Command python -ErrorAction Stop
-    $resolvedPythonPath = $pythonCommand.Source
-}
-
 $logDirectory = Join-Path $runtimeRoot "logs"
 New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $stdoutPath = Join-Path $logDirectory "dashboard.restart.$stamp.stdout.log"
 $stderrPath = Join-Path $logDirectory "dashboard.restart.$stamp.stderr.log"
-$previousPythonPath = $env:PYTHONPATH
-
-try {
-    $env:PYTHONPATH = Join-Path $sourceRoot "src"
-    Write-Host "Starting dashboard with source=$sourceRoot runtime=$runtimeRoot python=$resolvedPythonPath..."
-    $dashboardProcess = Start-Process `
-        -FilePath $resolvedPythonPath `
-        -ArgumentList @(
-            "-m", "btc_futures_bot.main",
-            "--config", $resolvedConfigPath,
-            "--exchange", $Exchange,
-            "--web",
-            "--host", $BindAddress,
-            "--port", "$Port"
-        ) `
-        -WorkingDirectory $runtimeRoot `
-        -RedirectStandardOutput $stdoutPath `
-        -RedirectStandardError $stderrPath `
-        -WindowStyle Hidden `
-        -PassThru
-} finally {
-    if ($null -eq $previousPythonPath) {
-        Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
-    } else {
-        $env:PYTHONPATH = $previousPythonPath
-    }
-}
+$dashboardProcess = Start-IndependentDashboard -PythonPath $resolvedPythonPath `
+    -SourceRoot $sourceRoot -RuntimeRoot $runtimeRoot `
+    -Arguments @('--config', $resolvedConfigPath, '--exchange', $Exchange, '--web', '--host', $BindAddress, '--port', "$Port") `
+    -StdoutPath $stdoutPath -StderrPath $stderrPath
 
 try {
     Wait-DashboardReady -Process $dashboardProcess

@@ -165,3 +165,11 @@ Windows 手动重启可以直接双击 `scripts\restart_bot.cmd`，也可以在 
 只运行 GET 状态校验、不发送 POST 或停止进程时，使用 `.\scripts\restart_bot.ps1 -CheckOnly`。仅重启页面而不启动交易引擎时，使用 `.\scripts\restart_bot.ps1 -DashboardOnly`。从隔离源码临时运行、但继续使用原实盘目录中的配置、报告和日志时，可传入 `-RuntimeWorkingDirectory C:\my_project`；此时 `PYTHONPATH` 仍指向脚本所在源码树。当前 API 未返回价格 tick 时，脚本只对 Binance `BTCUSDT` 使用明确的 `0.1` 回退；其他品种必须由状态 API 提供 `price_tick`，否则拒绝重启。若切换了网络节点，必须运行重启脚本，旧进程内保存的 Binance 限频倒计时不会因为出口 IP 改变而自动消失。
 
 `*.local.json` 只是覆盖层：加载时先读同名的已提交配置，再把本地文件逐键覆盖上去。页面保存只写它认识的字段，所以本地文件总会落后于仓库配置；如果不做合并，新增的策略开关会静默退回代码默认值（通常是关闭），仓库里明明打开的分支在实盘中并不会执行。合并后本地文件仍然优先，但没写到的键会继承已提交配置。真实测试网下单前仍需完成订单成交回报对账，不要直接把 `live` 当作实盘部署。
+
+### Windows 独立后台运行
+
+启动/重启脚本通过 Windows WMI 服务创建隐藏后台进程，不再把服务挂在 Codex 或终端的进程树下。启动命令结束后可关闭终端或退出/更新 Codex。日志仍在运行目录的 `logs` 中；此方式不提供电脑重启后的自动启动或进程崩溃自动恢复。
+
+请使用独立安装的 Python 3.11+，推荐在各运行目录创建 `.venv` 并执行 `python -m pip install -e .`（模型 2 使用 `python -m pip install -e ".[model2]"`）。脚本拒绝 Codex 路径及基于 Codex Python 创建的虚拟环境，也不会在 WMI 启动失败后回退为终端子进程。配置和凭据应存放在应用支持的本地配置中，后台进程不继承当前终端临时设置的环境变量。
+
+主分支：`powershell -NoProfile -ExecutionPolicy Bypass -File C:\my_project_main_runtime\scripts\restart_bot.ps1 -ConfigPath config.binance.testnet.local.json`。保留原有实盘快照和首轮健康检查。
