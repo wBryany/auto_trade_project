@@ -164,15 +164,13 @@ Describe "restart_bot PowerShell syntax" {
 
     It "establishes a healthy cold-start baseline before the engine start POST" {
         $content = Get-Content -LiteralPath (Join-Path $repoRoot "scripts\restart_bot.ps1") -Raw
-        $pythonPathInitIndex = $content.IndexOf('$runningPythonPath = $null')
         $listenerBranchIndex = $content.IndexOf('if ($servicePid)')
-        $pythonResolutionIndex = $content.IndexOf('if ($PythonPath)')
+        $pythonResolutionIndex = $content.IndexOf('$resolvedPythonPath = Resolve-ServicePython')
         $preStartIndex = $content.IndexOf('$preStartStatus = Wait-EngineStatus')
         $coldBaselineIndex = $content.IndexOf('$beforeSnapshot = $preStartSnapshot')
         $engineStartIndex = $content.IndexOf('$startResult = Invoke-RestMethod')
-        if ($pythonPathInitIndex -lt 0 -or $listenerBranchIndex -lt $pythonPathInitIndex -or
-            $pythonResolutionIndex -lt $listenerBranchIndex) {
-            throw "Cold start must initialize the optional running Python path before listener branching and Python resolution"
+        if ($pythonResolutionIndex -lt 0 -or $pythonResolutionIndex -gt $listenerBranchIndex) {
+            throw "Standalone Python must be validated before stopping the existing service"
         }
         if ($preStartIndex -lt 0 -or $coldBaselineIndex -lt $preStartIndex -or
             $engineStartIndex -lt $coldBaselineIndex) {

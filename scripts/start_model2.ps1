@@ -4,7 +4,8 @@ param(
     [ValidateRange(1, 65535)]
     [int]$Port = 8788,
     [string]$PythonPath = "",
-    [switch]$DashboardOnly
+    [switch]$DashboardOnly,
+    [switch]$Restart
 )
 
 Set-StrictMode -Version Latest
@@ -15,15 +16,8 @@ $configPath = Join-Path $sourceRoot "config.binance.model2.json"
 $probeAddress = if ($BindAddress -in @("0.0.0.0", "::")) { "127.0.0.1" } else { $BindAddress }
 $serviceUrl = "http://${probeAddress}:$Port"
 
-if ($PythonPath) {
-    $resolvedPythonPath = (Resolve-Path -LiteralPath $PythonPath).Path
-} elseif (Test-Path -LiteralPath (Join-Path $sourceRoot ".venv\Scripts\python.exe") -PathType Leaf) {
-    $resolvedPythonPath = Join-Path $sourceRoot ".venv\Scripts\python.exe"
-} elseif (Test-Path -LiteralPath (Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe") -PathType Leaf) {
-    $resolvedPythonPath = Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
-} else {
-    $resolvedPythonPath = (Get-Command python -ErrorAction Stop).Source
-}
+. (Join-Path $PSScriptRoot "independent_process.ps1")
+$resolvedPythonPath = Resolve-ServicePython -PythonPath $PythonPath -RuntimeRoot $sourceRoot
 
 $previousPythonPath = $env:PYTHONPATH
 try {
@@ -208,38 +202,26 @@ if ($listener) {
     if ([string]$tradeModelProperty.Value.mode -ne $configuredTradeModelMode) {
         throw "Existing Model 2 dashboard uses a different trade-model mode"
     }
-    Write-Host "Model 2 dashboard is already ready: $serviceUrl (PID $listener)"
-} else {
+    if ($Restart) {
+        Invoke-RestMethod "$serviceUrl/api/stop" -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 30 | Out-Null
+        $stopped = Invoke-RestMethod "$serviceUrl/api/status" -TimeoutSec 10
+        if ([bool]$stopped.running) { throw 'Model 2 engine stop was not confirmed; dashboard left running' }
+        Stop-Process -Id $listener -ErrorAction Stop
+        Wait-Process -Id $listener -Timeout 10 -ErrorAction SilentlyContinue
+        $listener = $null
+    }
+    if ($listener) { Write-Host "Model 2 dashboard is already ready: $serviceUrl (PID $listener)" }
+}
+if (-not $listener) {
     $logDirectory = Join-Path $sourceRoot "logs"
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
     $stdoutPath = Join-Path $logDirectory "dashboard.model2.$stamp.stdout.log"
     $stderrPath = Join-Path $logDirectory "dashboard.model2.$stamp.stderr.log"
-    $previousPythonPath = $env:PYTHONPATH
-    try {
-        $env:PYTHONPATH = Join-Path $sourceRoot "src"
-        $dashboardProcess = Start-Process `
-            -FilePath $resolvedPythonPath `
-            -ArgumentList @(
-                "-m", "btc_futures_bot.main",
-                "--config", $configPath,
-                "--exchange", $configuredExchange,
-                "--web",
-                "--host", $BindAddress,
-                "--port", "$Port"
-            ) `
-            -WorkingDirectory $sourceRoot `
-            -RedirectStandardOutput $stdoutPath `
-            -RedirectStandardError $stderrPath `
-            -WindowStyle Hidden `
-            -PassThru
-    } finally {
-        if ($null -eq $previousPythonPath) {
-            Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
-        } else {
-            $env:PYTHONPATH = $previousPythonPath
-        }
-    }
+    $dashboardProcess = Start-IndependentDashboard -PythonPath $resolvedPythonPath `
+        -SourceRoot $sourceRoot -RuntimeRoot $sourceRoot `
+        -Arguments @('--config', $configPath, '--exchange', $configuredExchange, '--web', '--host', $BindAddress, '--port', "$Port") `
+        -StdoutPath $stdoutPath -StderrPath $stderrPath
     try {
         Wait-Model2Dashboard -Process $dashboardProcess
     } catch {
