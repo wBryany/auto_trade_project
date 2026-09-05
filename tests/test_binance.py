@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from decimal import Decimal
 
 import pytest
@@ -506,10 +507,19 @@ def test_binance_aggregates_exact_managed_entry_fills(monkeypatch) -> None:
         },
     ]
 
-    def signed(method: str, path: str, params: dict | None = None) -> list[dict]:
+    def signed(
+        method: str,
+        path: str,
+        params: dict | None = None,
+        *,
+        max_attempts: int | None = None,
+        timeout: float | None = None,
+    ) -> list[dict]:
         assert method == "GET"
         assert path == "/fapi/v1/userTrades"
         assert params == {"symbol": "BTCUSDT", "orderId": "77", "limit": 1000}
+        assert max_attempts == 1
+        assert timeout == 2.0
         return rows
 
     monkeypatch.setattr(adapter, "_signed", signed)
@@ -534,6 +544,172 @@ def test_binance_aggregates_exact_managed_entry_fills(monkeypatch) -> None:
     assert fill["commission_assets"] == ["USDT"]
 
 
+def test_binance_prefers_complete_streamed_managed_entry_fills(monkeypatch) -> None:
+    adapter = _adapter()
+    adapter._private_stream = type(
+        "PrivateStream",
+        (),
+        {
+            "fills_for_order": lambda self, order_id: [
+                {
+                    "orderId": 77,
+                    "tradeId": 9001,
+                    "side": "SELL",
+                    "qty": "0.0004",
+                    "price": "79500",
+                    "commission": "0.0159",
+                    "commissionAsset": "USDT",
+                    "time": 1_788_525_001_000,
+                },
+                {
+                    "orderId": 77,
+                    "tradeId": 9002,
+                    "side": "SELL",
+                    "qty": "0.0006",
+                    "price": "79400",
+                    "commission": "0.02382",
+                    "commissionAsset": "USDT",
+                    "time": 1_788_525_001_234,
+                },
+            ]
+        },
+    )()
+    monkeypatch.setattr(
+        adapter,
+        "_signed",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("complete WebSocket fills must avoid REST")
+        ),
+    )
+
+    fill = adapter.fetch_entry_fill(
+        Position(
+            "short",
+            0.001,
+            79_440.0,
+            79_900.0,
+            78_500.0,
+            1_788_525_000_000,
+            entry_order_id="77",
+        )
+    )
+
+    assert fill is not None
+    assert fill["price"] == pytest.approx((31.8 + 47.64) / 0.001)
+    assert fill["timestamp"] == 1_788_525_001_000
+    assert fill["commission"] == pytest.approx(0.03972)
+    assert fill["source"] == "Binance ORDER_TRADE_UPDATE"
+
+
+def test_binance_combines_partial_stream_and_rest_fills_by_trade_id(monkeypatch) -> None:
+    adapter = _adapter()
+    adapter._private_stream = type(
+        "PrivateStream",
+        (),
+        {
+            "fills_for_order": lambda self, order_id: [
+                {
+                    "orderId": 77,
+                    "tradeId": 9001,
+                    "side": "BUY",
+                    "qty": "0.001",
+                    "price": "79000",
+                    "commission": "0.0395",
+                    "commissionAsset": "USDT",
+                    "time": 1_788_525_001_000,
+                }
+            ]
+        },
+    )()
+    calls = []
+
+    def signed(
+        method: str,
+        path: str,
+        params: dict | None = None,
+        *,
+        max_attempts: int | None = None,
+        timeout: float | None = None,
+    ) -> list[dict]:
+        calls.append((method, path, params))
+        assert max_attempts == 1
+        assert timeout == 2.0
+        return [
+            {
+                "orderId": 77,
+                "id": 9002,
+                "side": "BUY",
+                "qty": "0.002",
+                "quoteQty": "158.4",
+                "price": "79200",
+                "commission": "0.0792",
+                "commissionAsset": "USDT",
+                "time": 1_788_525_001_500,
+            }
+        ]
+
+    monkeypatch.setattr(adapter, "_signed", signed)
+
+    fill = adapter.fetch_entry_fill(
+        Position(
+            "long",
+            0.003,
+            79_133.0,
+            78_000.0,
+            82_000.0,
+            1_788_525_000_000,
+            entry_order_id="77",
+        )
+    )
+
+    assert fill is not None
+    assert fill["quantity"] == pytest.approx(0.003)
+    assert fill["price"] == pytest.approx((79.0 + 158.4) / 0.003)
+    assert fill["commission"] == pytest.approx(0.1187)
+    assert fill["source"] == "Binance ORDER_TRADE_UPDATE + /fapi/v1/userTrades"
+    assert calls == [
+        (
+            "GET",
+            "/fapi/v1/userTrades",
+            {"symbol": "BTCUSDT", "orderId": "77", "limit": 1000},
+        )
+    ]
+
+
+def test_binance_returns_pending_for_incomplete_managed_entry_fills(monkeypatch) -> None:
+    adapter = _adapter()
+    calls = []
+
+    def signed(*args, **kwargs):
+        calls.append((args, kwargs))
+        return [
+            {
+                "orderId": 77,
+                "side": "BUY",
+                "qty": "0.001",
+                "quoteQty": "79.0",
+                "price": "79000",
+                "commission": "0.0395",
+                "commissionAsset": "USDT",
+                "time": 1_788_525_001_000,
+            }
+        ]
+
+    monkeypatch.setattr(adapter, "_signed", signed)
+    assert adapter.fetch_entry_fill(
+        Position(
+            "long",
+            0.003,
+            79_133.0,
+            78_000.0,
+            82_000.0,
+            1_788_525_000_000,
+            entry_order_id="77",
+        )
+    ) is None
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize(
     ("row", "message"),
     [
@@ -542,8 +718,8 @@ def test_binance_aggregates_exact_managed_entry_fills(monkeypatch) -> None:
             "side",
         ),
         (
-            {"orderId": 77, "side": "BUY", "qty": "0.002", "price": "79000", "time": 1},
-            "full managed position quantity",
+            {"orderId": 77, "side": "BUY", "qty": "0.004", "price": "79000", "time": 1},
+            "exceed",
         ),
     ],
 )
@@ -852,6 +1028,48 @@ def test_binance_signed_get_retries_with_a_fresh_signature(monkeypatch) -> None:
     assert [call[0]["timestamp"] for call in calls] == [1_000_000, 1_000_001]
     assert calls[0][0]["signature"] != calls[1][0]["signature"]
     assert all(call[1]["max_attempts"] == 1 for call in calls)
+
+
+def test_entry_fill_metadata_network_failure_uses_one_short_request(monkeypatch) -> None:
+    adapter = _adapter()
+    monkeypatch.setenv("TEST_BINANCE_KEY", "configured")
+    monkeypatch.setenv("TEST_BINANCE_SECRET", "configured")
+    now = time.monotonic()
+    adapter._server_time_anchor_ms = 1_788_525_000_000
+    adapter._server_time_anchor_monotonic = now
+    adapter._server_time_synced_at = now
+    calls = []
+    sleeps = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        raise ApiError("network error: metadata lookup timed out")
+
+    monkeypatch.setattr("btc_futures_bot.exchanges.binance.request_json", request)
+    monkeypatch.setattr(
+        "btc_futures_bot.exchanges.binance.time.sleep",
+        lambda delay: sleeps.append(delay),
+    )
+
+    with pytest.raises(ApiError, match="metadata lookup timed out"):
+        adapter.fetch_entry_fill(
+            Position(
+                "long",
+                0.001,
+                79_000.0,
+                78_500.0,
+                80_250.0,
+                1_788_525_000_000,
+                entry_order_id="77",
+            )
+        )
+
+    assert len(calls) == 1
+    assert calls[0][0] == "GET"
+    assert calls[0][1].endswith("/fapi/v1/userTrades")
+    assert calls[0][2]["timeout"] == 2.0
+    assert calls[0][2]["max_attempts"] == 1
+    assert sleeps == []
 
 
 def test_binance_signed_post_does_not_retry_an_ambiguous_transport_failure(monkeypatch) -> None:

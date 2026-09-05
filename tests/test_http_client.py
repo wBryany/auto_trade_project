@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from io import BytesIO
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
+
+import pytest
 
 from btc_futures_bot.http_client import (
     ApiError,
@@ -13,6 +16,15 @@ from btc_futures_bot.http_client import (
 
 
 class _Response:
+    def __init__(
+        self,
+        *,
+        headers: dict[str, str] | None = None,
+        status: int = 200,
+    ) -> None:
+        self.headers = headers or {}
+        self.status = status
+
     def __enter__(self) -> "_Response":
         return self
 
@@ -99,6 +111,126 @@ def test_post_does_not_retry_direct_timeout_errors() -> None:
 
     assert mocked_urlopen.call_count == 1
     mocked_sleep.assert_not_called()
+
+
+def test_success_weight_logging_is_query_free_and_bounded(caplog: object) -> None:
+    clear_rate_limits()
+    clock = {"now": 1_000.0}
+    responses = [
+        _Response(headers={"X-MBX-USED-WEIGHT-1M": value})
+        for value in ("10", "50", "110", "111")
+    ]
+    try:
+        with (
+            patch("btc_futures_bot.http_client.urlopen", side_effect=responses),
+            patch(
+                "btc_futures_bot.http_client.time.time",
+                side_effect=lambda: clock["now"],
+            ),
+            caplog.at_level(logging.INFO, logger="btc_futures_bot.http_client"),  # type: ignore[attr-defined]
+        ):
+            for _index in range(4):
+                request_json(
+                    "GET",
+                    "https://fapi.binance.com/fapi/v1/userTrades",
+                    params={"symbol": "BTCUSDT", "signature": "must-not-leak"},
+                )
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records  # type: ignore[attr-defined]
+            if record.name == "btc_futures_bot.http_client"
+        ]
+        assert len(messages) == 2
+        assert "used_weight=1m:10" in messages[0]
+        assert "used_weight=1m:110" in messages[1]
+        assert all("host=fapi.binance.com" in message for message in messages)
+        assert all("path=/fapi/v1/userTrades" in message for message in messages)
+        assert all("status=200" in message for message in messages)
+        assert all("retry_at=0" in message for message in messages)
+        assert all("?" not in message for message in messages)
+        assert all("must-not-leak" not in message for message in messages)
+        assert all("signature" not in message for message in messages)
+    finally:
+        clear_rate_limits()
+
+
+def test_success_weight_logging_emits_again_after_timebox(caplog: object) -> None:
+    clear_rate_limits()
+    clock = {"now": 1_000.0}
+    try:
+        with (
+            patch(
+                "btc_futures_bot.http_client.urlopen",
+                side_effect=[
+                    _Response(headers={"x-mbx-used-weight-1m": "5"}),
+                    _Response(headers={"x-mbx-used-weight-1m": "6"}),
+                ],
+            ),
+            patch(
+                "btc_futures_bot.http_client.time.time",
+                side_effect=lambda: clock["now"],
+            ),
+            caplog.at_level(logging.INFO, logger="btc_futures_bot.http_client"),  # type: ignore[attr-defined]
+        ):
+            request_json("GET", "https://fapi.binance.com/fapi/v1/time")
+            clock["now"] += 61.0
+            request_json("GET", "https://fapi.binance.com/fapi/v1/time")
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records  # type: ignore[attr-defined]
+            if record.name == "btc_futures_bot.http_client"
+        ]
+        assert len(messages) == 2
+        assert "used_weight=1m:5" in messages[0]
+        assert "used_weight=1m:6" in messages[1]
+    finally:
+        clear_rate_limits()
+
+
+def test_rate_limit_logging_is_query_free_and_records_deadline(caplog: object) -> None:
+    clear_rate_limits()
+    error = HTTPError(
+        "https://fapi.binance.com/fapi/v1/userTrades",
+        429,
+        "Too Many Requests",
+        {
+            "Retry-After": "30",
+            "X-MBX-USED-WEIGHT-1M": "2401",
+        },
+        BytesIO(b'{"code":-1003,"msg":"Too many requests"}'),
+    )
+    try:
+        with (
+            patch("btc_futures_bot.http_client.urlopen", side_effect=error),
+            patch("btc_futures_bot.http_client.time.time", return_value=1_000.0),
+            caplog.at_level(logging.WARNING, logger="btc_futures_bot.http_client"),  # type: ignore[attr-defined]
+        ):
+            with pytest.raises(ApiError):
+                request_json(
+                    "GET",
+                    "https://fapi.binance.com/fapi/v1/userTrades",
+                    params={"symbol": "BTCUSDT", "signature": "must-not-leak"},
+                )
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records  # type: ignore[attr-defined]
+            if record.name == "btc_futures_bot.http_client"
+            and record.levelno == logging.WARNING
+        ]
+        assert messages == [
+            "exchange_http_rate_limit host=fapi.binance.com "
+            "path=/fapi/v1/userTrades status=429 used_weight=1m:2401 "
+            "retry_at=1030.000"
+        ]
+        assert "?" not in messages[0]
+        assert "must-not-leak" not in messages[0]
+        assert "signature" not in messages[0]
+        assert "BTCUSDT" not in messages[0]
+    finally:
+        clear_rate_limits()
 
 
 def test_rate_limit_is_not_retried_and_blocks_followup_requests() -> None:

@@ -959,10 +959,34 @@ class BinanceAdapter(ExchangeAdapter):
         }
 
     def fetch_entry_fill(self, position: Position) -> dict[str, Any] | None:
-        """Aggregate the exact Binance fills for one managed entry order."""
+        """Aggregate exact entry fills without blocking position management."""
         order_id = str(position.entry_order_id or "").strip()
         if not order_id:
             raise RuntimeError("Binance managed entry has no exchange order id")
+        streamed: list[dict[str, Any]] = []
+        if self._private_stream is not None:
+            fills_for_order = getattr(self._private_stream, "fills_for_order", None)
+            if callable(fills_for_order):
+                streamed_payload = fills_for_order(order_id)
+                if not isinstance(streamed_payload, list):
+                    raise RuntimeError("Binance streamed entry fills response is not a list")
+                streamed = [
+                    row
+                    for row in streamed_payload
+                    if str(row.get("orderId") or "") == order_id
+                ]
+                streamed_fill = self._aggregate_entry_fills(
+                    position,
+                    order_id,
+                    streamed,
+                    source="Binance ORDER_TRADE_UPDATE",
+                )
+                if streamed_fill is not None:
+                    return streamed_fill
+
+        # A protected entry can precede either the WebSocket fill event or the
+        # user-trade database. Make only one read here; the engine owns the
+        # non-blocking 15/30/60/... retry schedule.
         rows = self._signed(
             "GET",
             "/fapi/v1/userTrades",
@@ -971,33 +995,82 @@ class BinanceAdapter(ExchangeAdapter):
                 "orderId": order_id,
                 "limit": 1000,
             },
+            max_attempts=1,
+            timeout=2.0,
         )
         if not isinstance(rows, list):
             raise RuntimeError("Binance entry user-trades response is not a list")
         selected = [
             row for row in rows if str(row.get("orderId") or "") == order_id
         ]
+        rest_fill = self._aggregate_entry_fills(
+            position,
+            order_id,
+            selected,
+            source="Binance /fapi/v1/userTrades",
+        )
+        if rest_fill is not None:
+            return rest_fill
+
+        # During propagation each source can hold a different proper subset.
+        # Merge only rows with Binance trade ids so a fill observed on both
+        # transports can never be counted twice.
+        combined: dict[str, dict[str, Any]] = {}
+        if streamed and selected:
+            for row in (*streamed, *selected):
+                trade_id = row.get("tradeId")
+                if trade_id is None:
+                    trade_id = row.get("id")
+                if trade_id is None or str(trade_id).strip() == "":
+                    combined = {}
+                    break
+                combined[str(trade_id)] = row
+        if combined:
+            return self._aggregate_entry_fills(
+                position,
+                order_id,
+                list(combined.values()),
+                source="Binance ORDER_TRADE_UPDATE + /fapi/v1/userTrades",
+            )
+        return None
+
+    @staticmethod
+    def _aggregate_entry_fills(
+        position: Position,
+        order_id: str,
+        selected: list[dict[str, Any]],
+        *,
+        source: str,
+    ) -> dict[str, Any] | None:
         if not selected:
             return None
-
         expected_side = "BUY" if position.side == "long" else "SELL"
         sides = {str(row.get("side") or "").upper() for row in selected}
         if sides != {expected_side}:
             raise RuntimeError(
                 "Binance entry fills do not match the managed position side"
             )
-        quantity = sum(float(row.get("qty") or 0) for row in selected)
+        try:
+            quantities = [float(row.get("qty") or 0) for row in selected]
+            quantity = sum(quantities)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise RuntimeError("Binance entry fills have invalid quantity metadata") from error
         quantity_tolerance = max(1e-12, position.quantity * 1e-9)
-        if not math.isfinite(quantity) or abs(quantity - position.quantity) > quantity_tolerance:
+        if any(not math.isfinite(item) or item <= 0 for item in quantities):
+            raise RuntimeError("Binance entry fills have invalid quantity metadata")
+        if quantity - position.quantity > quantity_tolerance:
             raise RuntimeError(
-                "Binance entry fills do not cover the full managed position quantity"
+                "Binance entry fills exceed the managed position quantity"
             )
-        quote_quantity = sum(
-            float(row.get("quoteQty") or 0)
-            or float(row.get("qty") or 0) * float(row.get("price") or 0)
-            for row in selected
-        )
-        timestamps = [int(row.get("time") or 0) for row in selected]
+        try:
+            quote_quantity = sum(
+                float(row.get("quoteQty") or 0)
+                or quantity_row * float(row.get("price") or 0)
+                for row, quantity_row in zip(selected, quantities)
+            )
+            timestamps = [int(row.get("time") or 0) for row in selected]
+        except (TypeError, ValueError, OverflowError) as error:
+            raise RuntimeError("Binance entry fills have invalid price or timestamp metadata") from error
         if not math.isfinite(quote_quantity) or quantity <= 0 or quote_quantity <= 0:
             raise RuntimeError("Binance entry fills have no valid weighted price")
         if not timestamps or min(timestamps) <= 0:
@@ -1009,13 +1082,18 @@ class BinanceAdapter(ExchangeAdapter):
                 if row.get("commissionAsset")
             }
         )
-        commission = (
-            sum(float(row["commission"]) for row in selected)
-            if all(row.get("commission") is not None for row in selected)
-            else None
-        )
+        try:
+            commission = (
+                sum(float(row["commission"]) for row in selected)
+                if all(row.get("commission") is not None for row in selected)
+                else None
+            )
+        except (TypeError, ValueError, OverflowError) as error:
+            raise RuntimeError("Binance entry fills have invalid commission metadata") from error
         if commission is not None and not math.isfinite(commission):
             raise RuntimeError("Binance entry fills have invalid commission metadata")
+        if quantity + quantity_tolerance < position.quantity:
+            return None
         return {
             "side": expected_side,
             "quantity": quantity,
@@ -1024,7 +1102,7 @@ class BinanceAdapter(ExchangeAdapter):
             "commission": commission,
             "commission_assets": commission_assets,
             "order_id": order_id,
-            "source": "Binance /fapi/v1/userTrades",
+            "source": source,
         }
 
     def fetch_protection_status(self, position: Position) -> dict[str, Any]:
@@ -1298,13 +1376,33 @@ class BinanceAdapter(ExchangeAdapter):
     def _to_contracts(quantity: float) -> float:
         return quantity
 
-    def _signed(self, method: str, path: str, params: dict[str, Any] | None = None) -> Any:
+    def _signed(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        max_attempts: int | None = None,
+        timeout: float | None = None,
+    ) -> Any:
         key, secret, _ = self.credentials()
         headers = {"X-MBX-APIKEY": key, "Content-Type": "application/x-www-form-urlencoded"}
         request_method = method.upper()
-        self._ensure_server_time()
-        max_attempts = 3 if request_method == "GET" else 2
-        for attempt in range(max_attempts):
+        request_timeout = 5.0 if timeout is None else max(0.1, float(timeout))
+        if max_attempts is None and timeout is None:
+            # Keep the established call shape for default traffic and tests.
+            self._ensure_server_time()
+        else:
+            self._ensure_server_time(
+                max_attempts=max_attempts,
+                timeout=request_timeout,
+            )
+        attempt_limit = (
+            max(1, int(max_attempts))
+            if max_attempts is not None
+            else (3 if request_method == "GET" else 2)
+        )
+        for attempt in range(attempt_limit):
             signed_params = dict(params or {})
             signed_params["timestamp"] = self._server_timestamp_ms()
             signed_params.setdefault("recvWindow", 10_000)
@@ -1317,7 +1415,7 @@ class BinanceAdapter(ExchangeAdapter):
                         f"{self.base_url}{path}",
                         params=signed_params,
                         headers=headers,
-                        timeout=5.0,
+                        timeout=request_timeout,
                         max_attempts=1,
                     )
                 return request_json(
@@ -1325,13 +1423,20 @@ class BinanceAdapter(ExchangeAdapter):
                     f"{self.base_url}{path}",
                     headers=headers,
                     body=urlencode(signed_params),
-                    timeout=5.0,
+                    timeout=request_timeout,
                 )
             except ApiError as error:
                 safe_message = redact_url_credentials(str(error))
-                has_next_attempt = attempt + 1 < max_attempts
+                has_next_attempt = attempt + 1 < attempt_limit
                 if has_next_attempt and "-1021" in safe_message:
-                    self._sync_server_time(force=True)
+                    if max_attempts is None and timeout is None:
+                        self._sync_server_time(force=True)
+                    else:
+                        self._sync_server_time(
+                            force=True,
+                            max_attempts=max_attempts,
+                            timeout=request_timeout,
+                        )
                     continue
                 retryable_get = (
                     request_method == "GET"
@@ -1360,7 +1465,12 @@ class BinanceAdapter(ExchangeAdapter):
                 return self._server_time_anchor_ms + elapsed_ms
             return self.now_ms() + self._server_time_offset_ms
 
-    def _ensure_server_time(self) -> None:
+    def _ensure_server_time(
+        self,
+        *,
+        max_attempts: int | None = None,
+        timeout: float | None = None,
+    ) -> None:
         with self._server_time_lock:
             fresh = (
                 self._server_time_anchor_ms > 0
@@ -1369,13 +1479,23 @@ class BinanceAdapter(ExchangeAdapter):
         if fresh:
             return
         try:
-            self._sync_server_time(force=False)
+            self._sync_server_time(
+                force=False,
+                max_attempts=max_attempts,
+                timeout=timeout,
+            )
         except ApiError:
             with self._server_time_lock:
                 if self._server_time_anchor_ms <= 0:
                     raise
 
-    def _sync_server_time(self, *, force: bool = True) -> int:
+    def _sync_server_time(
+        self,
+        *,
+        force: bool = True,
+        max_attempts: int | None = None,
+        timeout: float | None = None,
+    ) -> int:
         with self._server_time_lock:
             if (
                 not force
@@ -1386,8 +1506,10 @@ class BinanceAdapter(ExchangeAdapter):
             payload = request_json(
                 "GET",
                 f"{self.base_url}/fapi/v1/time",
-                timeout=5.0,
-                max_attempts=3,
+                timeout=5.0 if timeout is None else max(0.1, float(timeout)),
+                max_attempts=(
+                    3 if max_attempts is None else max(1, int(max_attempts))
+                ),
             )
             finished_at = self.now_ms()
             finished_monotonic = time.monotonic()

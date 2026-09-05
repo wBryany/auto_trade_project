@@ -714,6 +714,7 @@ def test_live_entry_reconciles_only_after_protected_state_is_saved(tmp_path) -> 
                 "status": "FILLED",
                 "executedQty": str(self.requested_quantity),
                 "avgPrice": "100",
+                "updateTime": 1_788_525_001_000,
             }
 
         @staticmethod
@@ -731,6 +732,7 @@ def test_live_entry_reconciles_only_after_protected_state_is_saved(tmp_path) -> 
             assert persisted["entry_order_id"] == "11"
             assert persisted["stop_order_id"] == "21"
             assert persisted["entry_price"] == 100.0
+            assert persisted["opened_at"] == 1_788_525_001_000
             return {
                 "side": "BUY",
                 "quantity": position.quantity,
@@ -845,7 +847,7 @@ def test_restart_entry_fill_failure_keeps_restored_protected_position_and_alerts
     assert engine.position.entry_fee is None
     assert len(notifier.emergencies) == 1
     assert notifier.emergencies[0]["error"] is lookup_error
-    assert notifier.emergencies[0]["category"] == "order_failure"
+    assert notifier.emergencies[0]["category"] == "entry_reconciliation"
     assert notifier.emergencies[0]["incident"] == "managed_entry_fill:77"
     saved_position = json.loads(state_path.read_text(encoding="utf-8"))["managed_position"]["position"]
     assert saved_position["opened_at"] == managed["position"]["opened_at"]
@@ -922,6 +924,116 @@ def test_safe_restart_backfills_exact_entry_metadata_after_restore(tmp_path) -> 
     assert saved_position["entry_price"] == 79_012.5
     assert saved_position["opened_at"] == exact_opened_at
     assert saved_position["entry_fee_asset"] == "USDT"
+
+
+def test_pending_entry_fills_retry_without_alerts_or_blocking_risk_loop(monkeypatch) -> None:
+    clock = [100.0]
+    monkeypatch.setattr("btc_futures_bot.engine.time.monotonic", lambda: clock[0])
+
+    class Adapter(_EmergencyAdapter):
+        calls = 0
+
+        def fetch_entry_fill(self, position: Position) -> dict | None:
+            self.calls += 1
+            if self.calls < 3:
+                return None
+            return {
+                "side": "BUY", "quantity": position.quantity, "price": 100.0,
+                "timestamp": 1_788_525_001_234, "commission": 0.04,
+                "commission_assets": ["USDT"],
+                "source": "Binance /fapi/v1/userTrades",
+            }
+
+    adapter = Adapter()
+    notifier = _EmergencyNotifier()
+    engine = _alert_test_engine(adapter, notifier)
+    engine.position = Position("long", 1.0, 100.0, 99.0, 103.0, 123_456,
+                               entry_order_id="77", stop_order_id="88")
+    for timestamp in (100.0, 114.0, 115.0, 144.0):
+        clock[0] = timestamp
+        engine._reconcile_managed_entry_fill()
+    assert adapter.calls == 2
+    assert notifier.emergencies == []
+    clock[0] = 145.0
+    engine._reconcile_managed_entry_fill()
+    assert engine.position.entry_fee == 0.04
+    assert engine.position.stop_order_id == "88"
+    clock[0] = 1_000.0
+    engine._reconcile_managed_entry_fill()
+    assert adapter.calls == 3
+    assert notifier.emergencies == []
+    assert ("ip_restricted", "") in notifier.resolved
+
+
+def test_entry_fill_pending_timeout_is_reconciliation_alert(monkeypatch) -> None:
+    clock = [100.0]
+    monkeypatch.setattr("btc_futures_bot.engine.time.monotonic", lambda: clock[0])
+
+    class Adapter(_EmergencyAdapter):
+        @staticmethod
+        def fetch_entry_fill(position: Position) -> None:
+            return None
+
+    notifier = _EmergencyNotifier()
+    engine = _alert_test_engine(Adapter(), notifier)
+    engine.position = Position("long", 1.0, 100.0, 99.0, 103.0, 123_456,
+                               entry_order_id="77", stop_order_id="88")
+    for timestamp in (100.0, 115.0, 145.0, 205.0, 325.0):
+        clock[0] = timestamp
+        engine._reconcile_managed_entry_fill()
+    assert notifier.emergencies == []
+    assert engine._entry_fill_next_at == 400.0
+    clock[0] = 400.0
+    engine._reconcile_managed_entry_fill()
+    assert len(notifier.emergencies) == 1
+    assert notifier.emergencies[0]["category"] == "entry_reconciliation"
+    assert engine.position.stop_order_id == "88"
+
+
+def test_entry_fill_rate_limit_alert_is_immediate_and_respects_ban(monkeypatch) -> None:
+    clock = [100.0]
+    monkeypatch.setattr("btc_futures_bot.engine.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("btc_futures_bot.http_client.time.time", lambda: 1_000.0)
+    error = ApiError("IP banned", status_code=418, retry_at=1_600.0)
+
+    class Adapter(_EmergencyAdapter):
+        calls = 0
+
+        def fetch_entry_fill(self, position: Position) -> None:
+            self.calls += 1
+            raise error
+
+    adapter = Adapter()
+    notifier = _EmergencyNotifier()
+    engine = _alert_test_engine(adapter, notifier)
+    engine.position = Position("long", 1.0, 100.0, 99.0, 103.0, 123_456,
+                               entry_order_id="77", stop_order_id="88")
+    engine._reconcile_managed_entry_fill()
+    assert len(notifier.emergencies) == 1
+    assert notifier.emergencies[0]["error"] is error
+    clock[0] = 699.0
+    engine._reconcile_managed_entry_fill()
+    assert adapter.calls == 1
+    assert engine.position.stop_order_id == "88"
+
+
+def test_cli_loop_does_not_sleep_through_an_entire_ip_ban(monkeypatch) -> None:
+    engine = _alert_test_engine(_EmergencyAdapter(), _EmergencyNotifier())
+    calls = [0]
+    waits = []
+
+    def evaluate():
+        calls[0] += 1
+        if calls[0] == 1:
+            raise ApiError("IP banned", status_code=418, retry_at=time.time() + 8_000)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(engine, "evaluate_once", evaluate)
+    monkeypatch.setattr("btc_futures_bot.engine.time.sleep", waits.append)
+    with pytest.raises(KeyboardInterrupt):
+        engine.run_forever()
+    assert calls[0] == 2
+    assert waits == [30.0]
 
 
 def test_failed_live_preflight_does_not_erase_saved_managed_position(tmp_path) -> None:
@@ -1116,7 +1228,11 @@ def test_binance_client_ids_fit_exchange_limit() -> None:
         assert client_id.startswith(f"btcbot-{prefix}-")
 
 
-def test_live_position_checks_mark_price_each_poll_and_closes_at_protected_stop() -> None:
+def test_live_position_checks_mark_price_each_poll_and_closes_at_protected_stop(
+    tmp_path,
+) -> None:
+    exchange_exit_time_ms = 1_788_552_003_195
+
     class Adapter:
         name = "binance"
         settings = SimpleNamespace(symbol="BTCUSDT", environment="production")
@@ -1145,7 +1261,12 @@ def test_live_position_checks_mark_price_each_poll_and_closes_at_protected_stop(
         def place_market_order(self, request: object) -> dict:
             self.close_request = request
             self.closed = True
-            return {"status": "FILLED", "executedQty": "1", "avgPrice": "100.9"}
+            return {
+                "status": "FILLED",
+                "executedQty": "1",
+                "avgPrice": "100.9",
+                "updateTime": exchange_exit_time_ms,
+            }
 
         @staticmethod
         def market_fill(payload: dict, *, fallback_price: float) -> tuple[float, float]:
@@ -1167,7 +1288,14 @@ def test_live_position_checks_mark_price_each_poll_and_closes_at_protected_stop(
             return Signal("flat", 0, 1, ("no_entry",))
 
     adapter = Adapter()
-    engine = TradingEngine(adapter, Strategy(), RiskManager(), EngineConfig(mode="live"))
+    reporter = TradeReporter(tmp_path)
+    engine = TradingEngine(
+        adapter,
+        Strategy(),
+        RiskManager(),
+        EngineConfig(mode="live"),
+        reporter=reporter,
+    )
     engine.position = Position(
         "long",
         1.0,
@@ -1192,6 +1320,9 @@ def test_live_position_checks_mark_price_each_poll_and_closes_at_protected_stop(
     assert adapter.close_request.reduce_only is True
     assert adapter.close_request.side == "sell"
     assert engine.position is None
+    rows = reporter.query_trades(limit=1)
+    assert rows[0]["exit_time"] == "2026-09-04T20:00:03Z"
+    reporter.close()
 
 
 def test_live_adverse_dynamic_exit_closes_locally_and_keeps_hard_stop_until_fill() -> None:

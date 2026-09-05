@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .engine import normalized_poll_seconds
+from .engine import cycle_wait_seconds, normalized_poll_seconds
 from .http_client import ApiError, clear_rate_limits, is_rate_limit_error
 from .main import (
     build_engine,
@@ -619,7 +619,7 @@ class DashboardService:
                     self._last_logged_error = str(error)
                     self.operation_logger.record("engine_cycle", "cycle", status="error", summary="行情周期执行失败，引擎保持运行", result={"error": str(error)})
             poll = normalized_poll_seconds(self.engine.config.poll_seconds) if self.engine else 15
-            stop_event.wait(max(float(poll), rate_limit_wait))
+            stop_event.wait(cycle_wait_seconds(poll, rate_limit_wait))
 
     def _adapter(self, config: dict[str, Any], exchange_name: str) -> Any:
         expected = config.get("exchanges", {}).get(exchange_name, {})

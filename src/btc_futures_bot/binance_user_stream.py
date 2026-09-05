@@ -83,6 +83,10 @@ class BinanceUserDataStream:
         self._algo_orders: dict[str, dict[str, Any]] = {}
         self._recent_orders: dict[str, dict[str, Any]] = {}
         self._recent_algo_orders: dict[str, dict[str, Any]] = {}
+        # Exact TRADE executions are kept separately from the latest order
+        # lifecycle row. One market order can generate several trade events,
+        # and reconnect/replay must not double-count their commission.
+        self._order_trade_fills: dict[str, dict[str, dict[str, Any]]] = {}
 
     @property
     def available(self) -> bool:
@@ -188,6 +192,16 @@ class BinanceUserDataStream:
 
     def wait_for_algo_order(self, client_id: str, *, timeout: float = 2.0) -> dict[str, Any] | None:
         return self._wait_for_cached(self._recent_algo_orders, client_id, timeout)
+
+    def fills_for_order(self, order_id: str) -> list[dict[str, Any]]:
+        """Return a non-blocking snapshot of exact TRADE events for an order."""
+
+        lookup = str(order_id or "").strip()
+        if not lookup:
+            return []
+        with self._condition:
+            fills = self._order_trade_fills.get(lookup) or {}
+            return copy.deepcopy(list(fills.values()))
 
     def record_order_response(self, row: dict[str, Any]) -> None:
         """Make a successful synchronous order response visible immediately."""
@@ -471,6 +485,40 @@ class BinanceUserDataStream:
             "updateTime": update.get("T") or int(time.time() * 1000),
         }
         self._store_regular_order(row)
+        self._store_order_trade_fill(update)
+
+    def _store_order_trade_fill(self, update: dict[str, Any]) -> None:
+        """Keep one atomic fill per Binance trade id from ORDER_TRADE_UPDATE."""
+
+        if str(update.get("x") or "").upper() != "TRADE":
+            return
+        if str(update.get("s") or "").upper() != self.symbol:
+            return
+        order_id = str(update.get("i") or "").strip()
+        trade_id_value = update.get("t")
+        trade_id = "" if trade_id_value is None else str(trade_id_value).strip()
+        try:
+            quantity = Decimal(str(update.get("l") or "0"))
+        except (ArithmeticError, ValueError):
+            return
+        if not order_id or not trade_id or not quantity.is_finite() or quantity <= 0:
+            return
+
+        fills = self._order_trade_fills.setdefault(order_id, {})
+        if trade_id in fills:
+            return
+        fills[trade_id] = {
+            "orderId": update.get("i"),
+            "tradeId": trade_id_value,
+            "side": update.get("S"),
+            "qty": update.get("l"),
+            "price": update.get("L"),
+            "commission": update.get("n") if "n" in update else None,
+            "commissionAsset": update.get("N"),
+            "time": update.get("T"),
+        }
+        self._trim_recent(fills, maximum=1000)
+        self._trim_recent(self._order_trade_fills, maximum=300)
 
     def _apply_algo_update(self, update: dict[str, Any]) -> None:
         row = {

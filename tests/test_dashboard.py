@@ -17,6 +17,7 @@ from btc_futures_bot.dashboard import (
     _position_dict,
 )
 from btc_futures_bot.models import Position
+from btc_futures_bot.http_client import ApiError
 
 
 class _RecordingEmergencyNotifier:
@@ -228,7 +229,8 @@ def test_dashboard_market_snapshot_is_single_flight_across_tabs() -> None:
     assert all(result["market"]["mark_price"] == 100.0 for result in results)
 
 
-def test_dashboard_run_loop_alerts_on_error_then_resolves_after_success() -> None:
+@pytest.mark.parametrize("rate_limited", [False, True])
+def test_dashboard_run_loop_alerts_on_error_then_resolves_after_success(rate_limited) -> None:
     service = DashboardService.__new__(DashboardService)
     service._lock = threading.RLock()
     service.last_result = None
@@ -238,6 +240,11 @@ def test_dashboard_run_loop_alerts_on_error_then_resolves_after_success() -> Non
     service._last_logged_error = ""
     service._last_macro_block = ""
     timeline: list[str] = []
+    waits: list[float] = []
+    cycle_error = (
+        ApiError("venue cycle unavailable", status_code=418, retry_at=time.time() + 8_000)
+        if rate_limited else RuntimeError("venue cycle unavailable")
+    )
 
     recovered_result = SimpleNamespace(
         exchange="binance",
@@ -259,7 +266,7 @@ def test_dashboard_run_loop_alerts_on_error_then_resolves_after_success() -> Non
             self.evaluate_calls += 1
             if self.evaluate_calls == 1:
                 timeline.append("evaluate_error")
-                raise RuntimeError("venue cycle unavailable")
+                raise cycle_error
             assert service._last_logged_error == "venue cycle unavailable"
             timeline.append("evaluate_success")
             return recovered_result
@@ -298,6 +305,7 @@ def test_dashboard_run_loop_alerts_on_error_then_resolves_after_success() -> Non
             return self.checks > 2
 
         def wait(self, _timeout: float) -> bool:
+            waits.append(_timeout)
             return False
 
     class OperationLogger:
@@ -313,6 +321,7 @@ def test_dashboard_run_loop_alerts_on_error_then_resolves_after_success() -> Non
     service._run_loop()
 
     assert engine.evaluate_calls == 2
+    assert waits == ([30.0, 1.0] if rate_limited else [1.0, 1.0])
     assert len(engine.notifications) == 1
     notification = engine.notifications[0]
     assert str(notification["error"]) == "venue cycle unavailable"

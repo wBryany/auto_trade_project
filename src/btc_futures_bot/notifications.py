@@ -313,6 +313,11 @@ class EmailNotifier:
             )
         else:
             subject, heading, handling = {
+                "entry_reconciliation": (
+                    "【紧急】成交明细对账异常（已开仓）",
+                    "订单已成交且已建立硬止损，开仓成交明细对账异常",
+                    "现有仓位和交易所硬止损保留，程序将低频补查；请核对成交明细，不要重复下单。",
+                ),
                 "order_failure": (
                     "【紧急】下单失败",
                     "交易订单执行失败",

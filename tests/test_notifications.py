@@ -303,6 +303,25 @@ def test_non_binance_rate_limit_alert_uses_the_actual_exchange_name(tmp_path: Pa
     assert "Binance" not in messages[0]["Subject"]
 
 
+def test_entry_reconciliation_alert_distinguishes_filled_order_and_ip_ban(tmp_path: Path) -> None:
+    messages = []
+    notifier = EmailNotifier(_email_config(tmp_path), send_fn=messages.append)
+    context = dict(category="entry_reconciliation", exchange="binance", symbol="BTCUSDT",
+                   mode="live", environment="production", incident="managed_entry_fill:77",
+                   context="受保护仓位的开仓成交明细对账")
+    try:
+        assert notifier.notify_emergency(RuntimeError("fill metadata unavailable"), **context)
+        assert notifier.notify_emergency(ApiError("IP banned", status_code=418), **context)
+        assert notifier.flush()
+    finally:
+        notifier.close()
+    assert len(messages) == 2
+    assert "已开仓" in messages[0]["Subject"]
+    assert "下单失败" not in messages[0]["Subject"]
+    assert "硬止损" in messages[0].get_content()
+    assert "IP" in messages[1]["Subject"]
+
+
 def test_emergency_message_is_deduplicated_until_incident_is_resolved(tmp_path: Path) -> None:
     messages = []
     notifier = EmailNotifier(_email_config(tmp_path), send_fn=messages.append)

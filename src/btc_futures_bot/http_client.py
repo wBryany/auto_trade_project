@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 import time
@@ -9,6 +10,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 from typing import Any, Mapping
+
+
+LOG = logging.getLogger(__name__)
 
 
 class ApiError(RuntimeError):
@@ -40,6 +44,10 @@ class ApiError(RuntimeError):
 
 _RATE_LIMIT_LOCK = threading.Lock()
 _RATE_LIMIT_UNTIL: dict[str, float] = {}
+_USAGE_LOG_LOCK = threading.Lock()
+_USAGE_LOG_STATE: dict[tuple[str, str], tuple[int, int]] = {}
+_USAGE_LOG_INTERVAL_SECONDS = 60.0
+_USAGE_LOG_WEIGHT_STEP = 100
 _RATE_LIMIT_MARKERS = (
     "rate limit active",
     "http 418",
@@ -69,6 +77,104 @@ def _rate_limit_key(url: str) -> str:
     return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
 
 
+def _request_identity(url: str) -> tuple[str, str]:
+    """Return a query-free host/path pair that is safe for telemetry."""
+
+    parsed = urlsplit(str(url))
+    return parsed.netloc.lower(), parsed.path or "/"
+
+
+def _used_weight_headers(headers: Mapping[str, Any] | object) -> dict[str, int]:
+    try:
+        items = headers.items()  # type: ignore[union-attr]
+    except AttributeError:
+        return {}
+    result: dict[str, int] = {}
+    prefix = "X-MBX-USED-WEIGHT-"
+    for raw_name, raw_value in items:
+        name = str(raw_name).strip().upper()
+        if not name.startswith(prefix):
+            continue
+        window = name[len(prefix) :].strip().lower()
+        if not window:
+            continue
+        try:
+            used_weight = int(str(raw_value).strip())
+        except (TypeError, ValueError):
+            continue
+        if used_weight >= 0:
+            result[window] = used_weight
+    return result
+
+
+def _observe_successful_weight(
+    url: str,
+    *,
+    status: int,
+    headers: Mapping[str, Any] | object,
+) -> None:
+    """Log bounded Binance IP-weight high-water observations.
+
+    The aggregation key is host plus the exchange-provided rate window. A
+    100-weight increase or a one-minute timebox rollover is enough to emit
+    another observation. Query strings and headers containing credentials are
+    deliberately never passed to the logger.
+    """
+
+    observations = _used_weight_headers(headers)
+    if not observations:
+        return
+    host, path = _request_identity(url)
+    timebox = int(time.time() // _USAGE_LOG_INTERVAL_SECONDS)
+    selected: list[tuple[str, int]] = []
+    with _USAGE_LOG_LOCK:
+        for window, used_weight in observations.items():
+            key = (host, window)
+            previous = _USAGE_LOG_STATE.get(key)
+            should_log = (
+                previous is None
+                or timebox != previous[0]
+                or used_weight - previous[1] >= _USAGE_LOG_WEIGHT_STEP
+            )
+            if should_log:
+                _USAGE_LOG_STATE[key] = (timebox, used_weight)
+                selected.append((window, used_weight))
+    for window, used_weight in selected:
+        LOG.info(
+            "exchange_http_usage host=%s path=%s status=%s used_weight=%s:%s retry_at=0",
+            host,
+            path,
+            int(status),
+            window,
+            used_weight,
+        )
+
+
+def _record_rate_limit_response(
+    url: str,
+    *,
+    status: int,
+    headers: Mapping[str, Any] | object,
+    retry_at: float,
+) -> None:
+    """Record a rate-limit response without retaining its signed URL."""
+
+    host, path = _request_identity(url)
+    observations = _used_weight_headers(headers)
+    used_weight = (
+        ",".join(f"{window}:{value}" for window, value in sorted(observations.items()))
+        or "unknown"
+    )
+    LOG.warning(
+        "exchange_http_rate_limit host=%s path=%s status=%s used_weight=%s retry_at=%.3f",
+        host,
+        path,
+        int(status),
+        used_weight,
+        float(retry_at),
+    )
+
+
 def rate_limit_remaining(url: str) -> float:
     """Return seconds before another request may be sent to this host."""
 
@@ -94,6 +200,8 @@ def clear_rate_limits() -> None:
 
     with _RATE_LIMIT_LOCK:
         _RATE_LIMIT_UNTIL.clear()
+    with _USAGE_LOG_LOCK:
+        _USAGE_LOG_STATE.clear()
 
 
 def is_rate_limit_error(error: BaseException | str | object) -> bool:
@@ -194,12 +302,29 @@ def request_json(
         try:
             with urlopen(request, timeout=timeout) as response:
                 payload = response.read().decode("utf-8")
+                response_headers = getattr(response, "headers", {}) or {}
+                response_status = int(
+                    getattr(response, "status", 0)
+                    or getattr(response, "code", 0)
+                    or 200
+                )
+            _observe_successful_weight(
+                url,
+                status=response_status,
+                headers=response_headers,
+            )
             break
         except HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
             api_code = _response_api_code(detail)
             if error.code in {418, 429} or str(api_code or "") == "-1003":
                 retry_at = _set_rate_limit(url, _http_retry_at(error, detail))
+                _record_rate_limit_response(
+                    url,
+                    status=error.code,
+                    headers=getattr(error, "headers", {}) or {},
+                    retry_at=retry_at,
+                )
                 raise ApiError(
                     f"HTTP {error.code} {method} {safe_url}: {detail[:500]}",
                     status_code=error.code,

@@ -155,6 +155,54 @@ def test_private_stream_tracks_regular_and_algo_order_lifecycle(monkeypatch) -> 
     assert stream.wait_for_algo_order("btcbot-stop-1", timeout=0)["algoStatus"] == "FINISHED"
 
 
+def test_private_stream_collects_atomic_trade_fills_and_deduplicates_replays() -> None:
+    stream = _stream()
+    first = {
+        "e": "ORDER_TRADE_UPDATE",
+        "o": {
+            "s": "BTCUSDT",
+            "c": "btcbot-entry-fills",
+            "S": "BUY",
+            "o": "MARKET",
+            "x": "TRADE",
+            "X": "PARTIALLY_FILLED",
+            "i": 303,
+            "l": "0.001",
+            "z": "0.001",
+            "L": "79000",
+            "N": "USDT",
+            "n": "0.0395",
+            "T": 1_788_525_001_000,
+            "t": 9001,
+        },
+    }
+    second = json.loads(json.dumps(first))
+    second["o"].update(
+        {
+            "X": "FILLED",
+            "l": "0.002",
+            "z": "0.003",
+            "L": "79200",
+            "n": "0.0792",
+            "T": 1_788_525_001_500,
+            "t": 9002,
+        }
+    )
+
+    stream.process_message(json.dumps(first))
+    stream.process_message(json.dumps(first))
+    stream.process_message(json.dumps(second))
+
+    fills = stream.fills_for_order("303")
+    assert len(fills) == 2
+    assert [row["tradeId"] for row in fills] == [9001, 9002]
+    assert [row["qty"] for row in fills] == ["0.001", "0.002"]
+    assert [row["price"] for row in fills] == ["79000", "79200"]
+    assert sum(float(row["commission"]) for row in fills) == pytest.approx(0.1187)
+    assert {row["commissionAsset"] for row in fills} == {"USDT"}
+    assert stream.fills_for_order("missing") == []
+
+
 def test_private_stream_maps_real_binance_algo_trigger_price_field(monkeypatch) -> None:
     stream = _stream()
     monkeypatch.setattr(stream, "start", lambda **_kwargs: True)

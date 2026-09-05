@@ -37,6 +37,12 @@ def normalized_poll_seconds(value: int | float | str) -> int:
     return max(MIN_POLL_SECONDS, int(value))
 
 
+def cycle_wait_seconds(poll_seconds: int | float | str, retry_after: float = 0.0) -> float:
+    # The HTTP client owns the full host ban. Keep consuming private/market
+    # WebSocket state during it, including exchange-side stop executions.
+    return max(float(normalized_poll_seconds(poll_seconds)), min(30.0, retry_after))
+
+
 @dataclass
 class EngineConfig:
     mode: str = "paper"
@@ -97,6 +103,11 @@ class TradingEngine:
         self._private_entry_retry_deadline = 0.0
         self._private_entry_retry_next_at = 0.0
         self._private_entry_retry_notice_sent = False
+        self._entry_fill_order_id = ""
+        self._entry_fill_complete = False
+        self._entry_fill_started_at = 0.0
+        self._entry_fill_next_at = 0.0
+        self._entry_fill_attempts = 0
 
     def prepare_live(self) -> dict[str, Any]:
         if self.config.mode != "live":
@@ -324,6 +335,9 @@ class TradingEngine:
             )
             if active_exit is not None:
                 return active_exit
+            # Optional reporting metadata must run after position risk checks.
+            # The lookup is throttled independently and never resubmits orders.
+            self._reconcile_managed_entry_fill()
         if signal.side == "flat" or (
             signal.timestamp == self.last_signal_timestamp and not retry_pending
         ):
@@ -581,13 +595,14 @@ class TradingEngine:
             # stops and profit exits are decided online; the hard stop remains
             # live until an online close has filled.
             take_profit_client_id = ""
+            entry_time_ms = self._exchange_order_timestamp_ms(entry_payload)
             position = Position(
                 signal.side,
                 filled_quantity,
                 filled_price,
                 stop_price,
                 take_profit_price,
-                int(time.time() * 1000),
+                entry_time_ms or int(time.time() * 1000),
                 initial_stop_price=stop_price,
                 best_price=filled_price,
                 worst_price=filled_price,
@@ -1191,11 +1206,32 @@ class TradingEngine:
         fetch_entry_fill = getattr(self.adapter, "fetch_entry_fill", None)
         if not callable(fetch_entry_fill):
             return
+        order_id = position.entry_order_id or f"missing:{position.opened_at}"
+        now = time.monotonic()
+        if order_id != self._entry_fill_order_id:
+            self._entry_fill_order_id = order_id
+            self._entry_fill_complete = False
+            self._entry_fill_started_at = now
+            self._entry_fill_next_at = 0.0
+            self._entry_fill_attempts = 0
+        if self._entry_fill_complete or now < self._entry_fill_next_at:
+            return
+        self._entry_fill_attempts += 1
+        self._entry_fill_next_at = now + min(
+            300.0, 15.0 * (2 ** min(self._entry_fill_attempts - 1, 5))
+        )
         incident = f"managed_entry_fill:{position.entry_order_id or 'missing'}"
         try:
             fill = fetch_entry_fill(position)
             if not fill:
-                raise RuntimeError("Binance has not returned the complete managed entry fills")
+                if now - self._entry_fill_started_at >= 300.0:
+                    raise RuntimeError("开仓成交明细超过5分钟仍未完整返回；订单已成交且硬止损保留")
+                if self._entry_fill_attempts == 1:
+                    LOG.info("managed Binance entry fills pending; protected position retained")
+                self._entry_fill_next_at = min(
+                    self._entry_fill_next_at, self._entry_fill_started_at + 300.0
+                )
+                return
             expected_side = "BUY" if position.side == "long" else "SELL"
             if str(fill.get("side") or "").upper() != expected_side:
                 raise RuntimeError("Binance entry-fill side validation failed")
@@ -1240,12 +1276,22 @@ class TradingEngine:
                 entry_fee_asset=("USDT" if quote_fee is not None else "/".join(assets)),
             )
             self._save_live_reconciliation_state()
+            self._entry_fill_complete = True
+            # A WebSocket fill alone cannot prove that REST/IP access recovered.
+            if "/fapi/v1/userTrades" in str(fill.get("source") or ""):
+                self.resolve_emergency("ip_restricted")
+            self.resolve_emergency("entry_reconciliation", incident)
             self.resolve_emergency("order_failure", incident)
         except Exception as error:
+            if isinstance(error, ApiError) and error.rate_limited:
+                self._entry_fill_next_at = max(
+                    self._entry_fill_next_at,
+                    time.monotonic() + error.retry_after_seconds,
+                )
             LOG.warning("managed Binance entry-fill reconciliation failed: %s", error)
             self.notify_emergency(
                 error,
-                category="order_failure",
+                category="entry_reconciliation",
                 context="受保护仓位的开仓成交明细对账失败；保留现有仓位与硬止损，不重下单",
                 incident=incident,
                 details={
@@ -1427,7 +1473,11 @@ class TradingEngine:
             position,
             context="主动平仓已完成，但取消残留保护单失败",
         )
-        self._close_paper_position(close_price, exit_reason)
+        self._close_paper_position(
+            close_price,
+            exit_reason,
+            exit_time_ms=self._exchange_order_timestamp_ms(close_payload),
+        )
         self.resolve_emergency("order_failure", "close_submit")
         return {
             "closed_quantity": closed_quantity,
@@ -2280,11 +2330,23 @@ class TradingEngine:
                     )
                 if isinstance(error, ApiError) and error.rate_limited:
                     retry_after = error.retry_after_seconds
-            time.sleep(max(float(normalized_poll_seconds(self.config.poll_seconds)), retry_after))
+            time.sleep(cycle_wait_seconds(self.config.poll_seconds, retry_after))
 
     @staticmethod
     def _opposite_side(side: str) -> str:
         return "sell" if side == "long" else "buy"
+
+    @staticmethod
+    def _exchange_order_timestamp_ms(payload: dict[str, Any]) -> int | None:
+        """Return a validated exchange clock timestamp without risking order flow."""
+        for key in ("updateTime", "transactTime", "time"):
+            try:
+                timestamp = int(payload.get(key) or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if timestamp > 0:
+                return timestamp
+        return None
 
     @staticmethod
     def _client_id(prefix: str) -> str:
