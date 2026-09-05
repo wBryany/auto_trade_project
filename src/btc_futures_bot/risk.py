@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import floor
+from math import floor, isfinite
+from typing import Sequence
 
 from .costs import CostConfig
+from .models import Candle
 
 
 @dataclass(frozen=True)
@@ -15,6 +17,7 @@ class RiskConfig:
     max_consecutive_losses: int = 0
     cooldown_minutes: int = 15
     loss_streak_pause_minutes: int = 0
+    entry_range_lookback_minutes: int = 0
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,29 @@ class RiskManager:
             raise ValueError("max_consecutive_losses cannot be negative")
         if self.config.cooldown_minutes < 0 or self.config.loss_streak_pause_minutes < 0:
             raise ValueError("cooldown durations cannot be negative")
+        if self.config.entry_range_lookback_minutes < 0:
+            raise ValueError("entry_range_lookback_minutes cannot be negative")
+
+    def observed_range_allows_entry(self, candles: Sequence[Candle], entry_price: float) -> bool:
+        """Require observed closed-1m range to cover costs plus the configured edge.
+
+        This is a liquidity/volatility filter, not a forecast of attainable profit.
+        A synthetic take-profit distance alone cannot establish market opportunity.
+        Disabled by default; never use this gate to block management of an open position.
+        """
+        count = self.config.entry_range_lookback_minutes
+        if count == 0:
+            return True
+        if len(candles) < count or not isfinite(entry_price) or entry_price <= 0:
+            return False
+        window = candles[-count:]
+        if any(b.timestamp - a.timestamp != 60_000 for a, b in zip(window, window[1:])):
+            return False
+        if any(not isfinite(c.high) or not isfinite(c.low) or c.low <= 0 or c.high < c.low for c in window):
+            return False
+        observed = (max(c.high for c in window) - min(c.low for c in window)) / entry_price
+        required = self.costs.estimate_round_trip_cost(1.0, 1.0, 1.0) + self.costs.min_net_edge_pct
+        return observed >= required
 
     def protection(
         self,

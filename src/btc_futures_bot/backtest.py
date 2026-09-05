@@ -340,6 +340,10 @@ def run_backtest(
             # market order is therefore modeled at the next 1m open rather
             # than retroactively at the signal candle's close.
             entry_price = next_execution_open
+            if not risk.observed_range_allows_entry(
+                candles_by_timeframe["1m"], candles_by_timeframe["1m"][-1].close
+            ):
+                continue
             stop_loss_pct = dynamic_stop_loss_pct(
                 stop_candles,
                 strategy.config,

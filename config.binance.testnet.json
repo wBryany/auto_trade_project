@@ -230,6 +230,7 @@
       "min_net_edge_pct": 0.0015
   },
   "risk": {
+    "entry_range_lookback_minutes": 60,
     "risk_per_trade": 0.003,
     "stop_loss_pct": 0.003,
       "max_notional_pct": 0.30,

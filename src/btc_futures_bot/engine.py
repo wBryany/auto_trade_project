@@ -383,6 +383,14 @@ class TradingEngine:
         if not self._entry_allowed():
             return TradeResult(self.adapter.name, "risk_blocked", signal=signal, position=self.position)
 
+        if not self.risk.observed_range_allows_entry(candles_by_timeframe.get("1m", []), current_price):
+            self._clear_private_entry_retry()
+            return TradeResult(
+                self.adapter.name, "insufficient_market_range", signal=signal,
+                position=self.position,
+                raw={"entry_blocked": "closed_1m_range_below_costs_and_minimum_net_edge"},
+            )
+
         entry_attempt_started_at = (
             self._private_entry_retry_started_at
             if retry_pending
