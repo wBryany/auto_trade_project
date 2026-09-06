@@ -20,6 +20,7 @@ from .risk import RiskManager
 from .strategy import (
     MultiTimeframeStrategy,
     adverse_dynamic_exit_reason,
+    breakout_failure_exit_reason,
     dynamic_stop_loss_pct,
     effective_break_even_trigger_r,
     signal_position_size_multiplier,
@@ -1352,6 +1353,9 @@ class TradingEngine:
                 mark_price,
                 int(time.time() * 1000),
             )
+        if not exit_reason:
+            exit_reason = breakout_failure_exit_reason(position, self.position_signal,
+                candles_by_timeframe, self.strategy.config, mark_price, int(time.time() * 1000))
         if not exit_reason and self._profit_trend_exit_ready(candles_by_timeframe):
             exit_reason = "trend_invalidation"
         if not exit_reason:
@@ -1968,6 +1972,11 @@ class TradingEngine:
                 float(candle.close),
                 int(time.time() * 1000),
             )
+            if exit_reason:
+                exit_price = float(candle.close)
+        if exit_price is None:
+            exit_reason = breakout_failure_exit_reason(self.position, self.position_signal,
+                candles_by_timeframe or {}, self.strategy.config, float(candle.close), int(time.time() * 1000))
             if exit_reason:
                 exit_price = float(candle.close)
         time_exit_enabled = bool(getattr(self.strategy.config, "enable_time_exit", False))

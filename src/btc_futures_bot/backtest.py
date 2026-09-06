@@ -14,6 +14,7 @@ from .strategy import (
     MultiTimeframeStrategy,
     StrategyConfig,
     adverse_dynamic_exit_reason,
+    breakout_failure_exit_reason,
     dynamic_stop_loss_pct,
     effective_break_even_trigger_r,
     signal_position_size_multiplier,
@@ -171,6 +172,11 @@ def run_backtest(
                 )
                 if exit_reason:
                     exit_price = exit_candle.close
+            if exit_price is None and next_execution_open is not None:
+                exit_reason = breakout_failure_exit_reason(position, position_signal,
+                    candles_by_timeframe, strategy.config, exit_candle.close, decision_timestamp)
+                if exit_reason:
+                    exit_price = next_execution_open
             time_exit_enabled = bool(getattr(strategy.config, "enable_time_exit", False))
             soft_max_hold_seconds = max(0, int(strategy.config.max_hold_seconds))
             if exit_price is None and time_exit_enabled and soft_max_hold_seconds:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping, Sequence
 
 from .indicators import atr, ema, macd, rsi, sma
@@ -70,6 +70,8 @@ class StrategyConfig:
     traditional_pullback_max_range_atr: float = 0.0
     traditional_pullback_max_extension_atr: float = 0.0
     traditional_pullback_max_volume_ratio: float = 0.0
+    traditional_invalidate_failed_breakouts: bool = False
+    enable_breakout_failure_exit: bool = False
     traditional_allow_breakout: bool = True
     traditional_breakout_lookback: int = 6
     traditional_breakout_min_volume_ratio: float = 1.3
@@ -267,6 +269,8 @@ class _TraditionalSetupState:
     breakout_short_raw: bool
     breakout_long: bool
     breakout_short: bool
+    breakout_long_level: float = 0.0
+    breakout_short_level: float = 0.0
 
     @property
     def long_ready(self) -> bool:
@@ -644,6 +648,8 @@ class MultiTimeframeStrategy:
             self.config,
             feature=previous_trigger,
         )
+        if self.config.traditional_invalidate_failed_breakouts:
+            previous_setup = invalidate_breakout_setup(previous_setup, trigger_candles[-1:])
         long_macd_handoff = _traditional_setup_macd_handoff(
             previous_trigger,
             trigger,
@@ -682,6 +688,8 @@ class MultiTimeframeStrategy:
             if len(history) < minimum_trigger:
                 break
             setup = current_setup if age == 0 else _traditional_setup_state(history, self.config)
+            if age and self.config.traditional_invalidate_failed_breakouts:
+                setup = invalidate_breakout_setup(setup, trigger_candles[-age:])
             if long_setup_age is None and setup.long_ready:
                 long_setup_age = age
                 long_setup_state = setup
@@ -870,6 +878,8 @@ class MultiTimeframeStrategy:
                 reasons += (f"{regime_name}_countertrend_pullback_up",)
             if neutral_transition_long:
                 reasons += (f"{regime_name}_neutral_transition_up",)
+            if self.config.enable_breakout_failure_exit and selected_setup.breakout_long:
+                reasons += (f"breakout_level={selected_setup.breakout_long_level:.12g}",)
             return Signal("long", long_score, timestamp, reasons)
         if short_score == len(short_checks) and short_score > long_score:
             reasons = tuple(short_checks)
@@ -898,6 +908,8 @@ class MultiTimeframeStrategy:
                 reasons += (f"{regime_name}_countertrend_pullback_down",)
             if neutral_transition_short:
                 reasons += (f"{regime_name}_neutral_transition_down",)
+            if self.config.enable_breakout_failure_exit and selected_setup.breakout_short:
+                reasons += (f"breakout_level={selected_setup.breakout_short_level:.12g}",)
             return Signal("short", short_score, timestamp, reasons)
 
         # Ultra-short structural recovery: the closed 1h candle is context,
@@ -1589,6 +1601,8 @@ def _traditional_setup_state(
         death_cross=death_cross,
         pullback_long=pullback_long,
         pullback_short=pullback_short,
+        breakout_long_level=max((c.high for c in breakout_history), default=0.0),
+        breakout_short_level=min((c.low for c in breakout_history), default=0.0),
         breakout_long_raw=breakout_long_raw,
         breakout_short_raw=breakout_short_raw,
         breakout_long=breakout_long_raw and _traditional_breakout_quality(selected, "long", config),
@@ -3718,3 +3732,55 @@ def _traditional_reclaim_quality(
     if volume_cap and (feature.volume_ratio is None or feature.volume_ratio > volume_cap):
         return False
     return True
+
+
+def invalidate_breakout_setup(setup: _TraditionalSetupState, subsequent: Sequence[Candle]) -> _TraditionalSetupState:
+    """An intervening close through the original level expires a breakout.
+
+    Wick-only retests and independent cross/pullback setups remain valid.
+    """
+    long_failed = any(c.close <= setup.breakout_long_level for c in subsequent)
+    short_failed = any(c.close >= setup.breakout_short_level for c in subsequent)
+    return replace(setup,
+        breakout_long=setup.breakout_long and not long_failed,
+        breakout_long_raw=setup.breakout_long_raw and not long_failed,
+        breakout_short=setup.breakout_short and not short_failed,
+        breakout_short_raw=setup.breakout_short_raw and not short_failed)
+
+
+def breakout_failure_exit_reason(position: Position, signal: Signal | None,
+    candles_by_timeframe: Mapping[str, Sequence[Candle]], config: StrategyConfig,
+    current_price: float, now_ms: int) -> str:
+    """Two fully post-entry 5m closes plus adverse 1m momentum confirm failure.
+
+    The original entry level is stored in signal reasons and survives restart.
+    Legacy positions without a recorded level retain their existing management.
+    """
+    if not config.enable_breakout_failure_exit or signal is None or config.trigger_timeframe != "5m":
+        return ""
+    if position.side not in {"long", "short"} or signal.side != position.side:
+        return ""
+    expected = "5m_breakout" if position.side == "long" else "5m_breakdown"
+    if expected not in signal.reasons:
+        return ""
+    try:
+        level = float(next(r.split("=", 1)[1] for r in signal.reasons if r.startswith("breakout_level=")))
+    except (StopIteration, ValueError):
+        return ""
+    from math import isfinite
+    if not isfinite(level) or level <= 0 or not isfinite(current_price) or current_price <= 0:
+        return ""
+    closed = [c for c in candles_by_timeframe.get("5m", ()) if c.timestamp >= position.opened_at and c.timestamp + 300_000 <= now_ms]
+    if len(closed) < 2 or closed[-1].timestamp - closed[-2].timestamp != 300_000:
+        return ""
+    if now_ms - (closed[-1].timestamp + 300_000) >= 300_000:
+        return ""
+    adverse = lambda price: price < level if position.side == "long" else price > level
+    if not all(adverse(c.close) for c in closed[-2:]) or not adverse(current_price):
+        return ""
+    minutes = [c for c in candles_by_timeframe.get("1m", ()) if c.timestamp + 60_000 <= now_ms]
+    if len(minutes) < 2 or minutes[-1].timestamp - minutes[-2].timestamp != 60_000 or now_ms - (minutes[-1].timestamp + 60_000) >= 60_000:
+        return ""
+    if not _one_minute_adverse_confirmation(position.side, minutes, config, position.opened_at, 2):
+        return ""
+    return "breakout_failure"

@@ -33,6 +33,8 @@
     "max_leverage": 3
   },
   "strategy": {
+    "traditional_invalidate_failed_breakouts": true,
+    "enable_breakout_failure_exit": true,
     "mode": "scalp",
     "trigger_timeframe": "30s",
     "regime_timeframe": "5m",
