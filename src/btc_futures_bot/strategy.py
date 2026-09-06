@@ -4,6 +4,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any, Iterator, Mapping, Sequence
 
 from .indicators import atr, ema, macd, rsi, sma
@@ -78,7 +79,7 @@ def _strategy_replay_sequence_key(candles: Sequence[Candle]) -> Any:
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    """Configuration for the legacy scalp and traditional K-line modes."""
+    """Configuration for legacy scalp, minute scalp v2 and traditional modes."""
 
     mode: str = "scalp"
     trigger_timeframe: str = "30s"
@@ -97,6 +98,9 @@ class StrategyConfig:
     require_full_alignment: bool = False
     require_volume_confirmation: bool = True
     min_score: int = 2
+    scalp_min_body_ratio: float = 0.35
+    scalp_min_close_location: float = 0.6
+    scalp_max_extension_atr: float = 1.5
     take_profit_r: float = 2.5
     atr_stop_multiplier: float = 1.4
     min_stop_loss_pct: float = 0.0025
@@ -347,6 +351,29 @@ class _TraditionalSetupState:
 
 
 def _features(candles: Sequence[Candle], config: StrategyConfig) -> _Features | None:
+    replay_cache = _ACTIVE_STRATEGY_REPLAY_CACHE.get()
+    if replay_cache is None:
+        return _compute_features(candles, config)
+    cache_key = (
+        _strategy_replay_sequence_key(candles),
+        config.ema_fast,
+        config.ema_slow,
+        config.ema_regime,
+        config.macd_fast,
+        config.macd_slow,
+        config.macd_signal,
+        config.rsi_period,
+        config.atr_period,
+        config.breakout_lookback,
+        config.volume_sma_period,
+    )
+    cached = replay_cache.get("scalp_features", cache_key)
+    if cached is not _REPLAY_CACHE_MISS:
+        return cached
+    return replay_cache.put("scalp_features", cache_key, _compute_features(candles, config))
+
+
+def _compute_features(candles: Sequence[Candle], config: StrategyConfig) -> _Features | None:
     if not candles:
         return None
     closes = [candle.close for candle in candles]
@@ -472,8 +499,18 @@ class MultiTimeframeStrategy:
 
     def __init__(self, config: StrategyConfig | None = None) -> None:
         self.config = config or StrategyConfig()
+        if self.config.mode == "scalp_v2":
+            for field_name in ("scalp_min_body_ratio", "scalp_min_close_location"):
+                value = getattr(self.config, field_name)
+                if not isfinite(value) or not 0.0 <= value <= 1.0:
+                    raise ValueError(f"{field_name} must be finite and between 0 and 1")
+            extension = self.config.scalp_max_extension_atr
+            if not isfinite(extension) or extension <= 0.0:
+                raise ValueError("scalp_max_extension_atr must be positive and finite")
 
     def evaluate(self, candles_by_timeframe: Mapping[str, Sequence[Candle]]) -> Signal:
+        if self.config.mode == "scalp_v2":
+            return self._evaluate_scalp_v2(candles_by_timeframe)
         if self.config.mode == "traditional_kline":
             return self._evaluate_traditional(
                 candles_by_timeframe,
@@ -542,6 +579,85 @@ class MultiTimeframeStrategy:
         if short_ready:
             return Signal("short", short_score, timestamp, tuple(short_reasons))
         return Signal("flat", max(long_score, short_score), timestamp, ("no_scalp_setup",))
+
+    def _evaluate_scalp_v2(self, candles_by_timeframe: Mapping[str, Sequence[Candle]]) -> Signal:
+        """A fresh closed-minute setup, with five-minute directional context.
+
+        Unlike the legacy score-only mode, neither momentum nor a lower score
+        threshold can substitute for an actual trigger and confirmed turnover.
+        The caller supplies closed candles; no hour-scale trend is required.
+        """
+        config = self.config
+        if config.trigger_timeframe != "1m" or config.regime_timeframe != "5m":
+            return Signal("flat", 0, 0, ("scalp_v2_invalid_timeframes",))
+        trigger_candles = candles_by_timeframe.get("1m", ())
+        regime_candles = candles_by_timeframe.get("5m", ())
+        timestamp = trigger_candles[-1].timestamp if trigger_candles else 0
+        minimum = max(
+            config.ema_fast + 1,
+            config.ema_slow + 1,
+            config.rsi_period + 2,
+            config.atr_period + 1,
+            config.macd_slow + config.macd_signal,
+            config.breakout_lookback + 2,
+            config.volume_sma_period + 1,
+        )
+        if len(trigger_candles) < minimum or len(regime_candles) < minimum:
+            return Signal("flat", 0, timestamp, ("scalp_v2_insufficient_candles",))
+        trigger = _features(trigger_candles, config)
+        regime = _features(regime_candles, config)
+        if trigger is None or regime is None:
+            return Signal("flat", 0, timestamp, ("scalp_v2_insufficient_candles",))
+
+        # Strict separation prevents a perfectly flat EMA pair from being
+        # simultaneously treated as bullish and bearish context.
+        regime_long = _bullish_regime(regime) and not _bearish_regime(regime)
+        regime_short = _bearish_regime(regime) and not _bullish_regime(regime)
+        momentum_long = _bullish_momentum(trigger)
+        momentum_short = _bearish_momentum(trigger)
+        trigger_long = _bullish_trigger(trigger)
+        trigger_short = _bearish_trigger(trigger)
+        volume_ready = _volume_confirmed(trigger, config.min_volume_ratio)
+        long_score = int(regime_long) + int(momentum_long) + 2 * int(trigger_long) + int(trigger_long and volume_ready)
+        short_score = int(regime_short) + int(momentum_short) + 2 * int(trigger_short) + int(trigger_short and volume_ready)
+
+        side = "long" if regime_long else "short" if regime_short else "flat"
+        if side == "flat":
+            return Signal("flat", max(long_score, short_score), timestamp, ("scalp_v2_no_5m_direction",))
+        momentum_ready = momentum_long if side == "long" else momentum_short
+        trigger_ready = trigger_long if side == "long" else trigger_short
+        score = long_score if side == "long" else short_score
+        rejections: list[str] = []
+        if not momentum_ready:
+            rejections.append("scalp_v2_no_1m_momentum")
+        if not trigger_ready:
+            rejections.append("scalp_v2_no_fresh_trigger")
+        if not volume_ready:
+            rejections.append("scalp_v2_low_volume")
+        rejections.extend(_scalp_v2_quality_rejections(trigger_candles[-1], trigger, side, config))
+        if score < config.min_score:
+            rejections.append("scalp_v2_score_below_minimum")
+        if rejections:
+            return Signal("flat", score, timestamp, tuple(rejections))
+
+        breakout = (
+            trigger.previous_high is not None and trigger.close > trigger.previous_high
+            if side == "long"
+            else trigger.previous_low is not None and trigger.close < trigger.previous_low
+        )
+        return Signal(
+            side,
+            score,
+            timestamp,
+            (
+                "scalp_v2",
+                f"5m_{'bull' if side == 'long' else 'bear'}_regime",
+                f"1m_{'bull' if side == 'long' else 'bear'}_momentum",
+                "scalp_v2_1m_breakout" if breakout else "scalp_v2_1m_ema_reclaim",
+                "scalp_v2_1m_volume",
+                "scalp_v2_execution_quality",
+            ),
+        )
 
     def reevaluate_blocked_signal(
         self,
@@ -1471,6 +1587,32 @@ class MultiTimeframeStrategy:
             )
             + tuple(quality_rejections),
         )
+
+
+def _scalp_v2_quality_rejections(
+    candle: Candle,
+    feature: _Features,
+    side: str,
+    config: StrategyConfig,
+) -> list[str]:
+    candle_range = candle.high - candle.low
+    if candle_range <= 0 or feature.atr is None or feature.atr <= 0 or feature.ema_fast is None:
+        return ["scalp_v2_invalid_execution_range"]
+    rejections: list[str] = []
+    signed_body = candle.close - candle.open if side == "long" else candle.open - candle.close
+    close_location = (
+        (candle.close - candle.low) / candle_range
+        if side == "long"
+        else (candle.high - candle.close) / candle_range
+    )
+    if signed_body <= 0 or signed_body / candle_range < config.scalp_min_body_ratio:
+        rejections.append("scalp_v2_weak_candle_body")
+    if close_location < config.scalp_min_close_location:
+        rejections.append("scalp_v2_weak_close_location")
+    extension = abs(candle.close - feature.ema_fast) / feature.atr
+    if config.scalp_max_extension_atr > 0 and extension > config.scalp_max_extension_atr:
+        rejections.append("scalp_v2_overextended")
+    return rejections
 
 
 def _bullish_regime(feature: _Features) -> bool:

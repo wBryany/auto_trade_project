@@ -71,7 +71,7 @@ function Get-Model2Listener {
 }
 
 $enforcedModelStatus = $null
-if ($configuredTradeModelMode -eq "enforce") {
+if ($configuredTradeModelMode -in @("enforce", "shadow")) {
     $previousPythonPath = $env:PYTHONPATH
     try {
         $env:PYTHONPATH = Join-Path $sourceRoot "src"
@@ -92,7 +92,7 @@ if ($configuredTradeModelMode -eq "enforce") {
     }
     $enforcedModelStatus = $enforcedModelStatusJson | ConvertFrom-Json
     if (-not [bool]$enforcedModelStatus.ready -or [string]::IsNullOrWhiteSpace([string]$enforcedModelStatus.model_version)) {
-        throw "Model 2 enforce mode requires a ready, versioned artifact: $($enforcedModelStatus.error)"
+        throw "Model 2 $configuredTradeModelMode mode requires a ready, versioned artifact: $($enforcedModelStatus.error)"
     }
 }
 
@@ -199,13 +199,20 @@ if ($listener) {
     if ($null -eq $tradeModelProperty -or [string]$tradeModelProperty.Value.type -ne "lightgbm_meta") {
         throw "Existing dashboard on port $Port is not the Model 2 service"
     }
-    if ([string]$tradeModelProperty.Value.mode -ne $configuredTradeModelMode) {
-        throw "Existing Model 2 dashboard uses a different trade-model mode"
+    if ([string]$tradeModelProperty.Value.mode -ne $configuredTradeModelMode -and -not $Restart) {
+        throw "Existing Model 2 dashboard uses a different trade-model mode; use -Restart to apply the new paper configuration"
     }
     if ($Restart) {
+        # Paper positions live in memory; a process restart must not erase one.
+        if (@($status.positions).Count -gt 0 -or @($status.open_orders).Count -gt 0) {
+            throw 'Model 2 has positions or orders; wait until flat before a paper process restart'
+        }
         Invoke-RestMethod "$serviceUrl/api/stop" -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 30 | Out-Null
         $stopped = Invoke-RestMethod "$serviceUrl/api/status" -TimeoutSec 10
         if ([bool]$stopped.running) { throw 'Model 2 engine stop was not confirmed; dashboard left running' }
+        if (@($stopped.positions).Count -gt 0 -or @($stopped.open_orders).Count -gt 0) {
+            throw 'Model 2 is stopped but not flat; dashboard retained to preserve its paper position'
+        }
         Stop-Process -Id $listener -ErrorAction Stop
         Wait-Process -Id $listener -Timeout 10 -ErrorAction SilentlyContinue
         $listener = $null

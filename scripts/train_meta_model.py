@@ -115,6 +115,7 @@ def main() -> int:
         "1h": args.one_hour or args.data_dir / f"{symbol}-1h.jsonl",
     }
     funding_path = args.funding_file or args.data_dir / f"{symbol}-funding.jsonl"
+    print(f"loading candle dataset from {args.data_dir}", flush=True)
     candles = {timeframe: load_candles(path) for timeframe, path in paths.items()}
     funding_rates = load_funding_rates(funding_path)
 
@@ -161,6 +162,12 @@ def main() -> int:
         closed_history_limit=history_window.closed_history_limit,
     )
     execution_digest = execution_policy_hash(execution_policy)
+    print(
+        f"replaying {len(candles['1m'])} minute bars; "
+        f"strategy={strategy.config.mode}, horizon={barrier_config.horizon_bars}m, "
+        f"closed_history={history_window.closed_history_limit}",
+        flush=True,
+    )
     samples, replay_stats = replay_primary_candidates(
         candles,
         strategy,
@@ -189,6 +196,11 @@ def main() -> int:
             "purge/embargo left an empty partition; download a longer range or reduce the gaps"
         )
 
+    print(
+        f"training on {len(split.train)} candidates; "
+        f"validation={len(split.validation)}, holdout={len(split.holdout)}",
+        flush=True,
+    )
     model_path = args.output_dir / "model.txt"
     booster, model_digest = train_lightgbm_native(
         split.train,

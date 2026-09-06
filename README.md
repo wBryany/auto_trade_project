@@ -21,7 +21,14 @@ py -m btc_futures_bot.main --config config.example.json --once
 
 ## 交易模型 2.0（LightGBM Meta Gate）
 
-2.0 保留现有 `traditional_kline` 作为主策略，只在准备新开仓时用 LightGBM 对候选信号做放行或拒绝。仓位计算、硬止损、动态退出、报表、邮件和控制台仍使用原来的独立模块；模型不可用时，`enforce` 模式会禁止新开仓，但不会阻止已有仓位退出。
+2.0 的当前实验版本使用独立的 `scalp_v2` 分钟级超短线主策略：1m 收盘后出现突破或 EMA 收复、5m 方向一致，再检查动量、成交量、K 线实体及追价距离。不再等待 1h EMA50/200；1h 只作为 LightGBM 的背景特征。仓位计算、止损、报表、邮件和控制台仍沿用原来的独立模块。
+
+当前配置仅用于 OKX demo 行情下的 `paper` 本地撮合，不会向 OKX 发送测试网或实盘订单。`scalp_v2` 在引擎层禁止 `live`，包括通过 `shadow`/`off` 绕过模型审批的启动方式。
+
+- 5 分钟后满足扣费净盈利和最低 R 才软退出；10 分钟为硬退出阈值，无需盈利。paper 在下一次新收盘 1m K 线检查时执行，实际可能延迟约一根 K 线加轮询/数据延迟；止损可先发生。
+- ATR/结构止损范围 0.20%–0.30%，保留成本下限；按当前 taker/滑点假设，实际下限约 0.21%。目标 1.5R，扣费边际要求仍为 0.15%，不保证成交后有此收益。
+- 异常波动需同时满足相对倍数和绝对 1m 振幅至少 0.15%，暂停 3 分钟；已排定的宏观事件窗口不变。操作日志显示实际振幅及本次恢复时间。
+- 亏损后冷却 1 分钟；仓位上限和亏损限额没有放宽。既有 `max_daily_loss_pct` 当前按进程累计损益检查（不是持久化、跨日账本），不应靠反复重启规避限额。
 
 安装可选模型依赖并下载 Binance USDⓈ-M 公共历史数据：
 
@@ -33,12 +40,12 @@ python .\scripts\download_binance_klines.py --symbol BTCUSDT --start 2025-09-01T
 按当前有效策略、风险和费用配置重放候选，训练模型并冻结验证集阈值：
 
 ```powershell
-python .\scripts\train_meta_model.py --config .\config.binance.model2.json --data-dir .\data\binance_meta_12m --output-dir .\artifacts\trade_model_2_0
+python .\scripts\train_meta_model.py --config .\config.binance.model2.json --data-dir .\data\binance_meta_12m --output-dir .\artifacts\trade_model_2_0_scalp
 ```
 
 训练和实时推理共用同一特征实现。制品会校验特征顺序、模型文件、完整策略配置以及风险/费用/标签/历史窗口政策；任一指纹不一致都会拒绝加载。当前固定 TP/SL 三重障碍标签与实盘动态退出并不完全等价，因此生成的模型仅供 `paper` 对比，不会自动获得 `approved_for_live`。
 
-仓库当前附带的 `meta-20250901-20260904-v1` 是管线验证制品，不是已证明盈利的模型：其冻结阈值在 holdout 只选择 10/650 个候选，扣成本期望为 -0.003054、Profit Factor 为 0.266，因此明确标记为 `statistically_qualified=false` 和 `approved_for_live=false`。8788 可以用它验证门控、审计和 A/B 数据采集，但不能据此切换真实账户。
+旧的 `meta-20250901-20260904-v1` 保留在 `artifacts/trade_model_2_0` 供审计，已不被当前配置引用；它的 90 分钟标签不能用于新超短线策略。新的 `artifacts/trade_model_2_0_scalp` 使用 10 根 1m K 线标签、99 根闭合历史窗口，重新生成候选并按时间隔离训练/验证/留出集。Binance 历史数据向 OKX 迁移、重叠候选、动态退出与固定标签差异，都需要后续 paper 成交验证；不能把候选分类指标当成账户回测收益。
 
 在独立端口启动 2.0 纸面交易：
 
@@ -46,7 +53,9 @@ python .\scripts\train_meta_model.py --config .\config.binance.model2.json --dat
 .\scripts\start_model2.ps1
 ```
 
-打开 `http://127.0.0.1:8788`。2.0 使用独立的报表、操作日志、模型决策 SQLite 和邮件状态，不会复用 8787 的运行文件。`trade_model.mode` 支持 `off`、`shadow` 和 `enforce`；正式比较使用 `enforce`，阈值来自训练制品而不是手填概率。
+打开 `http://127.0.0.1:8788`。2.0 保留自己的报表、操作日志、模型决策 SQLite 和邮件状态，不会复用 8787 的运行文件。`trade_model.mode` 支持 `off`、`shadow` 和 `enforce`。`shadow` 记录概率及原本会否拒绝，但不拦截主策略；`enforce` 才实际过滤入场，模型不可用时禁止新开仓，不影响退出。未通过样本外检验的超短线模型使用 paper shadow 采样，不靠调低概率阈值制造放行；正式比较必须标明模式、模型版本与部署时间。
+
+`scripts/start_model2.ps1 -Restart` 会预检新模型制品，确认原实例属于 2.0 且 paper 无仓位/订单后停止并重建后台服务；有仓位时拒绝重启以避免丢失内存中的模拟持仓。旧 `.local.json` 的策略覆盖优先于受版本管理的配置；迁移时只同步 `risk.stop_loss_pct=0.0025`、`strategy.take_profit_r=1.5` 等策略字段，API Key 和邮件设置保持本机、不入 Git。
 
 若以后改为两个真实账户 A/B 并跑，必须使用不同 Binance 账户或子账户、不同 API Key 和 `BINANCE_MODEL2_API_KEY` / `BINANCE_MODEL2_API_SECRET` 环境变量。同一个单向持仓账户不能同时运行两套机器人，因为它们会共同看到并操作同一净仓位和保护单。比较时优先看净 R、Profit Factor、扣费期望、最大回撤、候选覆盖率和执行错误率，而不是只看胜率。
 

@@ -4,6 +4,8 @@ import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from btc_futures_bot.engine import EngineConfig, TradingEngine
 from btc_futures_bot.macro_risk import (
     MacroEvent,
@@ -162,7 +164,8 @@ def test_directional_policy_only_blocks_disorderly_dislocation_briefly() -> None
     decision = controller.decision({"1m": baseline + [dislocation]}, now_ms=now_ms)
 
     assert decision.blocked is True
-    assert decision.reason == "market_dislocation:range=14.00x,volume=4.00x"
+    assert decision.reason.startswith("market_dislocation:range=14.00x,volume=4.00x,")
+    assert "range_pct=13.9303%" in decision.reason
     assert decision.shock_classification == "extreme_dislocation"
     assert decision.shock_until_ms == now_ms + 3 * 60_000
     assert decision.shock_trigger_range_ratio == 14.0
@@ -223,8 +226,146 @@ def test_dislocation_reason_retains_trigger_ratios_during_cooldown() -> None:
     assert decision.blocked is True
     assert decision.range_ratio == 1.0
     assert decision.volume_ratio == 1.0
-    assert decision.reason == "market_dislocation:range=14.00x,volume=4.00x"
+    assert decision.reason.startswith("market_dislocation:range=14.00x,volume=4.00x,")
+    assert "range_pct=13.9303%" in decision.reason
+    assert decision.shock_trigger_current_range == 14.0
+    assert decision.current_range == 1.0
     assert decision.shock_classification == "extreme_dislocation"
+
+
+@pytest.mark.parametrize("floor", [-0.001, float("nan"), float("inf"), -float("inf"), 1.01])
+def test_invalid_absolute_shock_floor_is_rejected(floor: float) -> None:
+    with pytest.raises(ValueError, match="shock_min_range_pct"):
+        MacroRiskConfig(shock_min_range_pct=floor)
+    with pytest.raises(ValueError, match="shock_min_range_pct"):
+        MacroRiskConfig.from_mapping({"shock_min_range_pct": floor})
+
+
+def test_absolute_shock_floor_mapping_preserves_fraction_units_and_default() -> None:
+    assert MacroRiskConfig.from_mapping({}).shock_min_range_pct == 0.0
+    assert MacroRiskConfig.from_mapping({"shock_min_range_pct": 0.0015}).shock_min_range_pct == 0.0015
+
+
+@pytest.mark.parametrize("baseline_range, volume", [(2.95, 19.17), (8.0, 40.0)])
+def test_hard_block_floor_filters_small_moves_from_both_relative_triggers(
+    baseline_range: float, volume: float
+) -> None:
+    baseline = [
+        Candle(index * 60_000, 79_900.0, 79_900.0 + baseline_range, 79_900.0, 79_900.0, 10.0)
+        for index in range(20)
+    ]
+    # Mirrors the 2026-09-06 false pause: 22.2 USDT is only about 0.028%.
+    relative_spike = Candle(1_200_000, 79_900.0, 79_911.1, 79_888.9, 79_900.0, volume)
+    controller = MacroRiskController(
+        MacroRiskConfig(enabled=True, bls_ics_url="", shock_min_range_pct=0.0015, shock_cooldown_minutes=3)
+    )
+
+    decision = controller.decision({"1m": baseline + [relative_spike]}, now_ms=1_260_000)
+
+    assert decision.blocked is False
+    assert decision.reason == ""
+    assert decision.shock_until_ms == 0
+    assert decision.shock_classification == "below_min_absolute_range"
+    assert decision.absolute_range_pct == pytest.approx(22.2 / 79_900.0)
+    assert decision.current_range == pytest.approx(22.2)
+    assert decision.median_range == pytest.approx(baseline_range)
+    assert controller.status()["shock_min_range_pct"] == 0.0015
+    assert controller.status()["absolute_range_pct"] == decision.absolute_range_pct
+
+
+def test_legacy_default_keeps_relative_shock_behavior_for_small_absolute_moves() -> None:
+    baseline = [
+        Candle(index * 60_000, 79_900.0, 79_902.95, 79_900.0, 79_900.0, 10.0)
+        for index in range(20)
+    ]
+    relative_spike = Candle(1_200_000, 79_900.0, 79_911.1, 79_888.9, 79_900.0, 19.17)
+    controller = MacroRiskController(MacroRiskConfig(enabled=True, bls_ics_url=""))
+
+    decision = controller.decision({"1m": baseline + [relative_spike]}, now_ms=1_260_000)
+
+    assert decision.blocked is True
+    assert decision.shock_until_ms == 1_260_000 + 30 * 60_000
+    assert decision.reason.startswith("macro_shock:range=7.53x,volume=1.92x,")
+    assert "range_pct=0.0278%" in decision.reason
+    assert "range_abs=22.2000,baseline_range=2.9500" in decision.reason
+
+
+@pytest.mark.parametrize("baseline_range, volume", [(40.0, 10.0), (60.0, 40.0)])
+def test_hard_block_still_blocks_real_shocks_above_absolute_floor(
+    baseline_range: float, volume: float
+) -> None:
+    baseline = [
+        Candle(index * 60_000, 79_900.0, 79_900.0 + baseline_range, 79_900.0, 79_900.0, 10.0)
+        for index in range(20)
+    ]
+    shock = Candle(1_200_000, 79_900.0, 79_980.0, 79_820.0, 79_900.0, volume)
+    controller = MacroRiskController(
+        MacroRiskConfig(enabled=True, bls_ics_url="", shock_min_range_pct=0.0015, shock_cooldown_minutes=3)
+    )
+
+    decision = controller.decision({"1m": baseline + [shock]}, now_ms=1_260_000)
+
+    assert decision.blocked is True
+    assert decision.shock_until_ms == 1_440_000
+    assert decision.shock_trigger_absolute_range_pct == pytest.approx(160.0 / 79_900.0)
+    assert decision.shock_trigger_current_range == 160.0
+    assert decision.shock_trigger_median_range == baseline_range
+    assert "range_pct=0.2003%" in decision.reason
+
+
+def test_absolute_shock_floor_is_inclusive_at_exact_threshold() -> None:
+    baseline = [
+        Candle(index * 60_000, 1_000.0, 1_000.5, 1_000.0, 1_000.0, 10.0)
+        for index in range(20)
+    ]
+    shock = Candle(1_200_000, 1_000.0, 1_001.0, 999.0, 1_000.0, 10.0)
+    controller = MacroRiskController(MacroRiskConfig(enabled=True, bls_ics_url="", shock_min_range_pct=0.002))
+
+    assert controller.decision({"1m": baseline + [shock]}, now_ms=1_260_000).blocked is True
+
+
+def test_hard_block_floor_does_not_override_active_calendar_window() -> None:
+    baseline = [
+        Candle(index * 60_000, 79_900.0, 79_902.95, 79_900.0, 79_900.0, 10.0)
+        for index in range(20)
+    ]
+    relative_spike = Candle(1_200_000, 79_900.0, 79_911.1, 79_888.9, 79_900.0, 19.17)
+    controller = MacroRiskController(
+        MacroRiskConfig(
+            enabled=True,
+            bls_ics_url="",
+            shock_min_range_pct=0.0015,
+            events=(MacroEvent("FOMC", 1_260_000, pre_minutes=60, post_minutes=30),),
+        )
+    )
+
+    decision = controller.decision({"1m": baseline + [relative_spike]}, now_ms=1_260_000)
+
+    assert decision.blocked is True
+    assert decision.reason == "macro_event:FOMC"
+    assert decision.shock_until_ms == 0
+
+
+def test_hard_block_cooldown_recovers_with_same_closed_candle() -> None:
+    baseline = [
+        Candle(index * 60_000, 79_900.0, 79_902.95, 79_900.0, 79_900.0, 10.0)
+        for index in range(20)
+    ]
+    shock = Candle(1_200_000, 79_900.0, 79_980.0, 79_820.0, 79_900.0, 10.0)
+    controller = MacroRiskController(
+        MacroRiskConfig(enabled=True, bls_ics_url="", shock_min_range_pct=0.0015, shock_cooldown_minutes=3)
+    )
+
+    first = controller.decision({"1m": baseline + [shock]}, now_ms=1_260_000)
+    active = controller.decision({"1m": baseline + [shock]}, now_ms=1_439_999)
+    recovered = controller.decision({"1m": baseline + [shock]}, now_ms=1_440_000)
+
+    assert first.blocked is True
+    assert active.blocked is True
+    assert active.reason == first.reason
+    assert recovered.blocked is False
+    assert recovered.reason == ""
+    assert recovered.shock_until_ms == first.shock_until_ms
 
 
 def test_engine_does_not_open_position_when_macro_window_is_blocked() -> None:

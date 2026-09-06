@@ -323,13 +323,13 @@ def save_dashboard_config(path: str, updates: dict[str, Any]) -> Path:
             risk[key] = float(updates[key])
     strategy = config.setdefault("strategy", {})
     # The dashboard's ``mode`` field is the execution mode (paper/live), not
-    # the strategy selector (scalp/traditional_kline).  Keeping the names
+    # the strategy selector (scalp/scalp_v2/traditional_kline). Keeping the names
     # separate prevents an ordinary dashboard save from silently disabling
     # the configured strategy implementation.
     if "strategy_mode" in updates and str(updates["strategy_mode"]).strip():
         strategy_mode = str(updates["strategy_mode"]).strip()
-        if strategy_mode not in {"scalp", "traditional_kline"}:
-            raise ValueError("strategy_mode must be scalp or traditional_kline")
+        if strategy_mode not in {"scalp", "scalp_v2", "traditional_kline"}:
+            raise ValueError("strategy_mode must be scalp, scalp_v2 or traditional_kline")
         strategy["mode"] = strategy_mode
     for key in ("trigger_timeframe", "regime_timeframe"):
         if key in updates and str(updates[key]).strip():

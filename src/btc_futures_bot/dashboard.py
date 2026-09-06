@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import copy
 import logging
 import math
 import os
 import threading
 import time
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -36,6 +38,23 @@ def _masked(value: str) -> str:
     if len(value) <= 8:
         return "已保存"
     return f"{value[:4]}…{value[-4:]}"
+
+
+def _macro_entry_block_summary(status: dict[str, Any]) -> str:
+    """Expose the active cause, not an unrelated upcoming calendar event."""
+    reason = str(status.get("reason") or "unknown")
+    until_ms = int(status.get("shock_until_ms") or 0)
+    if reason.startswith("macro_event:"):
+        event = status.get("next_event") or {}
+        until_ms = max(
+            until_ms,
+            int(event.get("timestamp_ms") or 0) + int(event.get("post_minutes") or 0) * 60_000,
+        )
+    summary = f"暂停新开仓：{reason}"
+    if until_ms:
+        until = datetime.fromtimestamp(until_ms / 1000, tz=timezone.utc).astimezone()
+        summary += f"；当前窗口截止 {until.isoformat(timespec='seconds')}"
+    return summary
 
 
 def _json_safe(value: Any) -> Any:
@@ -181,6 +200,8 @@ class DashboardService:
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._stop_event: threading.Event | None = None
+        self._stopping = False
+        self._engine_config_snapshot: dict[str, Any] | None = None
         self.engine: Any = None
         self.reporter: TradeReporter | None = None
         self.last_result: Any = None
@@ -209,6 +230,14 @@ class DashboardService:
     @property
     def running(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
+
+    def _has_paper_position(self) -> bool:
+        engine = self.engine
+        return bool(
+            engine is not None
+            and getattr(getattr(engine, "config", None), "mode", "") == "paper"
+            and getattr(engine, "position", None) is not None
+        )
 
     def _config(self) -> dict[str, Any]:
         return load_config(self.config_path)
@@ -391,8 +420,10 @@ class DashboardService:
 
     def save_config(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            if self.running:
+            if self.running or getattr(self, "_stopping", False):
                 raise RuntimeError("请先停止交易引擎，再修改配置")
+            if self._has_paper_position():
+                raise RuntimeError("仍保留模拟仓位，不能修改配置；请启动原引擎继续管理至平仓")
             before = self.config_view()
             self.exchange_name = str(payload.get("exchange", "binance"))
             target = save_dashboard_config(self.config_path, payload)
@@ -426,6 +457,10 @@ class DashboardService:
 
     def start(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
+            if getattr(self, "_stopping", False) or (
+                self.running and self._stop_event and self._stop_event.is_set()
+            ):
+                raise RuntimeError("交易周期仍在停止中，请等待停止完成后重试")
             if self.running:
                 self.operation_logger.record("engine_start", "start", status="skipped", summary="启动请求被忽略：引擎已经运行", result={"running": True})
                 return {"running": True, "message": "交易引擎已经在运行"}
@@ -433,6 +468,25 @@ class DashboardService:
             exchange_name = self._exchange(config, str(payload.get("exchange", "")))
             mode = str(config.get("mode", "paper"))
             exchange_config = config.get("exchanges", {}).get(exchange_name, {})
+            if self._has_paper_position():
+                if (
+                    config != getattr(self, "_engine_config_snapshot", None)
+                    or exchange_name != self.engine.adapter.name
+                ):
+                    raise RuntimeError("仍保留模拟仓位；请恢复原运行配置和交易平台后启动，禁止覆盖仓位")
+                # Resume exactly the engine that owns the position and risk
+                # state. Rebuilding it would silently erase an unfinished trade.
+                self.last_error = ""
+                self._stop_event = threading.Event()
+                self._thread = threading.Thread(target=self._run_loop, name="btc-dashboard-engine", daemon=True)
+                self._thread.start()
+                self.operation_logger.record(
+                    "engine_start", "resume", summary="继续管理保留的模拟仓位，未重建引擎",
+                    result={"running": True, "mode": "paper", "exchange": exchange_name, "resumed": True},
+                )
+                return {"running": True, "mode": "paper", "exchange": exchange_name, "resumed": True}
+            if self.engine is not None:
+                raise RuntimeError("上一次停止尚未完成清理，请再次停止后再启动")
             self.exchange_name = exchange_name
             # The dashboard may have opened a read-only adapter while the
             # engine was stopped. Binance returns the same active listenKey
@@ -476,6 +530,7 @@ class DashboardService:
                 self.engine = None
                 self.reporter = None
                 raise
+            self._engine_config_snapshot = copy.deepcopy(config)
             self.last_result = None
             self.last_error = ""
             self.started_at = time.time()
@@ -503,45 +558,60 @@ class DashboardService:
 
     def stop(self) -> dict[str, Any]:
         with self._lock:
+            if getattr(self, "_stopping", False):
+                raise RuntimeError("交易引擎正在停止，请等待当前停止请求完成")
+            self._stopping = True
             if self._stop_event:
                 self._stop_event.set()
             thread = self._thread
-        if thread and thread is not threading.current_thread():
-            thread.join(timeout=3)
-        engine = self.engine
-        reporter = self.reporter
-        if engine is not None:
-            try:
-                engine.close()
-            except Exception:
-                LOG.exception("email notifier shutdown failed; engine stop continues")
-        if reporter is not None:
-            reporter.close()
-        with self._lock:
-            self._thread = None
-            self._stop_event = None
-            self.engine = None
-            self.reporter = None
-        self.operation_logger.record("engine_stop", "stop", summary="交易引擎已停止", result={"running": False})
-        return {"running": False}
+        try:
+            if thread and thread is not threading.current_thread():
+                thread.join(timeout=3)
+            with self._lock:
+                if thread and thread.is_alive():
+                    # evaluate_once may still be obtaining a response or placing
+                    # an order. Keep every owner alive until it really finishes.
+                    raise RuntimeError("交易周期尚未结束，停止未完成；状态已保留，请稍后再次停止，勿结束进程")
+                if self._has_paper_position():
+                    self._thread = None
+                    self._stop_event = None
+                    self.operation_logger.record(
+                        "engine_stop", "stop", summary="引擎已暂停，模拟仓位仍保留；启动可继续管理，请勿关闭服务",
+                        result={"running": False, "paper_position_retained": True},
+                    )
+                    return {"running": False, "paper_position_retained": True}
+                if self.engine is not None:
+                    self.engine.close()
+                if self.reporter is not None:
+                    self.reporter.close()
+                self._thread = None
+                self._stop_event = None
+                self.engine = None
+                self.reporter = None
+                self._engine_config_snapshot = None
+            self.operation_logger.record("engine_stop", "stop", summary="交易引擎已停止", result={"running": False})
+            return {"running": False}
+        finally:
+            with self._lock:
+                self._stopping = False
 
     def shutdown(self) -> None:
         """Release the dashboard-owned adapter and email worker on process exit."""
 
-        try:
-            self.stop()
-        finally:
-            adapter = self._dashboard_adapter
-            if adapter is not None:
-                close_adapter = getattr(adapter, "close", None)
-                if callable(close_adapter):
-                    try:
-                        close_adapter()
-                    except Exception:
-                        LOG.exception("dashboard adapter shutdown failed")
-            self._dashboard_adapter = None
-            self._dashboard_adapter_key = None
-            self.notifier.close()
+        stopped = self.stop()
+        if stopped.get("paper_position_retained"):
+            raise RuntimeError("模拟仓位仍在当前进程中，请启动继续管理至平仓后再关闭服务")
+        adapter = self._dashboard_adapter
+        if adapter is not None:
+            close_adapter = getattr(adapter, "close", None)
+            if callable(close_adapter):
+                try:
+                    close_adapter()
+                except Exception:
+                    LOG.exception("dashboard adapter shutdown failed")
+        self._dashboard_adapter = None
+        self._dashboard_adapter_key = None
+        self.notifier.close()
 
     def restart(self, payload: dict[str, Any]) -> dict[str, Any]:
         reason = str(payload.get("reason", "页面手动重启"))
@@ -579,8 +649,15 @@ class DashboardService:
                             "macro_risk",
                             "entry_block",
                             status="skipped",
-                            summary="重大宏观事件或突发波动期间暂停新开仓",
-                            details={"reason": macro_block, "next_event": macro_status.get("next_event")},
+                            summary=_macro_entry_block_summary(macro_status),
+                            details={
+                                "reason": macro_block,
+                                "next_event": macro_status.get("next_event"),
+                                "shock_until_ms": macro_status.get("shock_until_ms"),
+                                "shock_trigger_absolute_range_pct": macro_status.get("shock_trigger_absolute_range_pct"),
+                                "shock_trigger_current_range": macro_status.get("shock_trigger_current_range"),
+                                "shock_trigger_median_range": macro_status.get("shock_trigger_median_range"),
+                            },
                             result={"running": True, "position": bool(result.position)},
                         )
                     elif self._last_macro_block:
@@ -983,6 +1060,8 @@ class DashboardService:
                     trade_model_status["error"] = f"读取交易模型状态失败：{error}"
         return {
             "running": self.running,
+            "paper_position_retained": not self.running and self._has_paper_position(),
+            "stop_pending": bool(self.running and self._stop_event and self._stop_event.is_set()),
             "instance_id": str(config.get("instance_id") or ""),
             "exchange": exchange_name,
             "symbol": exchange_config.get("symbol", ""),
@@ -1023,6 +1102,14 @@ class DashboardService:
             "macro_risk": self.engine.macro_risk.status() if self.engine and self.engine.macro_risk else {"enabled": False, "blocked": False},
             "risk_guard": risk_guard,
             "trade_model": trade_model_status,
+            "strategy": {
+                key: config.get("strategy", {}).get(key)
+                for key in (
+                    "mode", "trigger_timeframe", "regime_timeframe", "max_hold_seconds",
+                    "hard_max_hold_seconds", "enable_time_exit", "atr_stop_multiplier",
+                    "min_stop_loss_pct", "max_stop_loss_pct",
+                )
+            },
             "email_notifications": email_status,
         }
 
@@ -1285,8 +1372,10 @@ const renderPositionMetrics=s=>{const table=document.querySelector('#positionsBo
 const originalRenderStatus=renderStatus;renderStatus=function(s){originalRenderStatus(s);const cycle=formatBeijing(s.last_cycle_at);const source=s.account?.source||'unavailable';const accountSource=source==='exchange'?'交易所账户':source==='exchange_stale'?'交易所账户（最近快照）':source==='paper'?'模拟权益':'账户数据暂不可用';const venue=s.exchange==='binance'?'币安':String(s.exchange||'').toUpperCase();const network=s.environment==='production'?'正式网络':'测试网';$('lastCycle').textContent=cycle;$('engineSub').textContent=s.running?`最近周期 ${cycle}`:'引擎未启动';if(source==='unavailable'){$('equity').textContent='—';$('balanceSub').innerHTML=`<span class="source-badge">${accountSource}</span> · 等待交易所私有接口恢复`;$('unrealized').textContent='—';$('pnlSub').textContent='未使用模拟权益替代'}else{$('balanceSub').innerHTML=`<span class="source-badge">${accountSource}</span> · 可用 ${exact(s.account?.available_balance_raw??s.account?.available_balance)} · 保证金 ${exact(s.account?.margin_balance_raw??s.account?.margin_balance)}`;$('pnlSub').textContent=source==='exchange'?'交易所实时账户':source==='exchange_stale'?'交易所最近成功快照':'模拟盘估算'}document.querySelector('.subtitle').textContent=`本地控制台 · ${s.mode} · ${venue}${network}`;if(s.connection.private_stale){$('connectionBox').insertAdjacentHTML('beforeend',`<br><span class="neutral">${esc(s.connection.private_warning||'私有数据为最近成功快照')}</span>`);if(!s.last_error){$('runtimeNotice').textContent=s.connection.private_warning||'私有数据暂时陈旧，禁止新开仓';$('runtimeNotice').className='notice'}}if(!s.running&&!s.last_error&&!s.connection.private_error){$('runtimeNotice').textContent=`引擎已停止；${venue}${network}${s.connection.private?'私有 API 已连接':'私有 API 未连接'}。`}renderPositionMetrics(s)};
 loadReports=async function(){try{const q=new URLSearchParams();if($('fromDate').value)q.set('from',$('fromDate').value);if($('toDate').value)q.set('to',$('toDate').value);if($('reportExchange').value)q.set('exchange',$('reportExchange').value);q.set('scope',reportScope);const d=await api('/api/reports?'+q.toString()),s=d.stats;$('statTrades').textContent=s.trades;$('statWinRate').textContent=s.trades?`${(s.wins/s.trades*100).toFixed(2)}%`:'0%';$('statGross').innerHTML=pnl(s.gross_pnl);$('statCost').innerHTML=num(s.total_cost);$('statNet').innerHTML=pnl(s.net_pnl);$('tradesBody').innerHTML=d.trades.length?d.trades.map(r=>`<tr><td>${esc(formatBeijing(r.entry_time))}</td><td>${esc(formatBeijing(r.exit_time))}</td><td>${esc(r.exchange)}</td><td>${esc(r.exchange_environment_label)}</td><td>${esc(r.side)}</td><td>${num(r.entry_price,2)}</td><td>${num(r.exit_price,2)}</td><td>${num(r.quantity,5)}</td><td>${pnl(r.gross_pnl)}</td><td>${num(r.trading_fee)}</td><td>${num(r.total_cost)}</td><td>${pnl(r.net_pnl)}</td><td>${pct(r.net_pnl_pct)}</td><td>${pct(r.fee_ratio_pct)}</td><td>${esc(r.exit_reason)}</td></tr>`).join(''):'<tr><td colspan="15" class="empty">暂无交易记录</td></tr>';$('dailyBody').innerHTML=summaryRows(d.daily);$('monthlyBody').innerHTML=summaryRows(d.monthly)}catch(e){toast(e.message)}};
 document.querySelectorAll('#reportScopeButtons button').forEach(button=>{button.onclick=()=>{reportScope=button.dataset.scope;document.querySelectorAll('#reportScopeButtons button').forEach(item=>item.classList.toggle('active',item===button));loadReports()}});$('reportBtn').onclick=loadReports;loadReports();
-if($('stopLoss'))$('stopLoss').insertAdjacentHTML('afterend','<div class="note">动态止损：30秒 ATR × 1.4，自动限制在 0.25%～0.60%；页面上的止损比例是 ATR 不可用时的备用值。</div>');
+if($('stopLoss'))$('stopLoss').insertAdjacentHTML('afterend','<div id="dynamicStopNote" class="note">动态止损使用当前策略的 ATR 与上下限；页面止损比例是 ATR 不可用时的备用值。</div>');
 if($('stopLoss'))$('stopLoss').insertAdjacentHTML('afterend','<div class="note">费用保护：按吃单 0.05% 双边、滑点 0.02%估算；反向信号不会在手续费后亏损时频繁平仓，除非出现满分强反转。</div>');
-const modelAwareRenderStatus=renderStatus;renderStatus=function(s){modelAwareRenderStatus(s);const m=s.trade_model||{};const ready=Boolean(m.ready);const threshold=m.threshold===null||m.threshold===undefined?'—':Number(m.threshold).toFixed(4);const approval=m.approved_for_live?'<span class="positive">已通过 live 审批</span>':'<span class="neutral">尚未通过 live 审批</span>';$('tradeModelBox').innerHTML=`模式：<b>${esc(m.mode||'off')}</b> · 状态：<span class="${ready?'positive':'neutral'}">${ready?'就绪':'未就绪'}</span><br>版本：${esc(m.model_version||'—')} · 阈值：${threshold}<br>${approval}${m.error?`<br><span class="negative">${esc(m.error)}</span>`:''}`;const sig=s.signal;if(sig&&sig.meta_decision){const score=Number(sig.meta_score).toFixed(4);const signalThreshold=Number(sig.meta_threshold).toFixed(4);$('signalBox').insertAdjacentHTML('beforeend',`<br>模型：${esc(sig.meta_decision)} · P=${score} / ${signalThreshold}`)}};
+const modelAwareRenderStatus=renderStatus;renderStatus=function(s){modelAwareRenderStatus(s);const m=s.trade_model||{};const ready=Boolean(m.ready);const threshold=m.threshold===null||m.threshold===undefined?'—':Number(m.threshold).toFixed(4);const approval=m.approved_for_live?'<span class="positive">已通过 live 审批</span>':'<span class="neutral">尚未通过 live 审批</span>';const modeHelp=m.mode==='shadow'?'旁路评分，不拦截开仓':m.mode==='enforce'?'参与开仓过滤':'模型已关闭';$('tradeModelBox').innerHTML=`模式：<b>${esc(m.mode||'off')}</b>（${modeHelp}） · 状态：<span class="${ready?'positive':'neutral'}">${ready?'就绪':'未就绪'}</span><br>版本：${esc(m.model_version||'—')} · 阈值：${threshold}<br>${approval}${m.error?`<br><span class="negative">${esc(m.error)}</span>`:''}`;const sig=s.signal;if(sig&&sig.meta_decision){const score=Number(sig.meta_score).toFixed(4);const signalThreshold=Number(sig.meta_threshold).toFixed(4);const decisionHelp=String(sig.meta_decision).startsWith('shadow_')?'（仅评分，主策略仍可开仓）':'';$('signalBox').insertAdjacentHTML('beforeend',`<br>模型：${esc(sig.meta_decision)}${decisionHelp} · 评分=${score} / ${signalThreshold}`)}};
 const emailAwareRenderStatus=renderStatus;renderStatus=function(s){emailAwareRenderStatus(s);const e=s.email_notifications||{};if($('emailState'))$('emailState').textContent=`邮件：${e.enabled?'已启用':'未启用'} · ${e.ready?'发送就绪':'配置未就绪'} · 收件人 ${e.recipients_count||0}/5${e.last_error?' · 最近错误：'+e.last_error:''}`};
+const scalpAwareRenderStatus=renderStatus;renderStatus=function(s){scalpAwareRenderStatus(s);const st=s.strategy||{};const label=st.mode==='scalp_v2'?'分钟级超短线 2.0':(st.mode||'—');const horizon=st.enable_time_exit?` · 获利时间退出 ${Number(st.max_hold_seconds||0)/60} 分钟 / 硬上限 ${Number(st.hard_max_hold_seconds||0)/60} 分钟`:'';$('tradeModelBox').insertAdjacentHTML('afterbegin',`主策略：<b>${esc(label)}</b> · ${esc(st.trigger_timeframe||'—')} 入场 / ${esc(st.regime_timeframe||'—')} 背景${esc(horizon)}<br>`);if($('dynamicStopNote')&&st.min_stop_loss_pct!==null&&st.min_stop_loss_pct!==undefined)$('dynamicStopNote').textContent=`动态止损：${st.trigger_timeframe||'当前周期'} ATR × ${st.atr_stop_multiplier}，限制在 ${Number(st.min_stop_loss_pct*100).toFixed(2)}%～${Number(st.max_stop_loss_pct*100).toFixed(2)}%；止损比例是 ATR 不可用时的备用值。`};
+const retainedPositionRenderStatus=renderStatus;renderStatus=function(s){retainedPositionRenderStatus(s);if(s.paper_position_retained){$('runtimeNotice').textContent='引擎已暂停，模拟仓位保留在当前进程；点击启动继续管理，平仓前请勿关闭服务或修改配置。';$('runtimeNotice').className='notice'}else if(s.stop_pending){$('runtimeNotice').textContent='当前交易周期仍在停止中，状态尚未清理；请稍后再次停止，勿直接结束进程。';$('runtimeNotice').className='notice'}};
 </script></body></html>"""

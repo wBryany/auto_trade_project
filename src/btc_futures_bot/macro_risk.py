@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import statistics
 import time
 from dataclasses import dataclass
@@ -55,6 +56,12 @@ class MacroRiskDecision:
     shock_trigger_range_ratio: float = 0.0
     shock_trigger_volume_ratio: float = 0.0
     shock_triggered_at_ms: int = 0
+    absolute_range_pct: float = 0.0
+    current_range: float = 0.0
+    median_range: float = 0.0
+    shock_trigger_absolute_range_pct: float = 0.0
+    shock_trigger_current_range: float = 0.0
+    shock_trigger_median_range: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -73,6 +80,9 @@ class MacroRiskConfig:
     shock_range_multiple: float = 2.5
     shock_volume_multiple: float = 3.0
     shock_extreme_range_multiple: float = 4.0
+    # Fraction of price, not percentage points. Zero preserves legacy behavior.
+    # Applies to both relative-range triggers under the hard_block policy.
+    shock_min_range_pct: float = 0.0
     shock_cooldown_minutes: int = 30
     shock_max_candle_age_minutes: int = 5
     shock_entry_policy: str = "hard_block"
@@ -81,6 +91,10 @@ class MacroRiskConfig:
     shock_dislocation_range_multiple: float = 6.0
     shock_dislocation_min_range_pct: float = 0.0
     events: tuple[MacroEvent, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.shock_min_range_pct) or not 0.0 <= self.shock_min_range_pct <= 1.0:
+            raise ValueError("shock_min_range_pct must be a finite fraction between 0 and 1")
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None, *, default_cache_path: str = "") -> "MacroRiskConfig":
@@ -118,6 +132,7 @@ class MacroRiskConfig:
                 1.0,
                 float(raw.get("shock_extreme_range_multiple", cls.shock_extreme_range_multiple)),
             ),
+            shock_min_range_pct=float(raw.get("shock_min_range_pct", cls.shock_min_range_pct)),
             shock_cooldown_minutes=max(1, int(raw.get("shock_cooldown_minutes", cls.shock_cooldown_minutes))),
             shock_max_candle_age_minutes=max(
                 1,
@@ -195,6 +210,12 @@ class MacroRiskController:
         self._shock_trigger_range_ratio = 0.0
         self._shock_trigger_volume_ratio = 0.0
         self._shock_triggered_at_ms = 0
+        self._last_absolute_range_pct = 0.0
+        self._last_current_range = 0.0
+        self._last_median_range = 0.0
+        self._shock_trigger_absolute_range_pct = 0.0
+        self._shock_trigger_current_range = 0.0
+        self._shock_trigger_median_range = 0.0
         self._last_decision = MacroRiskDecision()
         self._load_cache()
 
@@ -237,7 +258,10 @@ class MacroRiskController:
             reason = (
                 f"{reason_prefix}:"
                 f"range={self._shock_trigger_range_ratio:.2f}x,"
-                f"volume={self._shock_trigger_volume_ratio:.2f}x"
+                f"volume={self._shock_trigger_volume_ratio:.2f}x,"
+                f"range_pct={self._shock_trigger_absolute_range_pct * 100:.4f}%,"
+                f"range_abs={self._shock_trigger_current_range:.4f},"
+                f"baseline_range={self._shock_trigger_median_range:.4f}"
             )
         else:
             reason = ""
@@ -255,6 +279,12 @@ class MacroRiskController:
             shock_trigger_range_ratio=self._shock_trigger_range_ratio,
             shock_trigger_volume_ratio=self._shock_trigger_volume_ratio,
             shock_triggered_at_ms=self._shock_triggered_at_ms,
+            absolute_range_pct=self._last_absolute_range_pct,
+            current_range=self._last_current_range,
+            median_range=self._last_median_range,
+            shock_trigger_absolute_range_pct=self._shock_trigger_absolute_range_pct,
+            shock_trigger_current_range=self._shock_trigger_current_range,
+            shock_trigger_median_range=self._shock_trigger_median_range,
         )
         return self._last_decision
 
@@ -265,6 +295,7 @@ class MacroRiskController:
             "enabled": self.config.enabled,
             "shock_entry_policy": self.config.shock_entry_policy,
             "shock_cooldown_minutes": self.config.shock_cooldown_minutes,
+            "shock_min_range_pct": self.config.shock_min_range_pct,
             "blocked": decision.blocked,
             "reason": decision.reason,
             "next_event": (
@@ -286,6 +317,12 @@ class MacroRiskController:
             "shock_trigger_range_ratio": decision.shock_trigger_range_ratio,
             "shock_trigger_volume_ratio": decision.shock_trigger_volume_ratio,
             "shock_triggered_at_ms": decision.shock_triggered_at_ms,
+            "absolute_range_pct": decision.absolute_range_pct,
+            "current_range": decision.current_range,
+            "median_range": decision.median_range,
+            "shock_trigger_absolute_range_pct": decision.shock_trigger_absolute_range_pct,
+            "shock_trigger_current_range": decision.shock_trigger_current_range,
+            "shock_trigger_median_range": decision.shock_trigger_median_range,
             "calendar_events": len(self._events()),
             "calendar_error": self._last_refresh_error,
         }
@@ -301,12 +338,18 @@ class MacroRiskController:
     def _detect_shock(self, candles: Sequence[Candle], now_ms: int) -> tuple[float, float]:
         needed = self.config.shock_lookback + 1
         if len(candles) < needed:
+            self._last_absolute_range_pct = 0.0
+            self._last_current_range = 0.0
+            self._last_median_range = 0.0
             return 0.0, 0.0
         current = candles[-1]
         if current.timestamp <= self._last_shock_candle_timestamp:
             return self._last_decision.range_ratio, self._last_decision.volume_ratio
         self._last_shock_candle_timestamp = current.timestamp
         self._last_shock_classification = ""
+        self._last_absolute_range_pct = 0.0
+        self._last_current_range = 0.0
+        self._last_median_range = 0.0
         candle_age = now_ms - (int(current.timestamp) + 60_000)
         if candle_age < -60_000 or candle_age > self.config.shock_max_candle_age_minutes * 60_000:
             return 0.0, 0.0
@@ -316,6 +359,11 @@ class MacroRiskController:
         current_range = max(0.0, float(current.high) - float(current.low))
         median_range = statistics.median(ranges) if any(ranges) else 0.0
         range_ratio = current_range / median_range if median_range > 0 else 0.0
+        reference_price = max(abs(float(current.open)), abs(float(current.close)))
+        absolute_range_pct = current_range / reference_price if reference_price > 0 else 0.0
+        self._last_absolute_range_pct = absolute_range_pct
+        self._last_current_range = current_range
+        self._last_median_range = median_range
 
         def selected_volume(item: Candle) -> float:
             return float(item.quote_volume if item.quote_volume is not None else item.volume)
@@ -330,8 +378,15 @@ class MacroRiskController:
         )
         extreme_range = range_ratio >= self.config.shock_extreme_range_multiple
         if ordinary_shock or extreme_range:
-            reference_price = max(abs(float(current.open)), abs(float(current.close)))
-            absolute_range_pct = current_range / reference_price if reference_price > 0 else 0.0
+            # A near-zero baseline can turn a few dollars of normal movement
+            # into a very large multiple. Require a meaningful price move for
+            # both hard-block triggers; calendar windows remain independent.
+            if (
+                self.config.shock_entry_policy == "hard_block"
+                and absolute_range_pct < self.config.shock_min_range_pct
+            ):
+                self._last_shock_classification = "below_min_absolute_range"
+                return range_ratio, volume_ratio
             absolute_dislocation = absolute_range_pct >= self.config.shock_dislocation_min_range_pct
             body_ratio = abs(float(current.close) - float(current.open)) / current_range if current_range else 0.0
             if float(current.close) >= float(current.open):
@@ -370,11 +425,18 @@ class MacroRiskController:
                 self._shock_trigger_range_ratio = range_ratio
                 self._shock_trigger_volume_ratio = volume_ratio
                 self._shock_triggered_at_ms = now_ms
+                self._shock_trigger_absolute_range_pct = absolute_range_pct
+                self._shock_trigger_current_range = current_range
+                self._shock_trigger_median_range = median_range
                 LOG.warning(
-                    "market dislocation circuit breaker class=%s range=%.2fx volume=%.2fx cooldown=%sm",
+                    "market dislocation circuit breaker class=%s range=%.2fx volume=%.2fx "
+                    "range_pct=%.4f%% range_abs=%.4f baseline_range=%.4f cooldown=%sm",
                     classification,
                     range_ratio,
                     volume_ratio,
+                    absolute_range_pct * 100,
+                    current_range,
+                    median_range,
                     self.config.shock_cooldown_minutes,
                 )
             elif should_block:

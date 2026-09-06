@@ -26,6 +26,7 @@ from .strategy import (
     signal_stop_timeframe,
     signal_trade_management_overrides,
 )
+from .trade_model.features import REQUIRED_TIMEFRAMES
 
 LOG = logging.getLogger(__name__)
 MIN_POLL_SECONDS = 1
@@ -63,6 +64,14 @@ class TradingEngine:
         close_notifier: bool = True,
         entry_gate: Any = None,
     ) -> None:
+        if strategy.config.mode == "scalp_v2" and config.mode != "paper":
+            # This short-horizon experiment has no validated exchange-order
+            # execution contract yet. A shadow/off meta gate must not bypass
+            # the paper-only boundary, including on an exchange demo network.
+            raise ValueError(
+                "experimental scalp_v2 requires mode=paper; validated exchange-order "
+                "execution is required before enabling live or demo orders"
+            )
         self.adapter = adapter
         self.strategy = strategy
         self.risk = risk
@@ -242,12 +251,19 @@ class TradingEngine:
                 LOG.exception("daily email report scheduling failed")
         candles_by_timeframe: dict[str, list[Any]] = {}
         trigger_timeframe = self.strategy.config.trigger_timeframe
-        requested_timeframes = list(dict.fromkeys((trigger_timeframe, "1m", self.strategy.config.regime_timeframe)))
+        requested_timeframes = [trigger_timeframe, "1m", self.strategy.config.regime_timeframe]
+        gate_mode = str(getattr(getattr(self.entry_gate, "config", None), "mode", "off")).lower()
+        if gate_mode in {"shadow", "enforce"}:
+            # Feature context is independent of the primary signal's horizon.
+            # Minute scalping still needs the model's closed 1h feature bars,
+            # without turning the hourly context into a primary trend gate.
+            requested_timeframes.extend(REQUIRED_TIMEFRAMES)
+        requested_timeframes = list(dict.fromkeys(requested_timeframes))
         for timeframe in requested_timeframes:
             exchange_timeframe = "1m" if timeframe == "30s" and self.adapter.name != "okx" else timeframe
             candles = self._fetch_candles_cached(timeframe, exchange_timeframe)
             # The newest candle may still be forming. Exclude it so a signal is based on closed bars.
-            candles_by_timeframe[timeframe] = candles[:-1] if len(candles) > 1 else candles
+            candles_by_timeframe[timeframe] = candles[:-1]
         if self.config.mode == "live" and self.adapter.name == "binance":
             reconciliation_candles = candles_by_timeframe.get("1m") or candles_by_timeframe.get(trigger_timeframe, [])
             if reconciliation_candles:
