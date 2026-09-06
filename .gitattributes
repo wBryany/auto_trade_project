@@ -1,3 +1,4 @@
 # LightGBM native models are integrity-checked byte for byte by manifest.json.
 # Never let Git rewrite their line endings on checkout.
-artifacts/**/model.txt -text
+# Windows LightGBM may append a CRLF footer; retain and recognize those bytes.
+artifacts/**/model.txt -text whitespace=cr-at-eol
