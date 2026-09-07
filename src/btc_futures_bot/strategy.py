@@ -851,6 +851,21 @@ class MultiTimeframeStrategy:
         }
         long_score = sum(long_checks.values())
         short_score = sum(short_checks.values())
+        # Handoffs inherit the original setup, even when the confirming bar
+        # does not itself break a fresh high/low. Keep that level on every
+        # entry path so the same breakout-failure protection can manage it.
+        long_breakout_reasons = _traditional_breakout_exit_reasons(
+            long_setup_state or (previous_setup if long_macd_handoff or long_volume_handoff else current_setup),
+            "long",
+            self.config,
+            allow_raw=long_setup_age is None and long_volume_handoff,
+        )
+        short_breakout_reasons = _traditional_breakout_exit_reasons(
+            short_setup_state or (previous_setup if short_macd_handoff or short_volume_handoff else current_setup),
+            "short",
+            self.config,
+            allow_raw=short_setup_age is None and short_volume_handoff,
+        )
         if long_score == len(long_checks) and long_score > short_score:
             reasons = tuple(long_checks)
             selected_setup = long_setup_state or current_setup
@@ -878,8 +893,7 @@ class MultiTimeframeStrategy:
                 reasons += (f"{regime_name}_countertrend_pullback_up",)
             if neutral_transition_long:
                 reasons += (f"{regime_name}_neutral_transition_up",)
-            if self.config.enable_breakout_failure_exit and selected_setup.breakout_long:
-                reasons += (f"breakout_level={selected_setup.breakout_long_level:.12g}",)
+            reasons += tuple(reason for reason in long_breakout_reasons if reason not in reasons)
             return Signal("long", long_score, timestamp, reasons)
         if short_score == len(short_checks) and short_score > long_score:
             reasons = tuple(short_checks)
@@ -908,8 +922,7 @@ class MultiTimeframeStrategy:
                 reasons += (f"{regime_name}_countertrend_pullback_down",)
             if neutral_transition_short:
                 reasons += (f"{regime_name}_neutral_transition_down",)
-            if self.config.enable_breakout_failure_exit and selected_setup.breakout_short:
-                reasons += (f"breakout_level={selected_setup.breakout_short_level:.12g}",)
+            reasons += tuple(reason for reason in short_breakout_reasons if reason not in reasons)
             return Signal("short", short_score, timestamp, reasons)
 
         # Ultra-short structural recovery: the closed 1h candle is context,
@@ -952,7 +965,7 @@ class MultiTimeframeStrategy:
                 "long",
                 len(reasons),
                 timestamp,
-                (f"{regime_name}_structural_scalp_recovery_long",) + reasons,
+                (f"{regime_name}_structural_scalp_recovery_long",) + reasons + long_breakout_reasons,
             )
         if structural_scalp_short and not structural_scalp_long:
             reasons = tuple(name for name, ready in short_checks.items() if ready)
@@ -960,7 +973,7 @@ class MultiTimeframeStrategy:
                 "short",
                 len(reasons),
                 timestamp,
-                (f"{regime_name}_structural_scalp_recovery_short",) + reasons,
+                (f"{regime_name}_structural_scalp_recovery_short",) + reasons + short_breakout_reasons,
             )
 
         failed_breakout_short = _traditional_failed_breakout_short_reversal(
@@ -3732,6 +3745,34 @@ def _traditional_reclaim_quality(
     if volume_cap and (feature.volume_ratio is None or feature.volume_ratio > volume_cap):
         return False
     return True
+
+
+def _traditional_breakout_exit_reasons(
+    setup: _TraditionalSetupState,
+    side: str,
+    config: StrategyConfig,
+    *,
+    allow_raw: bool = False,
+) -> tuple[str, ...]:
+    """Preserve the breakout that actually admitted an already-valid entry.
+
+    Only a confirmed volume handoff may use a raw (previously low-volume)
+    breakout. A rejected raw breakout beside a cross/reclaim is not an entry
+    source and must not add an unrelated breakout-failure exit.
+    """
+    if not config.enable_breakout_failure_exit:
+        return ()
+    if side == "long":
+        ready = setup.breakout_long or (allow_raw and setup.breakout_long_raw)
+        level = setup.breakout_long_level
+        name = "breakout"
+    else:
+        ready = setup.breakout_short or (allow_raw and setup.breakout_short_raw)
+        level = setup.breakout_short_level
+        name = "breakdown"
+    if not ready:
+        return ()
+    return (f"{config.trigger_timeframe}_{name}", f"breakout_level={level:.12g}")
 
 
 def invalidate_breakout_setup(setup: _TraditionalSetupState, subsequent: Sequence[Candle]) -> _TraditionalSetupState:
