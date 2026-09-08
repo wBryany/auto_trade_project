@@ -31,6 +31,7 @@ from .strategy import (
 
 LOG = logging.getLogger(__name__)
 MIN_POLL_SECONDS = 1
+LIVE_MANAGEMENT_CHECKPOINT_SECONDS = 5.0
 
 
 def normalized_poll_seconds(value: int | float | str) -> int:
@@ -93,6 +94,8 @@ class TradingEngine:
         # Once prepare_live completes, normal saves may clear it after a real
         # close or replace it with the restored in-memory position.
         self._live_preflight_completed = False
+        self._last_saved_live_position: Position | None = None
+        self._last_live_management_save_at = 0.0
         self.unmanaged_live_position = self._load_unmanaged_live_position()
         self._managed_live_position_state = self._load_managed_live_position()
         self._last_live_reconciliation_at = 0.0
@@ -1202,10 +1205,42 @@ class TradingEngine:
                 encoding="utf-8",
             )
             temporary.replace(path)
+            self._last_saved_live_position = self.position
+            self._last_live_management_save_at = time.monotonic()
         except OSError:
             # Persistence must never turn a confirmed, protected live entry
             # into an emergency close. The exchange hard stop remains active.
             LOG.exception("failed to persist live reconciliation state")
+
+    def _checkpoint_live_position_management(self) -> None:
+        """Keep tightened stops durable and batch changing price extrema.
+
+        The exchange hard stop is unchanged. A crash must not discard an
+        already-armed local stop; best/worst prices are checkpointed at most
+        every five seconds while they change, without rewriting idle state.
+        Failed writes leave the previous snapshot intact and remain eligible
+        for retry on the next cycle.
+        """
+        position = self.position
+        saved = self._last_saved_live_position
+        if (
+            self.config.mode != "live"
+            or self.adapter.name != "binance"
+            or not self.config.reconciliation_state_path
+            or position is None
+            or position == saved
+        ):
+            return
+        protection_changed = saved is None or (
+            position.stop_price != saved.stop_price
+            or position.stop_reason != saved.stop_reason
+            or position.initial_stop_price != saved.initial_stop_price
+        )
+        if protection_changed or (
+            time.monotonic() - self._last_live_management_save_at
+            >= LIVE_MANAGEMENT_CHECKPOINT_SECONDS
+        ):
+            self._save_live_reconciliation_state()
 
     def _reconcile_managed_entry_fill(self) -> None:
         """Backfill exact Binance entry metadata without touching exposure."""
@@ -1383,6 +1418,7 @@ class TradingEngine:
         self._tighten_paper_stop(
             Candle(now_ms, mark_price, mark_price, mark_price, mark_price, 0.0)
         )
+        self._checkpoint_live_position_management()
         return None
 
     def _live_time_exit_reason(self, mark_price: float) -> str:
