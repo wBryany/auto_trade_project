@@ -99,6 +99,7 @@ class TradingEngine:
         self.unmanaged_live_position = self._load_unmanaged_live_position()
         self._managed_live_position_state = self._load_managed_live_position()
         self._last_live_reconciliation_at = 0.0
+        self._live_reconciliation_error_pending = False
         self._candle_cache: dict[str, list[Any]] = {}
         self._candle_cache_at: dict[str, float] = {}
         self._private_entry_retry_signal_timestamp = 0
@@ -783,6 +784,11 @@ class TradingEngine:
         self._candle_cache_at[cache_key] = now
         return candles
 
+    @property
+    def has_pending_live_reconciliation_error(self) -> bool:
+        """A skipped reconciliation cannot prove recovery from its last failure."""
+        return self._live_reconciliation_error_pending
+
     def _reconcile_binance_live_position_if_due(self, candle: Any) -> None:
         """Reconcile the local position from the private WebSocket cache."""
 
@@ -793,7 +799,13 @@ class TradingEngine:
         # Record the attempt first so a temporarily reconnecting private stream
         # is not queried repeatedly by every evaluation cycle.
         self._last_live_reconciliation_at = now
-        self._reconcile_binance_live_position(candle)
+        try:
+            self._reconcile_binance_live_position(candle)
+        except Exception:
+            self._live_reconciliation_error_pending = True
+            raise
+        else:
+            self._live_reconciliation_error_pending = False
 
     def _reconcile_binance_live_position(self, candle: Any) -> None:
         remote = self.adapter.fetch_live_position()
@@ -2369,7 +2381,8 @@ class TradingEngine:
             retry_after = 0.0
             try:
                 result = self.evaluate_once()
-                self.resolve_emergency("engine_runtime", "cycle")
+                if not self.has_pending_live_reconciliation_error:
+                    self.resolve_emergency("engine_runtime", "cycle")
                 if result.status not in {"no_action", "position_held"}:
                     LOG.warning("%s", result)
             except Exception as error:

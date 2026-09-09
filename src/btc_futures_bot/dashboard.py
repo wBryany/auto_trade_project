@@ -559,12 +559,20 @@ class DashboardService:
             rate_limit_wait = 0.0
             try:
                 result = self.engine.evaluate_once()
-                self.engine.resolve_emergency("engine_runtime", "cycle")
+                # A successful market-only cycle may have skipped the failed
+                # periodic private reconciliation. Keep its incident and
+                # visible error until reconciliation actually succeeds.
+                recovery_confirmed = not bool(
+                    getattr(self.engine, "has_pending_live_reconciliation_error", False)
+                )
+                if recovery_confirmed:
+                    self.engine.resolve_emergency("engine_runtime", "cycle")
                 with self._lock:
                     self.last_result = result
                     self.last_cycle_at = time.time()
-                    self.last_error = ""
-                    self._last_logged_error = ""
+                    if recovery_confirmed:
+                        self.last_error = ""
+                        self._last_logged_error = ""
                 macro_status = self.engine.macro_risk.status() if self.engine and self.engine.macro_risk else {}
                 macro_block = str(macro_status.get("reason") or "") if macro_status.get("blocked") else ""
                 if macro_block != self._last_macro_block:
