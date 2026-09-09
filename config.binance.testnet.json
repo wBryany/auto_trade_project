@@ -86,7 +86,7 @@
       "traditional_pullback_max_volume_ratio": 4.0,
       "traditional_strong_regime_min_gap_atr": 0.0,
       "traditional_strong_regime_require_fast_slope": false,
-      "traditional_strong_regime_require_macd": false,
+    "traditional_strong_regime_require_macd": true,
       "traditional_breakout_min_volume_ratio": 1.3,
       "traditional_breakout_min_body_ratio": 0.5,
       "traditional_breakout_min_close_location": 0.7,

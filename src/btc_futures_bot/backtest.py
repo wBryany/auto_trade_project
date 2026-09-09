@@ -146,6 +146,9 @@ def run_backtest(
                     worst_price=max(position.worst_price or position.entry_price, exit_candle.high),
                 )
             exit_price: float | None = None
+            # Intrabar protection retains the existing candle-open timestamp
+            # convention: OHLC data cannot locate the exact stop-hit tick.
+            exit_timestamp = exit_candle.timestamp
             if position.side == "long":
                 if exit_candle.low <= position.stop_price:
                     # A market stop cannot fill at the stop price after the
@@ -162,7 +165,10 @@ def run_backtest(
                 elif use_fixed_take_profit and exit_candle.low <= position.take_profit_price:
                     exit_price = position.take_profit_price
                     exit_reason = "take_profit"
-            if exit_price is None:
+            if exit_price is None and next_execution_open is not None:
+                # A closed-bar decision is known at its close, and the market
+                # fill is modeled at the next open (as for entries). Never use
+                # that future fill to decide whether an exit was warranted.
                 exit_reason = adverse_dynamic_exit_reason(
                     position,
                     candles_by_timeframe,
@@ -170,46 +176,46 @@ def run_backtest(
                     exit_candle.close,
                     decision_timestamp,
                 )
-                if exit_reason:
-                    exit_price = exit_candle.close
-            if exit_price is None and next_execution_open is not None:
-                exit_reason = breakout_failure_exit_reason(position, position_signal,
-                    candles_by_timeframe, strategy.config, exit_candle.close, decision_timestamp)
+                if not exit_reason:
+                    exit_reason = breakout_failure_exit_reason(
+                        position, position_signal, candles_by_timeframe,
+                        strategy.config, exit_candle.close, decision_timestamp,
+                    )
+                # Match the live priority when trend and time exits coincide.
+                if not exit_reason and _profit_trend_exit_ready(position, strategy, candles_by_timeframe):
+                    exit_reason = "trend_invalidation"
+                time_exit_enabled = bool(getattr(strategy.config, "enable_time_exit", False))
+                soft_max_hold_seconds = max(0, int(strategy.config.max_hold_seconds))
+                if not exit_reason and time_exit_enabled and soft_max_hold_seconds:
+                    hard_max_hold_seconds = max(
+                        soft_max_hold_seconds,
+                        int(getattr(strategy.config, "hard_max_hold_seconds", soft_max_hold_seconds)),
+                    )
+                    held_seconds = max(0.0, (decision_timestamp - position.opened_at) / 1000)
+                    net_at_close = risk.estimate_net_pnl(
+                        position.side,
+                        position.entry_price,
+                        exit_candle.close,
+                        position.quantity,
+                        holding_hours=held_seconds / 3600,
+                    )
+                    initial_stop = position.initial_stop_price or position.stop_price
+                    stop_distance = abs(position.entry_price - initial_stop)
+                    favorable_distance = (
+                        exit_candle.close - position.entry_price
+                        if position.side == "long"
+                        else position.entry_price - exit_candle.close
+                    )
+                    current_r = favorable_distance / stop_distance if stop_distance > 0 else 0.0
+                    min_time_exit_r = max(0.0, float(getattr(strategy.config, "time_exit_min_r", 0.5)))
+                    profitable_time_exit = net_at_close > 0 and current_r >= min_time_exit_r
+                    if held_seconds >= soft_max_hold_seconds and (profitable_time_exit or held_seconds >= hard_max_hold_seconds):
+                        exit_reason = "time_exit" if profitable_time_exit else "hard_time_exit"
                 if exit_reason:
                     exit_price = next_execution_open
-            time_exit_enabled = bool(getattr(strategy.config, "enable_time_exit", False))
-            soft_max_hold_seconds = max(0, int(strategy.config.max_hold_seconds))
-            if exit_price is None and time_exit_enabled and soft_max_hold_seconds:
-                hard_max_hold_seconds = max(
-                    soft_max_hold_seconds,
-                    int(getattr(strategy.config, "hard_max_hold_seconds", soft_max_hold_seconds)),
-                )
-                held_seconds = (exit_candle.timestamp - position.opened_at) / 1000
-                net_at_close = risk.estimate_net_pnl(
-                    position.side,
-                    position.entry_price,
-                    exit_candle.close,
-                    position.quantity,
-                    holding_hours=max(0.0, held_seconds / 3600),
-                )
-                initial_stop = position.initial_stop_price or position.stop_price
-                stop_distance = abs(position.entry_price - initial_stop)
-                favorable_distance = (
-                    exit_candle.close - position.entry_price
-                    if position.side == "long"
-                    else position.entry_price - exit_candle.close
-                )
-                current_r = favorable_distance / stop_distance if stop_distance > 0 else 0.0
-                min_time_exit_r = max(0.0, float(getattr(strategy.config, "time_exit_min_r", 0.5)))
-                profitable_time_exit = net_at_close > 0 and current_r >= min_time_exit_r
-                if held_seconds >= soft_max_hold_seconds and (profitable_time_exit or held_seconds >= hard_max_hold_seconds):
-                    exit_price = exit_candle.close
-                    exit_reason = "time_exit" if profitable_time_exit else "hard_time_exit"
-            if exit_price is None and _profit_trend_exit_ready(position, strategy, candles_by_timeframe):
-                exit_price = exit_candle.close
-                exit_reason = "trend_invalidation"
+                    exit_timestamp = next_execution_timestamp
             if exit_price is not None:
-                holding_hours = max(0.0, (exit_candle.timestamp - position.opened_at) / 3_600_000)
+                holding_hours = max(0.0, (exit_timestamp - position.opened_at) / 3_600_000)
                 pnl = risk.estimate_net_pnl(
                     position.side,
                     position.entry_price,
@@ -225,7 +231,7 @@ def run_backtest(
                             mode="backtest",
                             position=position,
                             exit_price=exit_price,
-                            exit_time_ms=exit_candle.timestamp,
+                            exit_time_ms=exit_timestamp,
                             exit_reason=exit_reason,
                             costs=risk.costs,
                             equity_before=position_equity_before,
@@ -244,7 +250,7 @@ def run_backtest(
                             cooldown_minutes,
                             max(0, int(getattr(risk.config, "loss_streak_pause_minutes", 0))),
                         )
-                    cooldown_until_ms = decision_timestamp + cooldown_minutes * 60_000
+                    cooldown_until_ms = max(decision_timestamp, exit_timestamp) + cooldown_minutes * 60_000
                 else:
                     consecutive_losses = 0
                 position = None
