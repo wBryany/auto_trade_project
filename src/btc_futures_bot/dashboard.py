@@ -13,7 +13,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .engine import cycle_wait_seconds, normalized_poll_seconds
-from .http_client import ApiError, is_rate_limit_error
+from .http_client import ApiError, is_rate_limit_error, rate_limit_remaining
 from .binance_request_budget import status as binance_request_status
 from .main import (
     build_engine,
@@ -315,6 +315,25 @@ class DashboardService:
             snapshot.get("snapshot_error"),
             private_stream.get("last_error") if isinstance(private_stream, dict) else "",
         )
+        settings = config.get("exchanges", {}).get(exchange_name, {})
+        base_url = str(settings.get("base_url") or "")
+        recovery_key = (
+            exchange_name, base_url, str(settings.get("environment") or ""),
+            str(settings.get("symbol") or ""),
+        )
+        recovery_id = (
+            str(private_stream.get("rest_recovery_id") or "").strip()
+            if isinstance(private_stream, dict) else ""
+        )
+        host_blocked = bool(base_url and rate_limit_remaining(base_url) > 0)
+        if recovery_id and (any(candidates) or host_blocked):
+            # A previously successful renewal cannot clear a newer failure
+            # discovered by an order call or another snapshot component.
+            with getattr(self, "_lock", threading.RLock()):
+                consumed = getattr(self, "_snapshot_rest_recovery_ids", None)
+                if consumed is None:
+                    consumed = self._snapshot_rest_recovery_ids = {}
+                consumed[recovery_key] = recovery_id
         rate_limit_error = next(
             (item for item in candidates if item and is_rate_limit_error(item)),
             None,
@@ -329,17 +348,39 @@ class DashboardService:
                 exchange_name=exchange_name,
             )
             return
-        if (
-            snapshot.get("private_available")
-            and str(snapshot.get("private_source") or "").lower() == "rest"
-            and not (
-            isinstance(order_limits, dict) and order_limits.get("error")
+        # A successful read cannot resolve the incident while any part of the
+        # same snapshot still reports a failure. In particular, a healthy
+        # WebSocket alone says nothing about REST/IP availability.
+        if any(candidates) or host_blocked or not snapshot.get("private_available") or snapshot.get("private_stale"):
+            return
+        source = str(snapshot.get("private_source") or "").lower()
+        recovered = source == "rest"
+        if source == "websocket" and isinstance(private_stream, dict):
+            try:
+                retry_at = float(private_stream.get("retry_at") or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                return
+            recovered = bool(
+                private_stream.get("healthy")
+                and private_stream.get("ready")
+                and private_stream.get("rest_recovery_confirmed") is True
+                and recovery_id
+                and math.isfinite(retry_at)
+                and retry_at <= time.time()
             )
-        ):
+        if recovered:
             resolve = getattr(notifier, "resolve_emergency", None)
             if callable(resolve):
                 try:
-                    resolve("ip_restricted", exchange_name, "snapshot")
+                    with getattr(self, "_lock", threading.RLock()):
+                        if source == "websocket":
+                            consumed = getattr(self, "_snapshot_rest_recovery_ids", None)
+                            if consumed is None:
+                                consumed = self._snapshot_rest_recovery_ids = {}
+                            if consumed.get(recovery_key) == recovery_id:
+                                return
+                            consumed[recovery_key] = recovery_id
+                        resolve("ip_restricted", exchange_name, "snapshot")
                 except Exception:
                     LOG.exception("dashboard IP alert recovery reset failed")
 

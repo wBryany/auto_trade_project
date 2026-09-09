@@ -7,6 +7,7 @@ import threading
 import time
 from decimal import Decimal
 from typing import Any, Callable
+from uuid import uuid4
 
 from .http_client import ApiError, request_json
 
@@ -76,6 +77,10 @@ class BinanceUserDataStream:
         self._last_bootstrap_at = 0.0
         self._last_error = ""
         self._last_exception: Exception | None = None
+        self._last_error_source = ""
+        self._error_revision = 0
+        self._rest_recovery_confirmed = False
+        self._rest_recovery_id = ""
         self._bootstrap_failed = False
         self._retry_at = 0.0
         self._reconnects = 0
@@ -174,6 +179,8 @@ class BinanceUserDataStream:
                 "last_transport_age_seconds": transport_age,
                 "last_event_age_seconds": event_age,
                 "last_error": self._last_error,
+                "rest_recovery_confirmed": self._rest_recovery_confirmed,
+                "rest_recovery_id": self._rest_recovery_id if self._rest_recovery_confirmed else "",
                 "retry_at": self._retry_at,
                 "retry_after_seconds": self._retry_after_seconds(),
                 "reconnects": self._reconnects,
@@ -264,6 +271,9 @@ class BinanceUserDataStream:
             self._ready = True
             self._last_error = ""
             self._last_exception = None
+            self._last_error_source = ""
+            self._error_revision += 1
+            self._rest_recovery_confirmed = False
             self._bootstrap_failed = False
             self._ready_event.set()
             self._condition.notify_all()
@@ -290,6 +300,9 @@ class BinanceUserDataStream:
             elif event == "listenKeyExpired":
                 self._last_error = "Binance private WebSocket listenKey expired"
                 self._last_exception = None
+                self._last_error_source = "authentication"
+                self._error_revision += 1
+                self._rest_recovery_confirmed = False
                 self._ready = False
                 self._ready_event.clear()
                 self._listen_key = ""
@@ -350,6 +363,7 @@ class BinanceUserDataStream:
                 continue
             with self._condition:
                 listen_key = self._listen_key
+                error_revision = self._error_revision
                 due = bool(
                     listen_key
                     and time.monotonic() - self._last_keepalive_at >= self.keepalive_seconds
@@ -360,6 +374,25 @@ class BinanceUserDataStream:
                 payload = self._listen_key_request("PUT")
                 replacement = str((payload or {}).get("listenKey") or "")
                 with self._condition:
+                    if self._listen_key != listen_key or self._stop.is_set():
+                        # A response for the old key cannot revive expired
+                        # authentication or alter a replacement key's timer.
+                        continue
+                    # A successful renewal only resolves the preceding
+                    # renewal failure. A concurrent reconnect/authentication
+                    # failure or a newly extended ban must remain visible.
+                    if (
+                        self._last_error_source == "keepalive"
+                        and self._error_revision == error_revision
+                        and self._retry_at <= time.time()
+                    ):
+                        self._last_error = ""
+                        self._last_exception = None
+                        self._last_error_source = ""
+                        self._retry_at = 0.0
+                        self._error_revision += 1
+                        self._rest_recovery_confirmed = True
+                        self._rest_recovery_id = uuid4().hex
                     self._last_keepalive_at = time.monotonic()
                     if replacement and replacement != self._listen_key:
                         self._listen_key = replacement
@@ -367,11 +400,12 @@ class BinanceUserDataStream:
                         if active_socket is not None:
                             active_socket.close()
             except Exception as error:
-                self._record_error(error)
+                self._record_error(error, source="keepalive")
                 # A temporary network failure should not discard a still-valid
                 # key. Retry after one minute, well before its 60-minute TTL.
                 with self._condition:
-                    self._last_keepalive_at = time.monotonic() - self.keepalive_seconds + 60.0
+                    if self._listen_key == listen_key:
+                        self._last_keepalive_at = time.monotonic() - self.keepalive_seconds + 60.0
 
     def _ensure_listen_key(self) -> str:
         with self._condition:
@@ -416,12 +450,25 @@ class BinanceUserDataStream:
             self._ready_event.clear()
             self._last_transport_at = time.monotonic()
             self._bootstrap_failed = False
+            self._error_revision += 1
+            self._rest_recovery_confirmed = False
+            error_revision = self._error_revision
         try:
             payload = self._snapshot_loader()
-            if self._stop.is_set():
-                _socket.keep_running = False
-                return
-            self.seed_snapshot(payload)
+            with self._condition:
+                if (
+                    self._stop.is_set()
+                    or self._error_revision != error_revision
+                    or self._retry_at > time.time()
+                ):
+                    # A completed REST read cannot erase an authentication,
+                    # transport or rate-limit failure that arrived meanwhile.
+                    _socket.keep_running = False
+                    return
+                self.seed_snapshot(payload)
+                self._retry_at = 0.0
+                self._rest_recovery_confirmed = True
+                self._rest_recovery_id = uuid4().hex
         except Exception as error:
             self._record_error(error, bootstrap_failure=True)
             with self._condition:
@@ -449,6 +496,8 @@ class BinanceUserDataStream:
 
     def _on_close(self, _socket: Any, status_code: Any, message: Any) -> None:
         with self._condition:
+            self._error_revision += 1
+            self._rest_recovery_confirmed = False
             self._connected = False
             self._ready = False
             self._ready_event.clear()
@@ -464,11 +513,20 @@ class BinanceUserDataStream:
         with self._condition:
             return max(0.0, self._retry_at - time.time())
 
-    def _record_error(self, error: Any, *, bootstrap_failure: bool = False) -> None:
+    def _record_error(
+        self, error: Any, *, bootstrap_failure: bool = False, source: str = "transport",
+    ) -> None:
         message = str(error)
         with self._condition:
+            self._error_revision += 1
+            self._rest_recovery_confirmed = False
             if isinstance(error, ApiError) and error.rate_limited:
                 self._retry_at = max(self._retry_at, error.retry_at)
+            if source == "keepalive" and self._last_error_source not in {"", "keepalive"}:
+                # Renewal does not establish an authenticated account cache.
+                # Keep the independent failure and any longer retry deadline.
+                LOG.debug("Binance keepalive failed while another stream error is active: %s", message)
+                return
             if self._bootstrap_failed and not bootstrap_failure and not isinstance(error, ApiError):
                 # Teardown/transport errors from the failed socket must not
                 # replace the authenticated snapshot failure that caused it.
@@ -478,6 +536,7 @@ class BinanceUserDataStream:
                 self._bootstrap_failed = True
             self._last_error = message
             self._last_exception = error if isinstance(error, Exception) else None
+            self._last_error_source = "bootstrap" if bootstrap_failure else source
             self._condition.notify_all()
         if not self._stop.is_set():
             LOG.warning("Binance private WebSocket user stream error: %s", message)
