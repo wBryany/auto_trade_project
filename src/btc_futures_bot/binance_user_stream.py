@@ -8,7 +8,7 @@ import time
 from decimal import Decimal
 from typing import Any, Callable
 
-from .http_client import request_json
+from .http_client import ApiError, request_json
 
 try:  # Installed through the project dependency; kept optional for safe fallback.
     import websocket
@@ -75,6 +75,9 @@ class BinanceUserDataStream:
         self._last_event_at = 0.0
         self._last_bootstrap_at = 0.0
         self._last_error = ""
+        self._last_exception: Exception | None = None
+        self._bootstrap_failed = False
+        self._retry_at = 0.0
         self._reconnects = 0
 
         self._account: dict[str, Any] = {}
@@ -171,6 +174,8 @@ class BinanceUserDataStream:
                 "last_transport_age_seconds": transport_age,
                 "last_event_age_seconds": event_age,
                 "last_error": self._last_error,
+                "retry_at": self._retry_at,
+                "retry_after_seconds": self._retry_after_seconds(),
                 "reconnects": self._reconnects,
             }
 
@@ -179,7 +184,16 @@ class BinanceUserDataStream:
         with self._condition:
             if not self.healthy():
                 reason = self._last_error or "Binance private WebSocket is not ready"
-                raise RuntimeError(reason)
+                error = self._last_exception
+                if isinstance(error, ApiError):
+                    # Callers attach notification metadata to exceptions. Do
+                    # not share one mutable exception/traceback across cycles.
+                    raise ApiError(
+                        reason, status_code=error.status_code,
+                        retry_at=max(error.retry_at, self._retry_at),
+                        api_code=error.api_code,
+                    ) from error
+                raise RuntimeError(reason) from error
             return {
                 "account": copy.deepcopy(self._account),
                 "positions": copy.deepcopy(list(self._positions.values())),
@@ -249,6 +263,8 @@ class BinanceUserDataStream:
             self._last_bootstrap_at = time.monotonic()
             self._ready = True
             self._last_error = ""
+            self._last_exception = None
+            self._bootstrap_failed = False
             self._ready_event.set()
             self._condition.notify_all()
 
@@ -273,7 +289,9 @@ class BinanceUserDataStream:
                     self._apply_margin_position(row)
             elif event == "listenKeyExpired":
                 self._last_error = "Binance private WebSocket listenKey expired"
+                self._last_exception = None
                 self._ready = False
+                self._ready_event.clear()
                 self._listen_key = ""
                 active_socket = self._socket
                 if active_socket is not None:
@@ -283,7 +301,16 @@ class BinanceUserDataStream:
     def _run(self) -> None:
         backoff = 1.0
         while not self._stop.is_set():
+            retry_delay = self._retry_after_seconds()
+            if retry_delay > 0:
+                if self._stop.wait(retry_delay):
+                    break
+                # A keepalive failure may have extended the deadline while
+                # waiting. Recheck before either REST or WebSocket reconnect.
+                continue
             had_ready_connection = False
+            with self._condition:
+                self._bootstrap_failed = False
             try:
                 listen_key = self._ensure_listen_key()
                 active_socket = websocket.WebSocketApp(
@@ -307,7 +334,10 @@ class BinanceUserDataStream:
                     self._socket = None
                     self._ready_event.clear()
                     self._condition.notify_all()
-            reconnect_delay = 1.0 if had_ready_connection else backoff
+            reconnect_delay = max(
+                1.0 if had_ready_connection else backoff,
+                self._retry_after_seconds(),
+            )
             if self._stop.wait(reconnect_delay):
                 break
             with self._condition:
@@ -315,7 +345,9 @@ class BinanceUserDataStream:
             backoff = 1.0 if had_ready_connection else min(30.0, backoff * 2)
 
     def _keepalive_loop(self) -> None:
-        while not self._stop.wait(1.0):
+        while not self._stop.wait(max(1.0, self._retry_after_seconds())):
+            if self._retry_after_seconds() > 0:
+                continue
             with self._condition:
                 listen_key = self._listen_key
                 due = bool(
@@ -381,15 +413,24 @@ class BinanceUserDataStream:
         with self._condition:
             self._connected = True
             self._ready = False
+            self._ready_event.clear()
             self._last_transport_at = time.monotonic()
-            self._last_error = ""
+            self._bootstrap_failed = False
         try:
-            self.seed_snapshot(self._snapshot_loader())
+            payload = self._snapshot_loader()
+            if self._stop.is_set():
+                _socket.keep_running = False
+                return
+            self.seed_snapshot(payload)
         except Exception as error:
-            self._record_error(error)
+            self._record_error(error, bootstrap_failure=True)
             with self._condition:
                 self._ready = False
-            _socket.close()
+                self._ready_event.clear()
+            # websocket-client dereferences app.sock.sock immediately after
+            # on_open returns. app.close() clears app.sock too early here.
+            # Retain it until run_forever's own finally/teardown closes it.
+            _socket.keep_running = False
             return
         LOG.info("Binance private WebSocket user stream connected for %s", self.symbol)
 
@@ -419,10 +460,24 @@ class BinanceUserDataStream:
                 message,
             )
 
-    def _record_error(self, error: Any) -> None:
+    def _retry_after_seconds(self) -> float:
+        with self._condition:
+            return max(0.0, self._retry_at - time.time())
+
+    def _record_error(self, error: Any, *, bootstrap_failure: bool = False) -> None:
         message = str(error)
         with self._condition:
+            if isinstance(error, ApiError) and error.rate_limited:
+                self._retry_at = max(self._retry_at, error.retry_at)
+            if self._bootstrap_failed and not bootstrap_failure and not isinstance(error, ApiError):
+                # Teardown/transport errors from the failed socket must not
+                # replace the authenticated snapshot failure that caused it.
+                LOG.debug("Binance user stream secondary error during teardown: %s", message)
+                return
+            if bootstrap_failure:
+                self._bootstrap_failed = True
             self._last_error = message
+            self._last_exception = error if isinstance(error, Exception) else None
             self._condition.notify_all()
         if not self._stop.is_set():
             LOG.warning("Binance private WebSocket user stream error: %s", message)

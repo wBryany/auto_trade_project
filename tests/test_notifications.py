@@ -274,8 +274,8 @@ def test_emergency_messages_cover_engine_order_and_ip_failures(tmp_path: Path) -
     assert "IP" in combined[2]
     assert "HTTP 418" in combined[2]
     assert "fetch candles" in combined[2]
-    assert "切换节点" in combined[2]
-    assert "重启" in combined[2]
+    assert "限频等待时间后重试" in combined[2]
+    assert "请勿反复重启" in combined[2]
     assert all("binance" in content for content in combined)
     assert all("BTCUSDT" in content for content in combined)
     assert all("live" in content for content in combined)

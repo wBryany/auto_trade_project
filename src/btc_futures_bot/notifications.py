@@ -308,8 +308,9 @@ class EmailNotifier:
                 subject = f"【紧急】{venue_name} API 限频/IP 限制"
                 heading = f"{venue_name} API 已限频或出口 IP 受限"
             handling = (
-                "请手动切换路由器代理节点，确认公网出口 IP 已变化后，"
-                "从页面重启引擎或运行 scripts\\restart_bot.ps1。程序不会自动切换节点。"
+                "程序会遵守交易所限频等待时间后重试。等待期间请勿反复重启或重复下单；"
+                "若等待结束后仍未恢复，请检查网络及共享出口的请求量，"
+                "并核对交易所实际仓位和保护单状态。"
             )
         else:
             subject, heading, handling = {
