@@ -48,6 +48,22 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _time_exit_policy(config: dict[str, Any], strategy_config: Any = None) -> dict[str, Any]:
+    """Display active strategy settings without presenting disabled deadlines."""
+    saved = config.get("strategy", {})
+
+    def setting(name: str, default: Any) -> Any:
+        return getattr(strategy_config, name, default) if strategy_config is not None else saved.get(name, default)
+
+    soft_seconds = max(0, int(setting("max_hold_seconds", 420)))
+    enabled = bool(setting("enable_time_exit", False)) and soft_seconds > 0
+    return {
+        "enabled": enabled,
+        "soft_seconds": soft_seconds if enabled else None,
+        "hard_seconds": max(soft_seconds, int(setting("hard_max_hold_seconds", 900))) if enabled else None,
+    }
+
+
 def _decimal(value: Any) -> Decimal:
     try:
         return Decimal(str(value if value not in (None, "") else "0"))
@@ -360,6 +376,7 @@ class DashboardService:
             "strategy_mode": config.get("strategy", {}).get("mode", "scalp"),
             "trigger_timeframe": config.get("strategy", {}).get("trigger_timeframe", "30s"),
             "regime_timeframe": config.get("strategy", {}).get("regime_timeframe", "5m"),
+            "enable_time_exit": config.get("strategy", {}).get("enable_time_exit", False),
             "max_hold_seconds": config.get("strategy", {}).get("max_hold_seconds", 300),
             "hard_max_hold_seconds": config.get("strategy", {}).get("hard_max_hold_seconds", 900),
             "min_hold_seconds": config.get("strategy", {}).get("min_hold_seconds", 60),
@@ -964,6 +981,10 @@ class DashboardService:
             "started_at": started_at,
             "last_cycle_at": last_cycle_at,
             "last_error": last_error,
+            "time_exit": _time_exit_policy(
+                config,
+                getattr(getattr(self.engine, "strategy", None), "config", None) if self.running else None,
+            ),
             "connection": {
                 "market": bool(snapshot.get("market")),
                 "private": bool(snapshot.get("private_available"))
@@ -1248,4 +1269,6 @@ document.querySelectorAll('#reportScopeButtons button').forEach(button=>{button.
 if($('stopLoss'))$('stopLoss').insertAdjacentHTML('afterend','<div class="note">动态止损：30秒 ATR × 1.4，自动限制在 0.25%～0.60%；页面上的止损比例是 ATR 不可用时的备用值。</div>');
 if($('stopLoss'))$('stopLoss').insertAdjacentHTML('afterend','<div class="note">费用保护：按吃单 0.05% 双边、滑点 0.02%估算；反向信号不会在手续费后亏损时频繁平仓，除非出现满分强反转。</div>');
 const emailAwareRenderStatus=renderStatus;renderStatus=function(s){emailAwareRenderStatus(s);const e=s.email_notifications||{};if($('emailState'))$('emailState').textContent=`邮件：${e.enabled?'已启用':'未启用'} · ${e.ready?'发送就绪':'配置未就绪'} · 收件人 ${e.recipients_count||0}/5${e.last_error?' · 最近错误：'+e.last_error:''}`};
+$('resultBox').insertAdjacentHTML('afterend','<div id="timeExitState" class="note"></div>');
+const timeExitAwareRenderStatus=renderStatus;renderStatus=function(s){timeExitAwareRenderStatus(s);const p=s.time_exit;if(p)$('timeExitState').textContent=p.enabled?`时间退出：已开启，软时间 ${p.soft_seconds/60} 分钟，硬时间 ${p.hard_seconds/60} 分钟`:'时间退出：已关闭（不按持仓时长平仓）'};
 </script></body></html>"""
