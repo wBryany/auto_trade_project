@@ -266,7 +266,7 @@ try {
     # exchange exposure still matches the pre-restart baseline.
     $preStartStatus = Wait-EngineStatus `
         -ExpectedRunning $false `
-        -TimeoutSeconds 45 `
+        -TimeoutSeconds 75 `
         -RequireHealthy
     $preStartSnapshot = Get-SafeRestartSnapshot -Status $preStartStatus
     if ($null -eq $beforeSnapshot) {
@@ -290,17 +290,58 @@ if ($DashboardOnly) {
 Write-Host "Starting the configured trading engine..."
 try {
     $body = @{exchange = $Exchange} | ConvertTo-Json -Compress
-    $startResult = Invoke-RestMethod `
-        "$serviceUrl/api/start" `
-        -Method Post `
-        -ContentType "application/json" `
-        -Body $body `
-        -TimeoutSec 45
-    if (-not (ConvertTo-RestartBoolean (Get-RestartValue $startResult @("running")))) {
-        throw "Engine start did not report running=true"
+    $startDeadline = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0 + 90.0
+    $startRetryCount = 0
+    while ($true) {
+        $remainingStartSeconds = $startDeadline - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
+        if ($remainingStartSeconds -le 0) { throw "Engine start retry deadline expired" }
+        try {
+            $startResult = Invoke-RestMethod `
+                "$serviceUrl/api/start" `
+                -Method Post `
+                -ContentType "application/json" `
+                -Body $body `
+                -TimeoutSec ([int][Math]::Max(1, [Math]::Min(45, [Math]::Floor($remainingStartSeconds))))
+            if (-not (ConvertTo-RestartBoolean (Get-RestartValue $startResult @("running")))) {
+                throw "Engine start did not report running=true"
+            }
+            break
+        } catch {
+            $startFailure = $_
+            $failurePayload = $null
+            $failureDetails = Get-RestartValue $startFailure @("ErrorDetails")
+            $failureMessage = [string](Get-RestartValue $failureDetails @("Message"))
+            if ($failureMessage) {
+                try { $failurePayload = $failureMessage | ConvertFrom-Json -ErrorAction Stop } catch { }
+            }
+            $retryPlan = Get-RestartStartRetryPlan -Payload $failurePayload `
+                -NowTimestamp ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0) `
+                -DeadlineTimestamp $startDeadline -RetryCount $startRetryCount
+            if ($null -eq $retryPlan) { throw $startFailure }
+
+            $startRetryCount += 1
+            Write-Host "Start preflight deferred by $($retryPlan.source); waiting before safety recheck (retry $startRetryCount/2)."
+            $waitUntil = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0 + $retryPlan.wait_seconds
+            while ($true) {
+                $waitLeft = $waitUntil - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
+                if ($waitLeft -le 0) { break }
+                Start-Sleep -Milliseconds ([int][Math]::Max(1, [Math]::Min(5000, [Math]::Ceiling($waitLeft * 1000))))
+            }
+            $remainingStartSeconds = $startDeadline - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
+            if ($remainingStartSeconds -lt 1) { throw "Engine start retry deadline expired before safety recheck" }
+            # Recheck the full exchange baseline on every retry. Use /start,
+            # not /restart: it must preserve the process's known cooldown.
+            $retryStatus = Wait-EngineStatus -ExpectedRunning $false -RequireHealthy `
+                -TimeoutSeconds ([int][Math]::Max(1, [Math]::Floor($remainingStartSeconds)))
+            $retrySnapshot = Get-SafeRestartSnapshot -Status $retryStatus
+            Assert-SafeRestartSnapshotUnchanged -Before $beforeSnapshot -After $retrySnapshot
+            Write-Host "Retry pre-start exchange snapshot confirmed: $(Format-SafeRestartSnapshot $retrySnapshot)"
+        }
     }
 } catch {
-    $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+    $errorDetails = Get-RestartValue $_ @("ErrorDetails")
+    $detail = [string](Get-RestartValue $errorDetails @("Message"))
+    if (-not $detail) { $detail = $_.Exception.Message }
     $failClosedResult = Stop-EngineFailClosed -Reason $detail
     throw "The trading engine start was not confirmed; $failClosedResult. Cause: $detail"
 }

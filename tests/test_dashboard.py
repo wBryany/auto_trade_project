@@ -491,7 +491,7 @@ def test_dashboard_email_test_rejects_delivery_timeout() -> None:
         service.email_test()
 
 
-def test_dashboard_explicit_restart_clears_old_ip_rate_limit_gate() -> None:
+def test_dashboard_restart_preserves_known_rate_limit_gate() -> None:
     service = DashboardService.__new__(DashboardService)
     timeline: list[str] = []
 
@@ -505,13 +505,13 @@ def test_dashboard_explicit_restart_clears_old_ip_rate_limit_gate() -> None:
     service.start = lambda _payload: timeline.append("start") or {"running": True}
 
     with patch(
-        "btc_futures_bot.dashboard.clear_rate_limits",
+        "btc_futures_bot.http_client.clear_rate_limits",
         side_effect=lambda: timeline.append("clear_rate_limits"),
     ):
         result = service.restart({"reason": "proxy node changed"})
 
     assert result == {"running": True}
-    assert timeline == ["stop", "clear_rate_limits", "start"]
+    assert timeline == ["stop", "start"]
 
 
 def test_dashboard_overlays_cached_private_snapshot_with_live_market_tick() -> None:

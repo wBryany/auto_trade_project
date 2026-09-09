@@ -13,7 +13,8 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .engine import cycle_wait_seconds, normalized_poll_seconds
-from .http_client import ApiError, clear_rate_limits, is_rate_limit_error
+from .http_client import ApiError, is_rate_limit_error
+from .binance_request_budget import status as binance_request_status
 from .main import (
     build_engine,
     credential_values,
@@ -270,6 +271,15 @@ class DashboardService:
         if not callable(notify):
             return False
         exchange = config.get("exchanges", {}).get(exchange_name, {})
+        payload_details = dict(details or {})
+        engine = getattr(self, "engine", None)
+        if engine is not None and (
+            getattr(engine, "position", None) is not None
+            or getattr(engine, "_managed_live_position_state", None) is not None
+        ):
+            # A startup that is resuming saved exposure is not a routine
+            # flat-account deferral, even before position restoration finishes.
+            payload_details.setdefault("当前本地仓位", "有")
         try:
             return bool(
                 notify(
@@ -281,7 +291,7 @@ class DashboardService:
                     environment=str(exchange.get("environment") or ""),
                     context=context,
                     incident=incident,
-                    details=details,
+                    details=payload_details or None,
                 )
             )
         except Exception:
@@ -559,10 +569,8 @@ class DashboardService:
         self.operation_logger.record("engine_restart", "restart", status="started", summary="开始重启交易引擎", details={"reason": reason})
         try:
             self.stop()
-            # A user may have just switched the router's outbound proxy/IP.
-            # Explicit restart is the safe boundary for discarding the old
-            # process-local Binance retry deadline and probing the new route.
-            clear_rate_limits()
+            # Restarting an engine does not prove the outgoing IP changed.
+            # Preserve known exchange deadlines and preventive request budgets.
             result = self.start(payload)
             self.operation_logger.record("engine_restart", "restart", summary="交易引擎重启成功", details={"reason": reason}, result=result)
             return result
@@ -981,6 +989,7 @@ class DashboardService:
             "started_at": started_at,
             "last_cycle_at": last_cycle_at,
             "last_error": last_error,
+            "rest_requests": binance_request_status(str(exchange_config.get("base_url") or "")),
             "time_exit": _time_exit_policy(
                 config,
                 getattr(getattr(self.engine, "strategy", None), "config", None) if self.running else None,
@@ -1159,7 +1168,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             LOG.exception("dashboard POST failed")
             if self.path == "/api/start":
                 self.server.service.operation_logger.record("engine_start", "start", status="error", summary="交易引擎启动失败", result={"error": str(error)})
-            self._json({"error": str(error)}, 400)
+            response = {"error": str(error)}
+            if isinstance(error, ApiError):
+                # Deployment may retry only a definite preflight rejection.
+                # Preserve typed timing information instead of asking scripts
+                # to guess from exception text or replay ambiguous timeouts.
+                response["retry"] = {
+                    "api_code": error.api_code,
+                    "upstream_status": error.status_code,
+                    "retry_at": error.retry_at,
+                    "retry_after_seconds": error.retry_after_seconds,
+                    "local_deferred": error.api_code == "LOCAL_REQUEST_BUDGET",
+                }
+            self._json(response, 400)
 
 
 class DashboardServer(ThreadingHTTPServer):

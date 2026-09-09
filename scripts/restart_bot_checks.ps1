@@ -45,6 +45,47 @@ function ConvertTo-RestartBoolean {
     }
 }
 
+function Get-RestartStartRetryPlan {
+    param(
+        [AllowNull()]
+        [object]$Payload,
+        [Parameter(Mandatory = $true)]
+        [double]$NowTimestamp,
+        [Parameter(Mandatory = $true)]
+        [double]$DeadlineTimestamp,
+        [int]$RetryCount = 0
+    )
+
+    # A retry is safe only for an explicitly rejected preflight. Unknown
+    # errors/timeouts may have succeeded and must never replay /api/start.
+    if ($RetryCount -lt 0 -or $RetryCount -ge 2) { return $null }
+    $metadata = Get-RestartValue $Payload @("retry")
+    if ($null -eq $metadata) { return $null }
+    $upstream = [string](Get-RestartValue $metadata @("upstream_status"))
+    $apiCode = [string](Get-RestartValue $metadata @("api_code"))
+    if ($upstream -eq "418") { return $null }
+    $local = $apiCode -eq "LOCAL_REQUEST_BUDGET" -and $upstream -eq ""
+    if (-not $local -and $upstream -ne "429") { return $null }
+    try {
+        $retryAt = [double](ConvertTo-RestartDecimal `
+            (Get-RestartValue $metadata @("retry_at")) -Field "retry_at")
+    } catch {
+        return $null
+    }
+    if ($retryAt -le 0 -or [double]::IsNaN($NowTimestamp) -or
+        [double]::IsInfinity($NowTimestamp) -or [double]::IsNaN($DeadlineTimestamp) -or
+        [double]::IsInfinity($DeadlineTimestamp)) { return $null }
+    # The response may arrive just after Retry-After expired. One short yield
+    # is then enough; never re-probe before the exchange deadline.
+    $waitSeconds = [Math]::Max(0.25, $retryAt - $NowTimestamp + 0.25)
+    if ($NowTimestamp + $waitSeconds -ge $DeadlineTimestamp) { return $null }
+    return [pscustomobject]@{
+        wait_seconds = $waitSeconds
+        retry_at = $retryAt
+        source = $(if ($local) { "local request budget" } else { "exchange HTTP 429" })
+    }
+}
+
 function ConvertTo-RestartDecimal {
     param(
         [AllowNull()]

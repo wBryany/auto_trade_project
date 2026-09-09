@@ -556,25 +556,59 @@ class BinanceAdapter(ExchangeAdapter):
             )
 
         position_mode = self._signed("GET", "/fapi/v1/positionSide/dual")
-        if bool(position_mode.get("dualSidePosition")):
+        mode_changed = bool(position_mode.get("dualSidePosition"))
+        if mode_changed:
             self._signed("POST", "/fapi/v1/positionSide/dual", {"dualSidePosition": "false"})
-        try:
-            self._signed(
-                "POST",
-                "/fapi/v1/marginType",
-                {"symbol": self.settings.symbol, "marginType": self.settings.margin_mode.upper()},
-            )
-        except ApiError as error:
-            if '"code":-4046' not in str(error).replace(" ", ""):
-                raise
-        leverage = max(1, min(125, int(max_leverage)))
-        leverage_result = self._signed(
-            "POST",
-            "/fapi/v1/leverage",
-            {"symbol": self.settings.symbol, "leverage": leverage},
+        # The synchronized account bootstrap already includes flat symbol
+        # settings. Reuse only an unambiguous one-way row; switching account
+        # mode invalidates this evidence. Missing/conflicting fields retain
+        # the original exchange-side setting and confirmation path.
+        symbol_positions = [
+            row for row in positions
+            if str(row.get("symbol") or "").upper() == self.settings.symbol.upper()
+        ]
+        current = (
+            symbol_positions[0]
+            if not mode_changed and len(symbol_positions) == 1
+            and str(symbol_positions[0].get("positionSide") or "").upper() == "BOTH"
+            else {}
         )
-        if int(leverage_result.get("leverage") or 0) != leverage:
-            raise RuntimeError("Binance did not confirm the requested leverage")
+        isolated = current.get("isolated")
+        if isinstance(isolated, str) and isolated.lower() in {"true", "false"}:
+            isolated = isolated.lower() == "true"
+        margin_mode = self.settings.margin_mode.upper()
+        margin_matches = isinstance(isolated, bool) and (
+            (isolated and margin_mode == "ISOLATED")
+            or (not isolated and margin_mode == "CROSSED")
+        )
+        if "marginType" in current:
+            # ACCOUNT_UPDATE supplies marginType but leaves the bootstrap's
+            # isolated flag in place. Never trust contradictory cached fields.
+            observed_margin = str(current["marginType"]).upper()
+            if observed_margin == "CROSS":
+                observed_margin = "CROSSED"
+            margin_matches = margin_matches and observed_margin == margin_mode
+        if not margin_matches:
+            try:
+                self._signed(
+                    "POST", "/fapi/v1/marginType",
+                    {"symbol": self.settings.symbol, "marginType": margin_mode},
+                )
+            except ApiError as error:
+                if '"code":-4046' not in str(error).replace(" ", ""):
+                    raise
+        leverage = max(1, min(125, int(max_leverage)))
+        try:
+            observed_leverage = float(current.get("leverage"))
+        except (TypeError, ValueError, OverflowError):
+            observed_leverage = 0.0
+        if isinstance(current.get("leverage"), bool) or observed_leverage != leverage:
+            leverage_result = self._signed(
+                "POST", "/fapi/v1/leverage",
+                {"symbol": self.settings.symbol, "leverage": leverage},
+            )
+            if int(leverage_result.get("leverage") or 0) != leverage:
+                raise RuntimeError("Binance did not confirm the requested leverage")
         return {
             "exchange": "binance",
             "environment": self.settings.environment,

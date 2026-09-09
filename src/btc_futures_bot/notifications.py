@@ -17,7 +17,12 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
-from .http_client import ApiError, is_rate_limit_error, redact_url_credentials
+from .http_client import (
+    ApiError,
+    is_local_request_deferred,
+    is_rate_limit_error,
+    redact_url_credentials,
+)
 from .models import Position, Signal
 from .reporting import TradeRecord, TradeReporter
 
@@ -290,6 +295,20 @@ class EmailNotifier:
         """Queue a high-priority, deduplicated operational alert."""
 
         selected_category = self._emergency_category(category, error)
+        if is_local_request_deferred(error):
+            # Preventive scheduling is not evidence of an exchange IP ban.
+            # Silence normal flat-account/startup flow only; a local budget
+            # that delays protection, exits or management is still actionable.
+            if selected_category == "ip_restricted":
+                selected_category = "engine_runtime"
+            position = (details or {}).get("当前本地仓位")
+            routine_wait = position == "无" or (
+                position is None and incident in {"start", "snapshot"}
+            )
+            if selected_category == "engine_runtime" and routine_wait:
+                # Preserve incident eligibility for a subsequent real rejection.
+                return False
+
         incident_key = self._emergency_incident_key(
             selected_category,
             exchange,

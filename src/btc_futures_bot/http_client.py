@@ -11,6 +11,8 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 from typing import Any, Mapping
 
+from . import binance_request_budget
+
 
 LOG = logging.getLogger(__name__)
 
@@ -202,11 +204,28 @@ def clear_rate_limits() -> None:
         _RATE_LIMIT_UNTIL.clear()
     with _USAGE_LOG_LOCK:
         _USAGE_LOG_STATE.clear()
+    binance_request_budget.clear()
+
+
+def is_local_request_deferred(error: BaseException | str | object) -> bool:
+    """Distinguish preventive local scheduling from an exchange rejection."""
+    current: object | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ApiError):
+            return current.api_code == "LOCAL_REQUEST_BUDGET"
+        if str(current).startswith("Binance REST deferred locally:"):
+            return True
+        current = (current.__cause__ or current.__context__) if isinstance(current, BaseException) else None
+    return False
 
 
 def is_rate_limit_error(error: BaseException | str | object) -> bool:
     """Recognize Binance IP throttling even after an exception was wrapped/stringified."""
 
+    if is_local_request_deferred(error):
+        return False
     current: object | None = error
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
@@ -299,6 +318,13 @@ def request_json(
                 retry_at=retry_at,
             )
         request = Request(url, data=data, headers=final_headers, method=request_method)
+        local_retry_at = binance_request_budget.reserve(request_method, url, body)
+        if local_retry_at > 0:
+            raise ApiError(
+                f"Binance REST deferred locally: preventive request budget; retry at {local_retry_at:.3f}",
+                retry_at=local_retry_at,
+                api_code="LOCAL_REQUEST_BUDGET",
+            )
         try:
             with urlopen(request, timeout=timeout) as response:
                 payload = response.read().decode("utf-8")
@@ -308,6 +334,7 @@ def request_json(
                     or getattr(response, "code", 0)
                     or 200
                 )
+            binance_request_budget.observe(url, response_headers)
             _observe_successful_weight(
                 url,
                 status=response_status,
@@ -315,6 +342,7 @@ def request_json(
             )
             break
         except HTTPError as error:
+            binance_request_budget.observe(url, getattr(error, "headers", {}) or {})
             detail = error.read().decode("utf-8", errors="replace")
             api_code = _response_api_code(detail)
             if error.code in {418, 429} or str(api_code or "") == "-1003":
@@ -354,7 +382,9 @@ def request_json(
                 continue
             raise ApiError(f"network error {method} {safe_url}: {error}") from error
     try:
-        return json.loads(payload) if payload else {}
+        result = json.loads(payload) if payload else {}
+        binance_request_budget.configure(url, result)
+        return result
     except json.JSONDecodeError as error:
         raise ApiError(f"invalid JSON from {method} {safe_url}: {payload[:500]}") from error
 
