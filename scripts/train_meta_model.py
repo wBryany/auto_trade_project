@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from btc_futures_bot.main import load_config
+from btc_futures_bot.costs import CostConfig
 from btc_futures_bot.strategy import MultiTimeframeStrategy, StrategyConfig
 from btc_futures_bot.trade_model.features import (
     FEATURE_NAMES,
@@ -106,7 +107,12 @@ def main() -> int:
     except (TypeError, ValueError) as error:
         raise SystemExit(f"invalid replay history window: {error}") from error
     strategy_mapping = dict(raw_config.get("strategy") or {})
-    strategy = MultiTimeframeStrategy(StrategyConfig(**strategy_mapping))
+    # The training data venue may differ from the deployment venue. Admission
+    # must nevertheless use the same selected execution costs as the engine.
+    active_exchange = str(raw_config.get("active_exchange") or "binance")
+    execution_exchange = dict((raw_config.get("exchanges") or {}).get(active_exchange) or {})
+    costs = CostConfig(**execution_exchange.get("costs", raw_config.get("costs", {})))
+    strategy = MultiTimeframeStrategy(StrategyConfig(**strategy_mapping), costs=costs)
     exchange = dict((raw_config.get("exchanges") or {}).get("binance") or {})
     symbol = str(args.symbol or exchange.get("symbol") or "BTCUSDT").upper()
     paths = {

@@ -22,6 +22,7 @@ from .strategy import (
     signal_stop_timeframe,
     signal_trade_management_overrides,
 )
+from .trade_model.features import REQUIRED_TIMEFRAMES
 
 
 _TIMEFRAME_MS = {
@@ -70,9 +71,24 @@ def run_backtest(
     use_fixed_take_profit: bool = False,
     entry_gate: Any = None,
 ) -> BacktestSummary:
-    strategy = strategy or MultiTimeframeStrategy(StrategyConfig())
+    if risk is None:
+        selected_costs = (
+            strategy.costs
+            if strategy is not None and getattr(strategy.config, "scalp_cost_filter_enabled", False)
+            else CostConfig(taker_fee_pct=fee_pct, slippage_pct=slippage_pct)
+        )
+        risk = RiskManager(RiskConfig(), costs=selected_costs)
+    strategy = strategy or MultiTimeframeStrategy(StrategyConfig(), costs=risk.costs)
+    if strategy.config.mode == "scalp_v2" and getattr(strategy.config, "scalp_cost_filter_enabled", False):
+        if strategy.costs != risk.costs:
+            raise ValueError("scalp cost admission and backtest execution must use identical costs")
+        required_history = ((int(strategy.config.hard_max_hold_seconds) + 59) // 60) * int(strategy.config.scalp_cost_lookback_windows)
+        if int(candle_limit) - 1 < required_history:
+            raise ValueError("candle_limit does not provide enough closed bars for scalp cost admission")
     trigger_timeframe = strategy.config.trigger_timeframe
     required_timeframes = list(dict.fromkeys((trigger_timeframe, "1m", strategy.config.regime_timeframe)))
+    if str(getattr(getattr(entry_gate, "config", None), "mode", "off")) in {"shadow", "enforce"}:
+        required_timeframes = list(dict.fromkeys((*required_timeframes, *REQUIRED_TIMEFRAMES)))
     bars: dict[str, list[Candle]] = {}
     for timeframe in required_timeframes:
         path = data_dir / f"{timeframe}.csv"
@@ -91,7 +107,6 @@ def run_backtest(
         timeframe: [item.timestamp for item in series]
         for timeframe, series in bars.items()
     }
-    risk = risk or RiskManager(RiskConfig(), costs=CostConfig(taker_fee_pct=fee_pct, slippage_pct=slippage_pct))
     equity = initial_equity
     peak_equity = equity
     max_drawdown = 0.0
@@ -278,7 +293,9 @@ def run_backtest(
                     holding_hours=held_seconds / 3600,
                 )
                 required_score = max(1, int(getattr(strategy.config, "reversal_min_score", 5)))
-                should_reverse = net_exit > 0 or signal.score >= required_score
+                should_reverse = net_exit > 0 or (
+                    strategy.config.mode != "scalp_v2" and signal.score >= required_score
+                )
                 if should_reverse:
                     pnl = risk.estimate_net_pnl(
                         position.side,

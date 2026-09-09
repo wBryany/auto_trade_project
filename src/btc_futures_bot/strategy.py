@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from math import isfinite
 from typing import Any, Iterator, Mapping, Sequence
 
+from .costs import CostConfig
+from .entry_costs import evaluate_scalp_cost_coverage
 from .indicators import atr, ema, macd, rsi, sma
 from .models import Candle, Position, Signal
 
@@ -101,6 +103,8 @@ class StrategyConfig:
     scalp_min_body_ratio: float = 0.35
     scalp_min_close_location: float = 0.6
     scalp_max_extension_atr: float = 1.5
+    scalp_cost_filter_enabled: bool = False
+    scalp_cost_lookback_windows: int = 6
     take_profit_r: float = 2.5
     atr_stop_multiplier: float = 1.4
     min_stop_loss_pct: float = 0.0025
@@ -497,8 +501,9 @@ def dynamic_stop_loss_pct(
 class MultiTimeframeStrategy:
     """Multi-timeframe signal generator with an explicit traditional mode."""
 
-    def __init__(self, config: StrategyConfig | None = None) -> None:
+    def __init__(self, config: StrategyConfig | None = None, *, costs: CostConfig | None = None) -> None:
         self.config = config or StrategyConfig()
+        self.costs = costs if costs is not None else CostConfig()
         if self.config.mode == "scalp_v2":
             for field_name in ("scalp_min_body_ratio", "scalp_min_close_location"):
                 value = getattr(self.config, field_name)
@@ -507,6 +512,12 @@ class MultiTimeframeStrategy:
             extension = self.config.scalp_max_extension_atr
             if not isfinite(extension) or extension <= 0.0:
                 raise ValueError("scalp_max_extension_atr must be positive and finite")
+            if self.config.scalp_cost_filter_enabled:
+                windows = self.config.scalp_cost_lookback_windows
+                if isinstance(windows, bool) or not isinstance(windows, int) or not 3 <= windows <= 12:
+                    raise ValueError("scalp_cost_lookback_windows must be an integer between 3 and 12")
+                if not isfinite(self.config.hard_max_hold_seconds) or self.config.hard_max_hold_seconds <= 0:
+                    raise ValueError("hard_max_hold_seconds must be positive and finite for scalp cost admission")
 
     def evaluate(self, candles_by_timeframe: Mapping[str, Sequence[Candle]]) -> Signal:
         if self.config.mode == "scalp_v2":
@@ -640,6 +651,33 @@ class MultiTimeframeStrategy:
         if rejections:
             return Signal("flat", score, timestamp, tuple(rejections))
 
+        cost_reasons: tuple[str, ...] = ()
+        if config.scalp_cost_filter_enabled:
+            coverage = evaluate_scalp_cost_coverage(
+                trigger_candles,
+                side,
+                config.hard_max_hold_seconds,
+                self.costs,
+                config.scalp_cost_lookback_windows,
+            )
+            if not coverage.allowed:
+                diagnostics = ":".join(
+                    f"{label}={value:.8f}" if value is not None else f"{label}=na"
+                    for label, value in (
+                        ("observed", coverage.observed_move_pct),
+                        ("latest", coverage.latest_move_pct),
+                        ("required", coverage.required_move_pct),
+                    )
+                )
+                return Signal(
+                    "flat", score, timestamp,
+                    (
+                        "scalp_v2_cost_blocked",
+                        f"scalp_v2_cost_detail:{coverage.reason}:{diagnostics}:horizon_bars={coverage.horizon_bars}:windows={coverage.lookback_windows}",
+                    ),
+                )
+            cost_reasons = ("scalp_v2_cost_coverage",)
+
         breakout = (
             trigger.previous_high is not None and trigger.close > trigger.previous_high
             if side == "long"
@@ -656,7 +694,7 @@ class MultiTimeframeStrategy:
                 "scalp_v2_1m_breakout" if breakout else "scalp_v2_1m_ema_reclaim",
                 "scalp_v2_1m_volume",
                 "scalp_v2_execution_quality",
-            ),
+            ) + cost_reasons,
         )
 
     def reevaluate_blocked_signal(

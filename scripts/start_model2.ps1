@@ -258,15 +258,20 @@ if (-not [bool]$status.running) {
 }
 
 $deadline = (Get-Date).AddSeconds(60)
+$lastCycleError = ""
 while ((Get-Date) -lt $deadline) {
     $status = Invoke-RestMethod "$serviceUrl/api/status" -TimeoutSec 10
     if ($status.running -and [double]$status.last_cycle_at -ge [double]$status.started_at) {
         if (-not [string]::IsNullOrWhiteSpace([string]$status.last_error)) {
-            throw "Model 2 first cycle failed: $($status.last_error)"
+            # A reconnect or minute-boundary history warmup can fail closed
+            # before the next valid cycle. Never report ready on that failure,
+            # but use the existing bounded startup window to await recovery.
+            $lastCycleError = [string]$status.last_error
+        } else {
+            Write-Host "Model 2 paper engine is running on $serviceUrl; first healthy cycle confirmed."
+            return
         }
-        Write-Host "Model 2 paper engine is running on $serviceUrl; first cycle confirmed."
-        return
     }
     Start-Sleep -Milliseconds 500
 }
-throw "Model 2 paper engine did not complete its first cycle within 60 seconds"
+throw "Model 2 paper engine did not complete a healthy cycle within 60 seconds. Last cycle error: $lastCycleError"

@@ -25,8 +25,19 @@ py -m btc_futures_bot.main --config config.example.json --once
 
 当前配置仅用于 OKX demo 行情下的 `paper` 本地撮合，不会向 OKX 发送测试网或实盘订单。`scalp_v2` 在引擎层禁止 `live`，包括通过 `shadow`/`off` 绕过模型审批的启动方式。
 
+OKX 连接已支持 WebSocket，2.0 配置启用 `exchanges.okx.websocket_enabled=true`：
+
+- `business` 连接订阅 `candle1m/candle5m/candle1H`；`public` 连接订阅 `mark-price/tickers`；`private` 连接登录后订阅账户、仓位和普通订单。demo 使用 `wspap.okx.com:8443`，production 使用 `ws.okx.com:8443`，不混用环境。[OKX v5 官方协议](https://www.okx.com/docs-v5/)
+- 首次启动/断线恢复时用 REST 补齐历史，再由 WS 推送维护；demo 的公开 REST 同样带 `x-simulated-trading:1`，确保历史与 demo WS 同一数据源，不混入 production 历史。只返回连续的已确认历史加当前形成中 K 线。WS 和启用流后的 REST fallback 都检查时效，陈旧/缺口/无效价格不能被补种操作或心跳伪装成新行情。用交易所时间加单调时钟校验，避免本机时钟漂移。
+- 私有订单频道没有初始快照，因此必须先读取完整 REST 账户、仓位、分页挂单基线。之后按实体更新时间合并推送，关闭订单/仓位不被迟到消息复活；重连或不确定状态先失效，再重新核对。基线最长每 60 秒更新，REST 中途失败不会在同一周期重新请求整套数据。
+- WS 空闲时发送文本 ping/pong，失败指数退避并限制重连频率；REST 使用有界超时和冷却，HTTP 或 OKX 业务限流会暂停重试。WS 减少正常行情轮询，但不绕过交易所 IP/区域/API Key 白名单限制；仍需合法可用的网络与匹配环境的凭据。
+- 页面每秒读取内存中的新鲜推送，明确显示 WS/REST 来源和陈旧状态。首次失败、并发刷新、配置切换不会重复创建流或触发请求风暴。`websocket_enabled=false` 可回到原 REST 模式；交易写接口仍保留 REST，当前 paper 不调用这些接口。
+
 - 5 分钟后满足扣费净盈利和最低 R 才软退出；10 分钟为硬退出阈值，无需盈利。paper 在下一次新收盘 1m K 线检查时执行，实际可能延迟约一根 K 线加轮询/数据延迟；止损可先发生。
 - ATR/结构止损范围 0.20%–0.30%，保留成本下限；按当前 taker/滑点假设，实际下限约 0.21%。目标 1.5R，扣费边际要求仍为 0.15%，不保证成交后有此收益。
+- 成本准入默认开启：以 10 分钟硬持仓周期切分最近 60 根闭合 1m K 线，得到 6 个不重叠窗口；每个窗口从首根开盘价计算对应方向的最大有利波幅。中位数和最新窗口都要超过“手续费＋滑点＋最低净收益”对应的价格门槛，当前多单约 0.2902%、空单约 0.2898%。这是历史活跃度过滤，不是预测，也不能保证未来覆盖成本；不能靠扩大理论止盈或止损通过它。缺少或不连续的历史拒绝入场。
+- 普通反向信号不能再凭统一的 5 分绕过净亏损保护反复换仓；原有止损、不利走势退出和硬时间退出仍可按风险规则亏损平仓。费用准入只影响新信号，不阻止既有仓位的风险退出。
+- 页面持仓保留毛浮盈，并另列预计平仓净盈亏、预计双边总成本和含费保本价。估算使用持仓原引擎费率及实际持有时间，不改写交易所账户余额；不是实际扣费账单。资金费仍按原持有时长模型估算，未模拟实际结算时点；缺合约面值的交易所张数仓位不猜测成本。
 - 异常波动需同时满足相对倍数和绝对 1m 振幅至少 0.15%，暂停 3 分钟；已排定的宏观事件窗口不变。操作日志显示实际振幅及本次恢复时间。
 - 亏损后冷却 1 分钟；仓位上限和亏损限额没有放宽。既有 `max_daily_loss_pct` 当前按进程累计损益检查（不是持久化、跨日账本），不应靠反复重启规避限额。
 
@@ -40,12 +51,12 @@ python .\scripts\download_binance_klines.py --symbol BTCUSDT --start 2025-09-01T
 按当前有效策略、风险和费用配置重放候选，训练模型并冻结验证集阈值：
 
 ```powershell
-python .\scripts\train_meta_model.py --config .\config.binance.model2.json --data-dir .\data\binance_meta_12m --output-dir .\artifacts\trade_model_2_0_scalp
+python .\scripts\train_meta_model.py --config .\config.binance.model2.json --data-dir .\data\binance_meta_12m --output-dir .\artifacts\trade_model_2_0_scalp_cost
 ```
 
 训练和实时推理共用同一特征实现。制品会校验特征顺序、模型文件、完整策略配置以及风险/费用/标签/历史窗口政策；任一指纹不一致都会拒绝加载。当前固定 TP/SL 三重障碍标签与实盘动态退出并不完全等价，因此生成的模型仅供 `paper` 对比，不会自动获得 `approved_for_live`。
 
-旧的 `meta-20250901-20260904-v1` 保留在 `artifacts/trade_model_2_0` 供审计，已不被当前配置引用；它的 90 分钟标签不能用于新超短线策略。新的 `artifacts/trade_model_2_0_scalp` 使用 10 根 1m K 线标签、99 根闭合历史窗口，重新生成候选并按时间隔离训练/验证/留出集。Binance 历史数据向 OKX 迁移、重叠候选、动态退出与固定标签差异，都需要后续 paper 成交验证；不能把候选分类指标当成账户回测收益。
+旧的 `meta-20250901-20260904-v1` 保留在 `artifacts/trade_model_2_0` 供审计，它的 90 分钟标签不能用于超短线策略；`artifacts/trade_model_2_0_scalp` 是修复成本准入前的版本，也已停止引用。当前 `artifacts/trade_model_2_0_scalp_cost` 使用 10 根 1m K 线标签、99 根闭合历史窗口及新成本准入，重新生成候选并按时间隔离训练/验证/留出集。训练使用部署交易所的有效费用，不把 Binance 数据源的费用误用于 OKX 部署；运行和回测会拒绝准入费用与执行费用不一致的配置。Binance 历史数据向 OKX 迁移、重叠候选、动态退出与固定标签差异，都需要后续 paper 成交验证；不能把候选分类指标当成账户回测收益。
 
 在独立端口启动 2.0 纸面交易：
 

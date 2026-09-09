@@ -37,6 +37,8 @@
     "scalp_min_body_ratio": 0.35,
     "scalp_min_close_location": 0.6,
     "scalp_max_extension_atr": 1.5,
+    "scalp_cost_filter_enabled": true,
+    "scalp_cost_lookback_windows": 6,
     "take_profit_r": 1.5,
     "atr_stop_multiplier": 1.4,
     "min_stop_loss_pct": 0.002,
@@ -100,7 +102,9 @@
       "enabled": true,
       "environment": "demo",
       "base_url": "https://openapi.okx.com",
-      "symbol": "BTC-USDT-SWAP"
+      "symbol": "BTC-USDT-SWAP",
+      "websocket_enabled": true,
+      "websocket_stale_seconds": 15.0
     },
     "binance": {
       "enabled": true,
@@ -123,8 +127,8 @@
   "trade_model": {
     "type": "lightgbm_meta",
     "mode": "shadow",
-    "artifact_path": "artifacts/trade_model_2_0_scalp/model.txt",
-    "manifest_path": "artifacts/trade_model_2_0_scalp/manifest.json",
+    "artifact_path": "artifacts/trade_model_2_0_scalp_cost/model.txt",
+    "manifest_path": "artifacts/trade_model_2_0_scalp_cost/manifest.json",
     "decision_log_path": "reports/okx_model2/model_decisions.sqlite3",
     "require_approved_for_live": true
   }

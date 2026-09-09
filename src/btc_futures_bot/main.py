@@ -449,10 +449,10 @@ def build_engine(
     notifier: EmailNotifier | None = None,
 ) -> TradingEngine:
     account = raw.get("account", {})
-    strategy = MultiTimeframeStrategy(StrategyConfig(**raw.get("strategy", {})))
     exchange_raw = raw["exchanges"][name]
     cost_raw = exchange_raw.get("costs", raw.get("costs", {}))
     costs = CostConfig(**cost_raw)
+    strategy = MultiTimeframeStrategy(StrategyConfig(**raw.get("strategy", {})), costs=costs)
     risk = RiskManager(RiskConfig(**raw.get("risk", {})), max_leverage=float(account.get("max_leverage", 3)), costs=costs)
     adapter = make_adapter(name, exchange_raw, account)
     selected_report_dir = report_directory(raw, name)

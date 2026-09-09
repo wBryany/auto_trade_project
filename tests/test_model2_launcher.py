@@ -178,3 +178,42 @@ def test_model2_restart_guard_is_fail_closed(
         assert error_fragment in result["error"]
     else:
         assert result["error"] == ""
+
+
+@pytest.mark.parametrize("recovers", [True, False])
+def test_model2_startup_waits_for_healthy_cycle_with_bounded_deadline(recovers):
+    source = (_REPOSITORY / "scripts/start_model2.ps1").read_text(encoding="utf-8-sig")
+    marker = "$deadline = (Get-Date).AddSeconds(60)"
+    block = marker + source.rsplit(marker, 1)[1]
+    encoded_block = base64.b64encode(block.encode("utf-16-le")).decode("ascii")
+    harness = r'''
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$serviceUrl = 'http://non-network.invalid:8788'
+$script:clock = 0
+$script:reads = 0
+function Get-Date { $script:clock += 5; return [datetime]::new(2020,1,1).AddSeconds($script:clock) }
+function Start-Sleep { param($Milliseconds) }
+function Write-Host { param($Object) }
+function Invoke-RestMethod {
+    param($Uri,$TimeoutSec)
+    $script:reads++
+    $message = if (RECOVERS -and $script:reads -ge 2) { '' } else { 'candle warmup pending' }
+    return [pscustomobject]@{running=$true;started_at=10;last_cycle_at=20;last_error=$message}
+}
+$block = [scriptblock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('ENCODED')))
+$errorText = ''
+try { & $block } catch { $errorText = $_.Exception.Message }
+[pscustomobject]@{reads=$script:reads;error=$errorText} | ConvertTo-Json -Compress
+'''.replace("RECOVERS", "$true" if recovers else "$false").replace("ENCODED", encoded_block)
+    command = base64.b64encode(harness.encode("utf-16-le")).decode("ascii")
+    result = subprocess.run([_POWERSHELL, "-NoProfile", "-NonInteractive", "-EncodedCommand", command],
+                            cwd=_REPOSITORY, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    if recovers:
+        assert payload == {"reads": 2, "error": ""}
+    else:
+        assert 2 < payload["reads"] < 20
+        assert "within 60 seconds" in payload["error"]
+        assert "candle warmup pending" in payload["error"]

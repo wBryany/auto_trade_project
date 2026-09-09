@@ -431,7 +431,7 @@ def main() -> None:
                 args.data_dir,
                 initial_equity=10_000.0,
                 candle_limit=int(raw.get("candle_limit", 300)),
-                strategy=MultiTimeframeStrategy(strategy_config),
+                strategy=MultiTimeframeStrategy(strategy_config, costs=costs),
                 risk=risk,
                 reporter=reporter,
                 use_fixed_take_profit=bool(candidate.get("fixed_take_profit", False)),

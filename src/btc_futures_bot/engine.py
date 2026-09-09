@@ -72,6 +72,13 @@ class TradingEngine:
                 "experimental scalp_v2 requires mode=paper; validated exchange-order "
                 "execution is required before enabling live or demo orders"
             )
+        if strategy.config.mode == "scalp_v2" and getattr(strategy.config, "scalp_cost_filter_enabled", False):
+            if getattr(strategy, "costs", None) != risk.costs:
+                raise ValueError("scalp cost admission and risk execution must use identical costs")
+            horizon_bars = (int(strategy.config.hard_max_hold_seconds) + 59) // 60
+            required_history = horizon_bars * int(strategy.config.scalp_cost_lookback_windows)
+            if int(config.candle_limit) - 1 < required_history:
+                raise ValueError("candle_limit does not provide enough closed bars for scalp cost admission")
         self.adapter = adapter
         self.strategy = strategy
         self.risk = risk
@@ -1791,6 +1798,11 @@ class TradingEngine:
         )
         if net_exit > 0:
             return True
+        if self.strategy.config.mode == "scalp_v2":
+            # All valid scalp_v2 signals score 5. That is not evidence strong
+            # enough to pay another round trip on an ordinary losing reversal.
+            # Adverse, hard-stop and hard-time exits remain independent.
+            return False
         required_score = max(1, int(getattr(self.strategy.config, "reversal_min_score", 5)))
         return signal.score >= required_score
 

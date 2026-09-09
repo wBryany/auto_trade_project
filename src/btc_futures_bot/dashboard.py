@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .costs import CostConfig
 from .engine import normalized_poll_seconds
 from .exchanges.factory import make_adapter
 from .http_client import ApiError, clear_rate_limits, is_rate_limit_error
@@ -28,6 +29,7 @@ from .main import (
 from .notifications import EmailNotificationConfig, EmailNotifier
 from .operation_log import OperationLogger
 from .reporting import TradeReporter
+from .risk import RiskManager
 
 LOG = logging.getLogger(__name__)
 
@@ -155,6 +157,83 @@ def _position_dict(
     }
 
 
+def _position_cost_view(
+    position: dict[str, Any],
+    costs: CostConfig | None,
+    *,
+    now_ms: int,
+    cost_source: str,
+    quantity_multiplier: float | None = 1.0,
+) -> dict[str, Any]:
+    """Add an estimated round-trip view without changing venue/gross fields."""
+    result = dict(position)
+    result.update({
+        "estimated_total_cost": None,
+        "estimated_net_pnl": None,
+        "estimated_net_pnl_pct": None,
+        "cost_break_even_price": None,
+        "estimated_costs_available": False,
+        "estimated_cost_source": cost_source,
+        "estimated_cost_error": "",
+    })
+    try:
+        if costs is None:
+            raise ValueError("成本配置不可用")
+        if quantity_multiplier is None or float(quantity_multiplier) <= 0:
+            raise ValueError("缺少合约面值，无法将张数转换为基础币数量")
+        side = str(position.get("side") or "")
+        entry = float(position.get("entry_price") or 0)
+        mark = float(position.get("mark_price") or 0)
+        quantity = abs(float(position.get("quantity") or 0)) * float(quantity_multiplier)
+        if side not in {"long", "short"} or not all(
+            math.isfinite(value) and value > 0 for value in (entry, mark, quantity)
+        ):
+            raise ValueError("持仓方向、价格或数量不可用于估算")
+        rates = (costs.fee_pct, costs.slippage_pct, costs.funding_rate_pct_per_8h)
+        if not all(math.isfinite(value) and value >= 0 for value in rates) or sum(rates[:2]) >= 1:
+            raise ValueError("成本费率不可用于估算")
+        opened_at = float(position.get("opened_at") or 0)
+        actual_hold = math.isfinite(opened_at) and opened_at > 0
+        holding_hours = max(0.0, (now_ms - opened_at) / 3_600_000) if actual_hold else costs.expected_holding_hours
+        breakdown = costs.breakdown(entry, mark, quantity, holding_hours=holding_hours)
+        net = costs.estimate_net_pnl(side, entry, mark, quantity, holding_hours=holding_hours)
+        result.update({
+            "estimated_total_cost": breakdown.total_cost,
+            "estimated_trading_fee": breakdown.trading_fee,
+            "estimated_slippage_cost": breakdown.slippage_cost,
+            "estimated_funding_fee": breakdown.funding_fee,
+            "estimated_net_pnl": net,
+            "estimated_net_pnl_pct": net / (entry * quantity),
+            "cost_break_even_price": RiskManager(costs=costs).break_even_price(side, entry, holding_hours=holding_hours),
+            "estimated_costs_available": True,
+            "estimated_holding_hours": holding_hours,
+            "estimated_holding_source": "actual_open_time" if actual_hold else "configured_expected_hold",
+        })
+    except (TypeError, ValueError, ZeroDivisionError, OverflowError) as error:
+        result["estimated_cost_error"] = str(error)
+    return result
+
+
+def _cost_assumptions_view(costs: CostConfig | None, source: str, *, error: str = "") -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "available": costs is not None,
+        "source": source,
+        "estimated_only": True,
+        "error": error,
+        "note": "含开仓和平仓费用，按标记价估算；不是交易所实扣，不修改账户余额。资金费为持仓时长估算，未按实际结算时点核对。",
+    }
+    if costs is not None:
+        result.update({
+            "execution": costs.execution,
+            "fee_pct_per_side": costs.fee_pct,
+            "slippage_pct_per_side": costs.slippage_pct,
+            "round_trip_pct_excluding_funding": costs.round_trip_pct,
+            "funding_rate_pct_per_8h": costs.funding_rate_pct_per_8h,
+            "expected_holding_hours": costs.expected_holding_hours,
+        })
+    return result
+
+
 def _mark_to_market_view(
     snapshot: dict[str, Any],
     symbol: str,
@@ -212,6 +291,7 @@ class DashboardService:
         self._snapshot_at = 0.0
         self._private_snapshot_at = 0.0
         self._snapshot_refreshing = False
+        self._snapshot_generation = 0
         self._snapshot_condition = threading.Condition(self._lock)
         self._dashboard_adapter: Any = None
         self._dashboard_adapter_key: tuple[str, str, str, str] | None = None
@@ -437,8 +517,8 @@ class DashboardService:
             self._exchange_snapshot = {}
             self._snapshot_at = 0
             self._private_snapshot_at = 0
-            self._dashboard_adapter = None
-            self._dashboard_adapter_key = None
+            self._snapshot_generation = getattr(self, "_snapshot_generation", 0) + 1
+            self._close_dashboard_adapter()
             after = self.config_view()
         tracked = ("exchange", "mode", "symbol", "environment", "base_url", "poll_seconds", "paper_equity", "max_leverage", "stop_loss_pct", "risk_per_trade", "max_notional_pct", "min_score", "take_profit_r", "volume_sma_period", "min_volume_ratio", "require_full_alignment", "email_notifications")
         changed = {
@@ -492,13 +572,7 @@ class DashboardService:
             # engine was stopped. Binance returns the same active listenKey
             # for the account, so close that stream before creating the engine
             # stream; closing it afterwards would invalidate the new stream.
-            dashboard_adapter = self._dashboard_adapter
-            if dashboard_adapter is not None:
-                close_dashboard_adapter = getattr(dashboard_adapter, "close", None)
-                if close_dashboard_adapter is not None:
-                    close_dashboard_adapter()
-                self._dashboard_adapter = None
-                self._dashboard_adapter_key = None
+            self._close_dashboard_adapter()
             self.reporter = TradeReporter(
                 report_directory(config, exchange_name),
                 config.get("report_timezone", "Asia/Shanghai"),
@@ -704,20 +778,23 @@ class DashboardService:
             poll = normalized_poll_seconds(self.engine.config.poll_seconds) if self.engine else 15
             stop_event.wait(max(float(poll), rate_limit_wait))
 
+    def _close_dashboard_adapter(self) -> None:
+        """Retire only the dashboard-owned transport, never the engine owner.
+
+        Callers hold _lock so retirement and replacement cannot race with a
+        concurrent status request constructing another stream group.
+        """
+        adapter = self._dashboard_adapter
+        engine_adapter = getattr(getattr(self, "engine", None), "adapter", None)
+        if adapter is not None and adapter is not engine_adapter:
+            close_adapter = getattr(adapter, "close", None)
+            if callable(close_adapter):
+                close_adapter()
+        self._dashboard_adapter = None
+        self._dashboard_adapter_key = None
+
     def _adapter(self, config: dict[str, Any], exchange_name: str) -> Any:
         expected = config.get("exchanges", {}).get(exchange_name, {})
-        if self.engine and self.engine.adapter.name == exchange_name:
-            settings = self.engine.adapter.settings
-            same_configuration = (
-                str(settings.environment).strip().lower()
-                == str(expected.get("environment", "")).strip().lower()
-                and str(settings.base_url).rstrip("/")
-                == str(expected.get("base_url", "")).rstrip("/")
-                and str(settings.symbol).strip().upper()
-                == str(expected.get("symbol", "")).strip().upper()
-            )
-            if same_configuration:
-                return self.engine.adapter
         key = (
             exchange_name,
             str(expected.get("environment", "")).strip().lower(),
@@ -725,20 +802,27 @@ class DashboardService:
             str(expected.get("symbol", "")).strip().upper(),
         )
         with self._lock:
+            if self.engine and self.engine.adapter.name == exchange_name:
+                settings = self.engine.adapter.settings
+                same_configuration = (
+                    str(settings.environment).strip().lower()
+                    == str(expected.get("environment", "")).strip().lower()
+                    and str(settings.base_url).rstrip("/")
+                    == str(expected.get("base_url", "")).rstrip("/")
+                    and str(settings.symbol).strip().upper()
+                    == str(expected.get("symbol", "")).strip().upper()
+                )
+                if same_configuration:
+                    return self.engine.adapter
             if self._dashboard_adapter is not None and self._dashboard_adapter_key == key:
                 return self._dashboard_adapter
-        # A stopped dashboard only needs a read-only market/account adapter.
-        # Building a full engine here would also load the meta model and open
-        # its decision-log SQLite connection, then immediately discard it.
-        adapter = make_adapter(
-            exchange_name,
-            expected,
-            dict(config.get("account") or {}),
-        )
-        with self._lock:
+            self._close_dashboard_adapter()
+            # Construction starts only one dashboard-owned stream group, even
+            # if several browser tabs request status simultaneously.
+            adapter = make_adapter(exchange_name, expected, dict(config.get("account") or {}))
             self._dashboard_adapter = adapter
             self._dashboard_adapter_key = key
-        return adapter
+            return adapter
 
     def _market_snapshot(self, config: dict[str, Any], exchange_name: str) -> dict[str, Any]:
         snapshot_seconds = max(5.0, float(config.get("dashboard_snapshot_seconds", 15)))
@@ -750,7 +834,16 @@ class DashboardService:
                 self._snapshot_condition.wait(timeout=10)
                 if self._exchange_snapshot:
                     return self._exchange_snapshot
+                # The original owner may still be waiting on its I/O. Do not
+                # create a second REST refresh after timeout/spurious wakeup.
+                message = "行情/账户快照仍在刷新，暂不可用"
+                return {
+                    "market": {"stale": True}, "positions": [], "open_orders": [],
+                    "private_available": False, "private_error": message,
+                    "snapshot_error": message,
+                }
             self._snapshot_refreshing = True
+            generation = getattr(self, "_snapshot_generation", 0)
         try:
             adapter = self._adapter(config, exchange_name)
             fetch_snapshot = getattr(adapter, "fetch_dashboard_snapshot_nonblocking", None)
@@ -761,6 +854,9 @@ class DashboardService:
             )
             self._handle_snapshot_alerts(snapshot, config, exchange_name)
             with self._snapshot_condition:
+                if generation != getattr(self, "_snapshot_generation", 0):
+                    return {"market": {"stale": True}, "private_available": False,
+                            "positions": [], "open_orders": [], "private_error": "配置已变更，等待新快照"}
                 now = time.time()
                 private_now = time.monotonic()
                 previous = self._exchange_snapshot
@@ -775,7 +871,7 @@ class DashboardService:
                     and last_private_at > 0
                     and private_now - last_private_at <= stale_limit
                 )
-                if snapshot.get("private_available"):
+                if snapshot.get("private_available") and not snapshot.get("private_stale") and not snapshot.get("private_error"):
                     self._private_snapshot_at = private_now
                 elif preserve_private:
                     error_message = str(snapshot.get("private_error") or "私有 API 暂时不可用")
@@ -788,7 +884,7 @@ class DashboardService:
                     stale["private_stale"] = True
                     stale["private_error"] = ""
                     stale["private_warning"] = (
-                        "Binance 私有网络短暂波动，暂时显示最近一次成功账户快照"
+                        f"{exchange_name.upper()} 私有网络短暂波动，暂时显示最近一次成功账户快照"
                     )
                     stale["private_snapshot_at"] = last_private_at
                     stale["snapshot_error"] = error_message
@@ -803,8 +899,9 @@ class DashboardService:
                 exchange_name,
             )
             with self._snapshot_condition:
-                if not self._exchange_snapshot:
-                    raise
+                if generation != getattr(self, "_snapshot_generation", 0):
+                    return {"market": {"stale": True}, "private_available": False,
+                            "positions": [], "open_orders": [], "private_error": "配置已变更，等待新快照"}
                 now = time.time()
                 private_now = time.monotonic()
                 stale = dict(self._exchange_snapshot)
@@ -823,7 +920,7 @@ class DashboardService:
                 stale["private_stale"] = preserve_private
                 if preserve_private:
                     stale["private_warning"] = (
-                        "Binance 网络短暂波动，暂时显示最近一次成功账户快照"
+                        f"{exchange_name.upper()} 网络短暂波动，暂时显示最近一次成功账户快照"
                     )
                     stale["private_error"] = ""
                 else:
@@ -863,11 +960,21 @@ class DashboardService:
                 refreshed.update(live_snapshot)
                 if "order_limits" not in live_snapshot and "order_limits" in snapshot:
                     refreshed["order_limits"] = snapshot["order_limits"]
-                refreshed.pop("private_stale", None)
-                refreshed.pop("private_warning", None)
-                refreshed.pop("snapshot_error", None)
+                fresh_private = (
+                    bool(live_snapshot.get("private_available"))
+                    and not live_snapshot.get("private_stale")
+                    and not live_snapshot.get("private_error")
+                    and all(name in live_snapshot for name in ("account", "positions", "open_orders"))
+                )
+                if fresh_private:
+                    for name in ("private_stale", "private_warning", "private_error"):
+                        if name not in live_snapshot:
+                            refreshed.pop(name, None)
+                    if not (live_snapshot.get("market") or {}).get("stale") and "snapshot_error" not in live_snapshot:
+                        refreshed.pop("snapshot_error", None)
                 market = dict(refreshed.get("market") or {})
-                market.pop("stale", None)
+                # Replacement market data carries its own freshness contract;
+                # explicit stale flags from a disconnected stream survive.
                 refreshed["market"] = market
                 return refreshed
             fetch_live_market = getattr(adapter, "fetch_live_market_snapshot", None)
@@ -888,7 +995,8 @@ class DashboardService:
         refreshed = dict(snapshot)
         market = dict(snapshot.get("market") or {})
         market.update(live_market)
-        market.pop("stale", None)
+        if "stale" not in live_market:
+            market.pop("stale", None)
         refreshed["market"] = market
         return refreshed
 
@@ -942,6 +1050,19 @@ class DashboardService:
         config = self._config()
         exchange_name = self._exchange(config)
         exchange_config = config.get("exchanges", {}).get(exchange_name, {})
+        engine_costs = (
+            getattr(getattr(self.engine, "risk", None), "costs", None)
+            if self.engine is not None and getattr(self.engine, "position", None) is not None
+            else None
+        )
+        cost_source = "managed_engine" if engine_costs is not None else "configured_exchange"
+        cost_error = ""
+        try:
+            costs = engine_costs if engine_costs is not None else CostConfig(**exchange_config.get("costs", config.get("costs", {})))
+        except (TypeError, ValueError) as error:
+            costs = None
+            cost_error = str(error)
+        cost_assumptions = _cost_assumptions_view(costs, cost_source, error=cost_error)
         try:
             snapshot = self._market_snapshot(config, exchange_name)
             snapshot = self._with_live_market(config, exchange_name, snapshot)
@@ -967,7 +1088,23 @@ class DashboardService:
             if snapshot.get("private_stale"):
                 position["source"] = "exchange_stale"
         if paper_position:
+            paper_position = _position_cost_view(
+                paper_position, costs, now_ms=int(time.time() * 1000), cost_source=cost_source,
+            )
             positions = [paper_position]
+        else:
+            # Exchange snapshots do not necessarily use base-asset quantities.
+            # OKX exposes contract counts: never assume one contract is one BTC.
+            for index, position in enumerate(positions):
+                multiplier: float | None = 1.0
+                if exchange_name in {"okx", "gate"}:
+                    multiplier = position.get("contract_size") or exchange_config.get("contract_size") or None
+                    if str(position.get("symbol") or exchange_config.get("symbol")) != str(exchange_config.get("symbol")):
+                        multiplier = None
+                positions[index] = _position_cost_view(
+                    position, costs, now_ms=int(time.time() * 1000),
+                    cost_source=cost_source, quantity_multiplier=multiplier,
+                )
         if account:
             account["source"] = (
                 "exchange_stale" if snapshot.get("private_stale") else "exchange"
@@ -1072,7 +1209,9 @@ class DashboardService:
             "last_cycle_at": last_cycle_at,
             "last_error": last_error,
             "connection": {
-                "market": bool(snapshot.get("market")),
+                "market": bool(snapshot.get("market")) and not bool((snapshot.get("market") or {}).get("stale")),
+                "market_source": (snapshot.get("market") or {}).get("price_source", ""),
+                "market_stream": snapshot.get("market_stream", {}),
                 "private": bool(snapshot.get("private_available"))
                 and not bool(snapshot.get("private_stale"))
                 and not bool(snapshot.get("private_error")),
@@ -1086,6 +1225,7 @@ class DashboardService:
             "account": account,
             "order_sizing": _order_sizing_view(config, snapshot, account),
             "positions": positions,
+            "cost_assumptions": cost_assumptions,
             "open_orders": snapshot.get("open_orders", []),
             "signal": {
                 "side": signal.side,
@@ -1373,9 +1513,28 @@ const originalRenderStatus=renderStatus;renderStatus=function(s){originalRenderS
 loadReports=async function(){try{const q=new URLSearchParams();if($('fromDate').value)q.set('from',$('fromDate').value);if($('toDate').value)q.set('to',$('toDate').value);if($('reportExchange').value)q.set('exchange',$('reportExchange').value);q.set('scope',reportScope);const d=await api('/api/reports?'+q.toString()),s=d.stats;$('statTrades').textContent=s.trades;$('statWinRate').textContent=s.trades?`${(s.wins/s.trades*100).toFixed(2)}%`:'0%';$('statGross').innerHTML=pnl(s.gross_pnl);$('statCost').innerHTML=num(s.total_cost);$('statNet').innerHTML=pnl(s.net_pnl);$('tradesBody').innerHTML=d.trades.length?d.trades.map(r=>`<tr><td>${esc(formatBeijing(r.entry_time))}</td><td>${esc(formatBeijing(r.exit_time))}</td><td>${esc(r.exchange)}</td><td>${esc(r.exchange_environment_label)}</td><td>${esc(r.side)}</td><td>${num(r.entry_price,2)}</td><td>${num(r.exit_price,2)}</td><td>${num(r.quantity,5)}</td><td>${pnl(r.gross_pnl)}</td><td>${num(r.trading_fee)}</td><td>${num(r.total_cost)}</td><td>${pnl(r.net_pnl)}</td><td>${pct(r.net_pnl_pct)}</td><td>${pct(r.fee_ratio_pct)}</td><td>${esc(r.exit_reason)}</td></tr>`).join(''):'<tr><td colspan="15" class="empty">暂无交易记录</td></tr>';$('dailyBody').innerHTML=summaryRows(d.daily);$('monthlyBody').innerHTML=summaryRows(d.monthly)}catch(e){toast(e.message)}};
 document.querySelectorAll('#reportScopeButtons button').forEach(button=>{button.onclick=()=>{reportScope=button.dataset.scope;document.querySelectorAll('#reportScopeButtons button').forEach(item=>item.classList.toggle('active',item===button));loadReports()}});$('reportBtn').onclick=loadReports;loadReports();
 if($('stopLoss'))$('stopLoss').insertAdjacentHTML('afterend','<div id="dynamicStopNote" class="note">动态止损使用当前策略的 ATR 与上下限；页面止损比例是 ATR 不可用时的备用值。</div>');
-if($('stopLoss'))$('stopLoss').insertAdjacentHTML('afterend','<div class="note">费用保护：按吃单 0.05% 双边、滑点 0.02%估算；反向信号不会在手续费后亏损时频繁平仓，除非出现满分强反转。</div>');
+if($('stopLoss'))$('stopLoss').insertAdjacentHTML('afterend','<div id="configuredCostNote" class="note">费用为配置估算值，开仓价不等于含费保本价。</div>');
 const modelAwareRenderStatus=renderStatus;renderStatus=function(s){modelAwareRenderStatus(s);const m=s.trade_model||{};const ready=Boolean(m.ready);const threshold=m.threshold===null||m.threshold===undefined?'—':Number(m.threshold).toFixed(4);const approval=m.approved_for_live?'<span class="positive">已通过 live 审批</span>':'<span class="neutral">尚未通过 live 审批</span>';const modeHelp=m.mode==='shadow'?'旁路评分，不拦截开仓':m.mode==='enforce'?'参与开仓过滤':'模型已关闭';$('tradeModelBox').innerHTML=`模式：<b>${esc(m.mode||'off')}</b>（${modeHelp}） · 状态：<span class="${ready?'positive':'neutral'}">${ready?'就绪':'未就绪'}</span><br>版本：${esc(m.model_version||'—')} · 阈值：${threshold}<br>${approval}${m.error?`<br><span class="negative">${esc(m.error)}</span>`:''}`;const sig=s.signal;if(sig&&sig.meta_decision){const score=Number(sig.meta_score).toFixed(4);const signalThreshold=Number(sig.meta_threshold).toFixed(4);const decisionHelp=String(sig.meta_decision).startsWith('shadow_')?'（仅评分，主策略仍可开仓）':'';$('signalBox').insertAdjacentHTML('beforeend',`<br>模型：${esc(sig.meta_decision)}${decisionHelp} · 评分=${score} / ${signalThreshold}`)}};
 const emailAwareRenderStatus=renderStatus;renderStatus=function(s){emailAwareRenderStatus(s);const e=s.email_notifications||{};if($('emailState'))$('emailState').textContent=`邮件：${e.enabled?'已启用':'未启用'} · ${e.ready?'发送就绪':'配置未就绪'} · 收件人 ${e.recipients_count||0}/5${e.last_error?' · 最近错误：'+e.last_error:''}`};
 const scalpAwareRenderStatus=renderStatus;renderStatus=function(s){scalpAwareRenderStatus(s);const st=s.strategy||{};const label=st.mode==='scalp_v2'?'分钟级超短线 2.0':(st.mode||'—');const horizon=st.enable_time_exit?` · 获利时间退出 ${Number(st.max_hold_seconds||0)/60} 分钟 / 硬上限 ${Number(st.hard_max_hold_seconds||0)/60} 分钟`:'';$('tradeModelBox').insertAdjacentHTML('afterbegin',`主策略：<b>${esc(label)}</b> · ${esc(st.trigger_timeframe||'—')} 入场 / ${esc(st.regime_timeframe||'—')} 背景${esc(horizon)}<br>`);if($('dynamicStopNote')&&st.min_stop_loss_pct!==null&&st.min_stop_loss_pct!==undefined)$('dynamicStopNote').textContent=`动态止损：${st.trigger_timeframe||'当前周期'} ATR × ${st.atr_stop_multiplier}，限制在 ${Number(st.min_stop_loss_pct*100).toFixed(2)}%～${Number(st.max_stop_loss_pct*100).toFixed(2)}%；止损比例是 ATR 不可用时的备用值。`};
 const retainedPositionRenderStatus=renderStatus;renderStatus=function(s){retainedPositionRenderStatus(s);if(s.paper_position_retained){$('runtimeNotice').textContent='引擎已暂停，模拟仓位保留在当前进程；点击启动继续管理，平仓前请勿关闭服务或修改配置。';$('runtimeNotice').className='notice'}else if(s.stop_pending){$('runtimeNotice').textContent='当前交易周期仍在停止中，状态尚未清理；请稍后再次停止，勿直接结束进程。';$('runtimeNotice').className='notice'}};
+const positionCostTable=$('positionsBody').closest('table');
+positionCostTable.querySelector('thead tr').children[5].textContent='毛浮盈';
+positionCostTable.closest('.table-wrap').insertAdjacentHTML('beforebegin','<div id="positionCostNote" class="note">正在读取费用估算…</div>');
+$('unrealized').closest('.metric').querySelector('.eyebrow').textContent='毛浮盈（未扣费用）';
+const costAwareRenderStatus=renderStatus;renderStatus=function(s){
+  costAwareRenderStatus(s);
+  const header=positionCostTable.querySelector('thead tr');
+  const grossRatioHeader=header.querySelector('[data-pnl-pct]');if(grossRatioHeader)grossRatioHeader.textContent='毛浮盈比例';
+  if(!header.querySelector('[data-net-pnl]'))header.insertAdjacentHTML('beforeend','<th data-net-pnl>预计平仓净盈亏</th><th>预计双边总成本</th><th>含费保本价</th>');
+  const positions=s.positions||[],rows=[...$('positionsBody').querySelectorAll('tr')];
+  if(!positions.length){const cell=rows[0]?.querySelector('td');if(cell)cell.colSpan=12}
+  positions.forEach((p,index)=>{const row=rows[index];if(!row)return;const ready=p.estimated_costs_available===true;const missing=`<span title="${esc(p.estimated_cost_error||'费用估算不可用')}">—</span>`;row.insertAdjacentHTML('beforeend',`<td>${ready?`${pnl(p.estimated_net_pnl)}<br><span class="small">${pct(p.estimated_net_pnl_pct)}</span>`:missing}</td><td>${ready?num(p.estimated_total_cost,4):missing}</td><td>${ready?num(p.cost_break_even_price,4):missing}</td>`)});
+  const c=s.cost_assumptions||{};const basis=c.source==='managed_engine'?'持仓原引擎':'当前平台配置';let note=c.available?`费用估算（${basis}）：单边手续费 ${pct(c.fee_pct_per_side)} + 单边滑点 ${pct(c.slippage_pct_per_side)}；双边合计约 ${pct(c.round_trip_pct_excluding_funding)}（不含资金费）。毛浮盈未扣成本；预计净盈亏包含开仓和平仓成本，不是交易所实扣，不修改账户余额。`:`费用估算不可用：${c.error||'等待有效配置'}。毛浮盈未扣费用。`;
+  if(c.available)note+='资金费按持仓时长估算，未按实际结算时点核对。';
+  if(positions.some(p=>p.estimated_holding_source==='configured_expected_hold'))note+='未提供开仓时间的交易所仓位使用配置持仓时长估算。';
+  if(positions.some(p=>!p.estimated_costs_available))note+='部分仓位缺少价格、数量或合约面值，费用栏显示 —。';
+  $('positionCostNote').textContent=note;if($('configuredCostNote'))$('configuredCostNote').textContent=note;
+};
+const streamAwareRenderStatus=renderStatus;renderStatus=function(s){streamAwareRenderStatus(s);const c=s.connection||{},m=s.market||{};const source=c.market_source||m.price_source||'未就绪';const transport=c.market_stream||{};const ws=typeof transport.connected==='boolean'?` · WS ${transport.connected?'已连接':'未连接'}`:'';$('connectionBox').insertAdjacentHTML('beforeend',`<br><span class="small">行情来源：${esc(source)}${esc(ws)} · 私有来源：${esc(c.private_source||'未就绪')}</span>`);if(c.private_warning&&!c.private_stale)$('connectionBox').insertAdjacentHTML('beforeend',`<br><span class="neutral">${esc(c.private_warning)}</span>`);};
 </script></body></html>"""

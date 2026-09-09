@@ -36,6 +36,8 @@ def test_shipped_scalp_profile_has_matched_short_horizon(profile):
     assert strategy.mode == "scalp_v2"
     assert (strategy.trigger_timeframe, strategy.regime_timeframe) == ("1m", "5m")
     assert strategy.enable_time_exit
+    assert strategy.scalp_cost_filter_enabled
+    assert strategy.scalp_cost_lookback_windows == 6
     assert (strategy.max_hold_seconds, strategy.hard_max_hold_seconds) == (300, 600)
     assert policy["history_window"]["closed_history_limit"] == 99
     assert policy["labeling"]["barrier_config"]["horizon_bars"] == 10
@@ -80,7 +82,8 @@ def test_shipped_model_shadow_allows_real_scalp_paper_entry(profile, tmp_path, s
     gate = EntryGate(MetaModelConfig.from_mapping(profile, tmp_path))
     try:
         assert gate.status()["ready"], gate.status()["error"]
-        closes = [100 + .03 * i + (.12 if i % 2 == 0 else -.12) for i in range(40)]
+        closes = [100 + .03 * i + (.12 if i % 2 == 0 else -.12) for i in range(80)]
+        final_close = closes[-1] + .65
         asof = 1_780_002_000_000
         market = {}
         for name, interval in (("1m", 60_000), ("5m", 300_000), ("1h", 3_600_000)):
@@ -88,12 +91,12 @@ def test_shipped_model_shadow_allows_real_scalp_paper_entry(profile, tmp_path, s
             bars = []
             for i, close in enumerate(closes):
                 opening = closes[i - 1] if i else close
-                bars.append(Candle(last_closed - (40 - i) * interval, opening,
+                bars.append(Candle(last_closed - (80 - i) * interval, opening,
                                    max(opening, close) + .03, min(opening, close) - .03,
                                    close, 10))
-            bars.append(Candle(last_closed, closes[-1], 101.73, closes[-1] - .03, 101.7, 15))
+            bars.append(Candle(last_closed, closes[-1], final_close + .03, closes[-1] - .03, final_close, 15))
             # Adapter includes one forming bar, which the engine must drop.
-            bars.append(Candle(last_closed + interval, 101.7, 101.73, 101.67, 101.7, 10))
+            bars.append(Candle(last_closed + interval, final_close, final_close + .03, final_close - .03, final_close, 10))
             if side == "short":
                 bars = [replace(c, open=200-c.open, high=200-c.low,
                                 low=200-c.high, close=200-c.close) for c in bars]
@@ -110,7 +113,7 @@ def test_shipped_model_shadow_allows_real_scalp_paper_entry(profile, tmp_path, s
                 pytest.fail("paper must never submit an exchange order")
 
         engine = TradingEngine(
-            PaperOnlyAdapter(), MultiTimeframeStrategy(StrategyConfig(**profile["strategy"])),
+            PaperOnlyAdapter(), MultiTimeframeStrategy(StrategyConfig(**profile["strategy"]), costs=CostConfig(**profile["costs"])),
             RiskManager(RiskConfig(**profile["risk"]), costs=CostConfig(**profile["costs"])),
             EngineConfig(mode="paper", candle_limit=100, take_profit_r=1.5), entry_gate=gate,
         )

@@ -51,6 +51,10 @@ _BARRIER_FIELDS = (
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
 IMPLEMENTATION_SOURCE_PATHS: dict[str, Path] = {
+    "src/btc_futures_bot/entry_costs.py": _PACKAGE_DIR.parent / "entry_costs.py",
+    "src/btc_futures_bot/costs.py": _PACKAGE_DIR.parent / "costs.py",
+    "src/btc_futures_bot/risk.py": _PACKAGE_DIR.parent / "risk.py",
+    "src/btc_futures_bot/backtest.py": _PACKAGE_DIR.parent / "backtest.py",
     "src/btc_futures_bot/strategy.py": _PACKAGE_DIR.parent / "strategy.py",
     "src/btc_futures_bot/engine.py": _PACKAGE_DIR.parent / "engine.py",
     "src/btc_futures_bot/trade_model/features.py": _PACKAGE_DIR / "features.py",
