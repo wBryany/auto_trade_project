@@ -96,6 +96,7 @@ class TradingEngine:
         self._live_preflight_completed = False
         self._last_saved_live_position: Position | None = None
         self._last_live_management_save_at = 0.0
+        self._pending_live_exit: dict[str, Any] | None = None
         self.unmanaged_live_position = self._load_unmanaged_live_position()
         self._managed_live_position_state = self._load_managed_live_position()
         self._last_live_reconciliation_at = 0.0
@@ -135,6 +136,7 @@ class TradingEngine:
             # The exchange is flat, so a previously saved managed position is
             # historical and must not be eligible for a later restart.
             self._managed_live_position_state = None
+            self._pending_live_exit = None
             self._save_live_reconciliation_state()
         self._live_preflight_completed = True
         return self.live_preflight
@@ -186,6 +188,17 @@ class TradingEngine:
             self.last_position_candle_timestamp = int(
                 state.get("last_position_candle_timestamp") or 0
             )
+            pending = state.get("pending_exit")
+            if isinstance(pending, dict) and pending.get("request_not_sent") is True:
+                if (
+                    pending.get("position_identity") == self._live_exit_position_identity(self.position)
+                    and isinstance(pending.get("exit_reason"), str)
+                    and pending["exit_reason"]
+                    and math.isfinite(float(pending.get("decision_price", 0)))
+                    and float(pending.get("decision_price", 0)) > 0
+                    and math.isfinite(float(pending.get("retry_at", 0)))
+                ):
+                    self._pending_live_exit = dict(pending)
         except (KeyError, TypeError, ValueError) as error:
             raise RuntimeError(f"saved managed position is invalid: {error}") from error
 
@@ -810,6 +823,7 @@ class TradingEngine:
     def _reconcile_binance_live_position(self, candle: Any) -> None:
         remote = self.adapter.fetch_live_position()
         if self.position is None:
+            self._clear_pending_live_exit()
             if remote is not None:
                 self._observe_unmanaged_live_position(remote)
                 raise RuntimeError(
@@ -821,10 +835,19 @@ class TradingEngine:
         position = self.position
         if remote is not None:
             if remote.get("side") != position.side:
+                self._clear_pending_live_exit()
                 raise RuntimeError("Binance position side differs from local engine state")
             remote_quantity = float(remote.get("quantity") or 0)
             if abs(remote_quantity - position.quantity) > max(1e-12, position.quantity * 0.001):
+                self._clear_pending_live_exit()
                 raise RuntimeError("Binance position quantity differs from local engine state")
+            if self._matching_pending_live_exit() is not None:
+                remote_entry = float(remote.get("entry_price") or 0)
+                if remote_entry <= 0 or not math.isclose(
+                    remote_entry, position.entry_price, rel_tol=1e-8, abs_tol=1e-8,
+                ):
+                    self._clear_pending_live_exit()
+                    raise RuntimeError("Binance entry price differs from deferred exit position")
             if not position.stop_order_id:
                 try:
                     rollback_payload = self.adapter.emergency_close(
@@ -867,6 +890,9 @@ class TradingEngine:
     def _finalize_binance_live_position_closed(self, candle: Any) -> None:
         """Record a Binance exit after a caller has already confirmed it is flat."""
 
+        # Venue flatness invalidates any unsent close even if optional history
+        # reconciliation below fails; never carry it into another exposure.
+        self._clear_pending_live_exit()
         if self.position is None:
             return
         # The venue is flat while the engine still has a position. The hard
@@ -1195,11 +1221,17 @@ class TradingEngine:
             ),
             "position_equity_before": self.position_equity_before,
             "last_position_candle_timestamp": self.last_position_candle_timestamp,
+            "pending_exit": (
+                self._pending_live_exit
+                if self._pending_live_exit and self._pending_live_exit.get("position_identity")
+                == self._live_exit_position_identity(position)
+                else None
+            ),
         }
 
-    def _save_live_reconciliation_state(self) -> None:
+    def _save_live_reconciliation_state(self) -> bool:
         if not self.config.reconciliation_state_path:
-            return
+            return True
         try:
             path = Path(self.config.reconciliation_state_path)
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1219,10 +1251,12 @@ class TradingEngine:
             temporary.replace(path)
             self._last_saved_live_position = self.position
             self._last_live_management_save_at = time.monotonic()
+            return True
         except OSError:
             # Persistence must never turn a confirmed, protected live entry
             # into an emergency close. The exchange hard stop remains active.
             LOG.exception("failed to persist live reconciliation state")
+            return False
 
     def _checkpoint_live_position_management(self) -> None:
         """Keep tightened stops durable and batch changing price extrema.
@@ -1288,6 +1322,9 @@ class TradingEngine:
                     self._entry_fill_next_at, self._entry_fill_started_at + 300.0
                 )
                 return
+            fill_order_id = str(fill.get("order_id") or "")
+            if fill_order_id and fill_order_id != position.entry_order_id:
+                raise RuntimeError("Binance entry-fill order identity validation failed")
             expected_side = "BUY" if position.side == "long" else "SELL"
             if str(fill.get("side") or "").upper() != expected_side:
                 raise RuntimeError("Binance entry-fill side validation failed")
@@ -1318,6 +1355,9 @@ class TradingEngine:
             )
             if quote_fee is not None and not math.isfinite(quote_fee):
                 raise RuntimeError("Binance entry-fill commission validation failed")
+            if self.position is not position:
+                raise RuntimeError("managed position changed during entry-fill reconciliation")
+            pending = self._matching_pending_live_exit()
             self.position = replace(
                 position,
                 entry_price=price,
@@ -1331,6 +1371,14 @@ class TradingEngine:
                 entry_fee=quote_fee,
                 entry_fee_asset=("USDT" if quote_fee is not None else "/".join(assets)),
             )
+            if pending is not None and position.entry_order_id:
+                # Exact fills can correct the provisional open timestamp. This
+                # is still the validated entry order, so keep its unsent exit
+                # attached through the metadata correction and next restart.
+                self._pending_live_exit = {
+                    **pending,
+                    "position_identity": self._live_exit_position_identity(self.position),
+                }
             self._save_live_reconciliation_state()
             self._entry_fill_complete = True
             # A WebSocket fill alone cannot prove that REST/IP access recovered.
@@ -1357,6 +1405,33 @@ class TradingEngine:
                 },
             )
 
+    def _live_exit_position_identity(self, position: Position) -> dict[str, Any]:
+        return {
+            "symbol": self.adapter.settings.symbol,
+            "environment": getattr(self.adapter.settings, "environment", "production"),
+            "side": position.side,
+            "quantity": position.quantity,
+            "opened_at": position.opened_at,
+            "entry_order_id": position.entry_order_id,
+            "entry_client_id": position.entry_client_id,
+            "stop_order_id": position.stop_order_id,
+        }
+
+    def _clear_pending_live_exit(self) -> None:
+        if self._pending_live_exit is not None:
+            self._pending_live_exit = None
+            self._save_live_reconciliation_state()
+
+    def _matching_pending_live_exit(self) -> dict[str, Any] | None:
+        pending = self._pending_live_exit
+        if pending is not None and (
+            self.position is None or self.adapter.name != "binance"
+            or pending.get("position_identity") != self._live_exit_position_identity(self.position)
+        ):
+            self._clear_pending_live_exit()
+            return None
+        return pending
+
     def _manage_live_position(
         self,
         mark_price: float,
@@ -1382,6 +1457,36 @@ class TradingEngine:
                 worst_price=max(position.worst_price or position.entry_price, mark_price),
             )
         self.position = position
+
+        pending = self._matching_pending_live_exit()
+        if pending is not None:
+            if time.time() < float(pending["retry_at"]):
+                # Keep local protection/extrema current while waiting. Normal
+                # private reconciliation also continues before this method.
+                now_ms = int(time.time() * 1000)
+                self._tighten_paper_stop(Candle(now_ms, mark_price, mark_price, mark_price, mark_price, 0.0))
+                self._checkpoint_live_position_management()
+                return TradeResult(
+                    self.adapter.name, "live_exit_retry_wait", signal=signal,
+                    position=self.position,
+                    raw={"exit_reason": pending["exit_reason"], "retry_at": pending["retry_at"]},
+                )
+            # A server-side stop or external close can win during the wait.
+            # Bypass the usual five-second throttle immediately before retry.
+            now_ms = int(time.time() * 1000)
+            self._reconcile_binance_live_position(
+                Candle(now_ms, mark_price, mark_price, mark_price, mark_price, 0.0),
+            )
+            if self.position is None:
+                return TradeResult(self.adapter.name, "live_exit_reconciled", signal=signal)
+            pending = self._matching_pending_live_exit()
+            if pending is not None:
+                close_result = self._close_live_position(mark_price, str(pending["exit_reason"]))
+                return TradeResult(
+                    self.adapter.name, "live_active_exit", signal=signal, position=self.position,
+                    raw={"exit_reason": pending["exit_reason"], "decision_mark_price": mark_price,
+                         "original_decision_mark_price": pending["decision_price"], **close_result},
+                )
 
         exit_reason = ""
         if self._stop_is_protected(position):
@@ -1469,17 +1574,35 @@ class TradingEngine:
 
     def _close_live_position(self, reference_price: float, exit_reason: str) -> dict[str, Any]:
         if self.position is None:
+            self._clear_pending_live_exit()
             return {"already_flat": True, "exit_price": reference_price}
         position = self.position
+        pending = self._matching_pending_live_exit()
+        if pending is not None:
+            # Consume the persisted permission to retry before submission. A
+            # crash or uncertain result must not leave an unsent marker behind.
+            self._pending_live_exit = None
+            if not self._save_live_reconciliation_state():
+                self._pending_live_exit = pending
+                raise RuntimeError("deferred exit not submitted: could not persist retry consumption")
+        client_id = self._client_id("close")
+        LOG.info(
+            "%s live exit request reason=%s side=%s quantity=%.8f decision_price=%.8f "
+            "entry_order_id=%s close_client_id=%s deferred_retry=%s",
+            self.adapter.name, exit_reason, position.side, position.quantity,
+            reference_price, position.entry_order_id, client_id, pending is not None,
+        )
+        submission_returned = False
         try:
             close_payload = self.adapter.place_market_order(
                 OrderRequest(
                     self._opposite_side(position.side),
                     position.quantity,
                     True,
-                    self._client_id("close"),
+                    client_id,
                 )
             )
+            submission_returned = True
             self.resolve_emergency("ip_restricted")
             closed_quantity, close_price = self.adapter.market_fill(
                 close_payload,
@@ -1520,6 +1643,27 @@ class TradingEngine:
                         "exit_price": reference_price,
                         "close_error": str(close_error),
                     }
+            if (
+                self.adapter.name == "binance" and not submission_returned
+                and isinstance(close_error, ApiError) and close_error.request_not_sent
+                and (close_error.rate_limited or close_error.api_code == "LOCAL_REQUEST_BUDGET")
+                and self.position is not None
+                and self._live_exit_position_identity(self.position) == self._live_exit_position_identity(position)
+            ):
+                self._pending_live_exit = {
+                    "position_identity": self._live_exit_position_identity(position),
+                    "exit_reason": str(pending["exit_reason"]) if pending else exit_reason,
+                    "decision_price": float(pending["decision_price"]) if pending else reference_price,
+                    "retry_at": max(time.time(), close_error.retry_at),
+                    "request_not_sent": True,
+                }
+                self._save_live_reconciliation_state()
+                LOG.warning(
+                    "%s live exit deferred before submission reason=%s side=%s "
+                    "entry_order_id=%s retry_at=%.3f",
+                    self.adapter.name, self._pending_live_exit["exit_reason"], position.side,
+                    position.entry_order_id, self._pending_live_exit["retry_at"],
+                )
             self.notify_emergency(
                 close_error,
                 category="order_failure",
@@ -2342,6 +2486,7 @@ class TradingEngine:
             pnl,
         )
         self.position = None
+        self._pending_live_exit = None
         self.position_signal = None
         self.position_equity_before = 0.0
         self.last_position_candle_timestamp = 0

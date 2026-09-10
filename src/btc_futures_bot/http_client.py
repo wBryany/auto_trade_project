@@ -25,11 +25,15 @@ class ApiError(RuntimeError):
         status_code: int | None = None,
         retry_at: float = 0.0,
         api_code: int | str | None = None,
+        request_not_sent: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retry_at = float(retry_at)
         self.api_code = api_code
+        # Only a caller that has not submitted its target request may set this.
+        # HTTP rejections and uncertain transport failures default to False.
+        self.request_not_sent = bool(request_not_sent)
 
     @property
     def retry_after_seconds(self) -> float:
@@ -316,6 +320,7 @@ def request_json(
                 f"rate limit active for {_rate_limit_key(url)}; retry in {blocked_for:.0f}s",
                 status_code=418,
                 retry_at=retry_at,
+                request_not_sent=True,
             )
         request = Request(url, data=data, headers=final_headers, method=request_method)
         local_retry_at = binance_request_budget.reserve(request_method, url, body)
@@ -324,6 +329,7 @@ def request_json(
                 f"Binance REST deferred locally: preventive request budget; retry at {local_retry_at:.3f}",
                 retry_at=local_retry_at,
                 api_code="LOCAL_REQUEST_BUDGET",
+                request_not_sent=True,
             )
         try:
             with urlopen(request, timeout=timeout) as response:

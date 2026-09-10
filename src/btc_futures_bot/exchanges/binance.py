@@ -1423,19 +1423,30 @@ class BinanceAdapter(ExchangeAdapter):
         headers = {"X-MBX-APIKEY": key, "Content-Type": "application/x-www-form-urlencoded"}
         request_method = method.upper()
         request_timeout = 5.0 if timeout is None else max(0.1, float(timeout))
-        if max_attempts is None and timeout is None:
-            # Keep the established call shape for default traffic and tests.
-            self._ensure_server_time()
-        else:
-            self._ensure_server_time(
-                max_attempts=max_attempts,
-                timeout=request_timeout,
-            )
+        try:
+            if max_attempts is None and timeout is None:
+                # Keep the established call shape for default traffic and tests.
+                self._ensure_server_time()
+            else:
+                self._ensure_server_time(
+                    max_attempts=max_attempts,
+                    timeout=request_timeout,
+                )
+        except ApiError as error:
+            # Time synchronization is a prerequisite: this target signed
+            # request has not been submitted, regardless of the time GET's
+            # outcome. Consumers must also check their operation's submit phase.
+            raise ApiError(
+                redact_url_credentials(str(error)), status_code=error.status_code,
+                retry_at=error.retry_at, api_code=error.api_code,
+                request_not_sent=True,
+            ) from error
         attempt_limit = (
             max(1, int(max_attempts))
             if max_attempts is not None
             else (3 if request_method == "GET" else 2)
         )
+        target_may_have_been_sent = False
         for attempt in range(attempt_limit):
             signed_params = dict(params or {})
             signed_params["timestamp"] = self._server_timestamp_ms()
@@ -1460,17 +1471,26 @@ class BinanceAdapter(ExchangeAdapter):
                     timeout=request_timeout,
                 )
             except ApiError as error:
+                target_may_have_been_sent |= not error.request_not_sent
                 safe_message = redact_url_credentials(str(error))
                 has_next_attempt = attempt + 1 < attempt_limit
                 if has_next_attempt and "-1021" in safe_message:
-                    if max_attempts is None and timeout is None:
-                        self._sync_server_time(force=True)
-                    else:
-                        self._sync_server_time(
-                            force=True,
-                            max_attempts=max_attempts,
-                            timeout=request_timeout,
-                        )
+                    try:
+                        if max_attempts is None and timeout is None:
+                            self._sync_server_time(force=True)
+                        else:
+                            self._sync_server_time(
+                                force=True,
+                                max_attempts=max_attempts,
+                                timeout=request_timeout,
+                            )
+                    except ApiError as sync_error:
+                        raise ApiError(
+                            redact_url_credentials(str(sync_error)),
+                            status_code=sync_error.status_code,
+                            retry_at=sync_error.retry_at, api_code=sync_error.api_code,
+                            request_not_sent=False,
+                        ) from sync_error
                     continue
                 retryable_get = (
                     request_method == "GET"
@@ -1486,6 +1506,7 @@ class BinanceAdapter(ExchangeAdapter):
                     status_code=error.status_code,
                     retry_at=error.retry_at,
                     api_code=error.api_code,
+                    request_not_sent=error.request_not_sent and not target_may_have_been_sent,
                 ) from None
         raise ApiError("Binance signed request failed after server-time synchronization")
 
@@ -1518,7 +1539,12 @@ class BinanceAdapter(ExchangeAdapter):
                 max_attempts=max_attempts,
                 timeout=timeout,
             )
-        except ApiError:
+        except ApiError as error:
+            if error.rate_limited:
+                # An old clock anchor cannot make a host ban disappear. Keep
+                # the original rejection visible instead of replacing it with
+                # the subsequent local host-block message.
+                raise
             with self._server_time_lock:
                 if self._server_time_anchor_ms <= 0:
                     raise
