@@ -276,26 +276,31 @@ def run_backtest(
             and signal.side != position.side
             and signal.timestamp != last_signal_timestamp
         ):
-            execution_timestamp = next_execution_timestamp or decision_timestamp
-            held_seconds = max(0.0, (execution_timestamp - position.opened_at) / 1000)
+            # Mirror the live decision using the latest known price and clock.
+            # A later execution gap can change the fill and its costs, never
+            # whether this closed-bar opposite signal warrants an exit.
+            decision_price = candles_by_timeframe["1m"][-1].close
+            held_seconds = max(0.0, (decision_timestamp - position.opened_at) / 1000)
             minimum_hold = max(0, int(getattr(strategy.config, "min_hold_seconds", 60)))
             if held_seconds >= minimum_hold and next_execution_open is not None:
                 net_exit = risk.estimate_net_pnl(
                     position.side,
                     position.entry_price,
-                    next_execution_open,
+                    decision_price,
                     position.quantity,
                     holding_hours=held_seconds / 3600,
                 )
                 required_score = max(1, int(getattr(strategy.config, "reversal_min_score", 5)))
                 should_reverse = net_exit > 0 or signal.score >= required_score
                 if should_reverse:
+                    execution_timestamp = next_execution_timestamp
+                    holding_hours = max(0.0, (execution_timestamp - position.opened_at) / 3_600_000)
                     pnl = risk.estimate_net_pnl(
                         position.side,
                         position.entry_price,
                         next_execution_open,
                         position.quantity,
-                        holding_hours=held_seconds / 3600,
+                        holding_hours=holding_hours,
                     )
                     if reporter is not None:
                         reporter.record_trade(
@@ -324,7 +329,7 @@ def run_backtest(
                                 cooldown_minutes,
                                 max(0, int(getattr(risk.config, "loss_streak_pause_minutes", 0))),
                             )
-                        cooldown_until_ms = decision_timestamp + cooldown_minutes * 60_000
+                        cooldown_until_ms = max(decision_timestamp, execution_timestamp) + cooldown_minutes * 60_000
                     else:
                         consecutive_losses = 0
                     position = None
