@@ -84,4 +84,5 @@ def test_range_gate_does_not_prevent_live_position_exit(monkeypatch):
     def unexpected_gate(*args):
         raise AssertionError('position exit must precede any entry filter')
     monkeypatch.setattr(engine.risk, 'observed_range_allows_entry', unexpected_gate)
+    monkeypatch.setattr(engine.risk, 'assess_entry_range', unexpected_gate)
     assert engine.evaluate_once().status == 'live_active_exit'

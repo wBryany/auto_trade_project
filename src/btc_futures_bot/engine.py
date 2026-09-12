@@ -5,7 +5,7 @@ import logging
 import math
 import time
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -77,6 +77,7 @@ class TradingEngine:
         self.config = config
         self.position: Position | None = None
         self.last_signal_timestamp = 0
+        self._last_logged_entry_rejection: tuple[int, str] | None = None
         self.session_pnl = 0.0
         self.consecutive_losses = 0
         self.cooldown_until = 0.0
@@ -399,14 +400,23 @@ class TradingEngine:
         self.pending_macro_signal = None
         self.last_signal_timestamp = signal.timestamp
         if not self._entry_allowed():
-            return TradeResult(self.adapter.name, "risk_blocked", signal=signal, position=self.position)
+            risk_rejection = self._entry_risk_rejection_details()
+            self._log_entry_rejection(signal, "risk_blocked", risk_rejection)
+            return TradeResult(
+                self.adapter.name, "risk_blocked", signal=signal, position=self.position,
+                raw={"entry_diagnostics": risk_rejection},
+            )
 
-        if not self.risk.observed_range_allows_entry(candles_by_timeframe.get("1m", []), current_price):
+        range_assessment = self.risk.assess_entry_range(candles_by_timeframe.get("1m", []), current_price)
+        if not range_assessment.allowed:
             self._clear_private_entry_retry()
+            range_details = asdict(range_assessment)
+            self._log_entry_rejection(signal, "insufficient_market_range", range_details)
             return TradeResult(
                 self.adapter.name, "insufficient_market_range", signal=signal,
                 position=self.position,
-                raw={"entry_blocked": "closed_1m_range_below_costs_and_minimum_net_edge"},
+                raw={"entry_blocked": "closed_1m_range_below_costs_and_minimum_net_edge",
+                     "entry_diagnostics": range_details},
             )
 
         entry_attempt_started_at = (
@@ -486,7 +496,15 @@ class TradingEngine:
             ),
         )
         if not self.risk.is_cost_effective(signal.side, current_price, protection.take_profit_price, protection.quantity):
-            return TradeResult(self.adapter.name, "cost_blocked", signal=signal, position=self.position)
+            details = self._entry_cost_rejection_details(
+                signal, current_price, protection.take_profit_price, protection.quantity,
+                stage="before_live_quantity",
+            )
+            self._log_entry_rejection(signal, "cost_blocked", details)
+            return TradeResult(
+                self.adapter.name, "cost_blocked", signal=signal, position=self.position,
+                raw={"entry_diagnostics": details},
+            )
         if self.config.mode == "live":
             requested_quantity, sizing_raw = self._select_live_entry_quantity(
                 protection.quantity,
@@ -546,7 +564,15 @@ class TradingEngine:
                 protection.take_profit_price,
                 requested_quantity,
             ):
-                return TradeResult(self.adapter.name, "cost_blocked", signal=signal, position=self.position)
+                details = self._entry_cost_rejection_details(
+                    signal, current_price, protection.take_profit_price, requested_quantity,
+                    stage="after_live_quantity",
+                )
+                self._log_entry_rejection(signal, "cost_blocked", details)
+                return TradeResult(
+                    self.adapter.name, "cost_blocked", signal=signal, position=self.position,
+                    raw={"entry_diagnostics": details},
+                )
             entry_client_id = self._client_id("entry")
             try:
                 entry_payload = self.adapter.place_market_order(
@@ -2120,6 +2146,64 @@ class TradingEngine:
         if self.session_pnl <= -(self.config.paper_equity * self.risk.config.max_daily_loss_pct):
             return False
         return time.time() >= self.cooldown_until
+
+    def _entry_risk_rejection_details(self) -> dict[str, Any]:
+        # Snapshot only after _entry_allowed has rejected. Keep its existing
+        # cooldown clock and loss-streak reset behavior as the sole decision.
+        threshold = int(self.risk.config.max_consecutive_losses)
+        if threshold > 0 and self.consecutive_losses >= threshold:
+            return {
+                "reason": "consecutive_loss_limit",
+                "consecutive_losses": self.consecutive_losses,
+                "loss_limit": threshold,
+                "pause_minutes": max(0, int(getattr(self.risk.config, "loss_streak_pause_minutes", 0))),
+                "cooldown_until": self.cooldown_until,
+            }
+        if self.session_pnl <= -(self.config.paper_equity * self.risk.config.max_daily_loss_pct):
+            return {
+                "reason": "session_loss_limit",
+                "session_pnl": self.session_pnl,
+                "loss_limit": self.config.paper_equity * self.risk.config.max_daily_loss_pct,
+            }
+        return {"reason": "cooldown_active", "cooldown_until": self.cooldown_until}
+
+    def _entry_cost_rejection_details(
+        self, signal: Signal, entry_price: float, target_price: float,
+        quantity: float, *, stage: str,
+    ) -> dict[str, Any]:
+        net_profit = self.risk.costs.estimate_net_pnl(signal.side, entry_price, target_price, quantity)
+        notional = entry_price * quantity
+        return {
+            "reason": "target_net_edge_below_minimum",
+            "stage": stage,
+            "entry_price": entry_price,
+            "target_price": target_price,
+            "quantity": quantity,
+            "estimated_net_profit": net_profit,
+            "net_edge_pct": net_profit / notional if notional > 0 else None,
+            "required_pct": self.risk.costs.min_net_edge_pct,
+        }
+
+    def _log_entry_rejection(self, signal: Signal, status: str, details: dict[str, Any]) -> None:
+        # Ordinary entry gates consume last_signal_timestamp. Keep this small
+        # diagnostic guard separate so an existing private retry cannot spam
+        # the same rejection; it must never change retry eligibility.
+        identity = (signal.timestamp, signal.side)
+        if identity == self._last_logged_entry_rejection:
+            return
+        self._last_logged_entry_rejection = identity
+        payload = {
+            "status": status, "signal_timestamp": signal.timestamp,
+            "side": signal.side, "score": signal.score, **details,
+        }
+        # These callers pass only fixed reason codes and a small numeric
+        # whitelist, never exchange payloads, signal prose or credentials.
+        payload = {
+            key: None if isinstance(value, float) and not math.isfinite(value) else value
+            for key, value in payload.items()
+        }
+        LOG.info("%s entry_gate_rejected %s", self.adapter.name,
+                 json.dumps(payload, sort_keys=True, allow_nan=False))
 
     def _manage_paper_position(
         self,

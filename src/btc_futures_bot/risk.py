@@ -28,6 +28,21 @@ class Protection:
     risk_amount: float
 
 
+@dataclass(frozen=True)
+class EntryRangeAssessment:
+    allowed: bool
+    reason: str
+    lookback_minutes: int
+    available_candles: int
+    window_count: int
+    entry_price: float | None
+    first_candle_timestamp: int | None = None
+    last_candle_timestamp: int | None = None
+    range_points: float | None = None
+    observed_pct: float | None = None
+    required_pct: float | None = None
+
+
 class RiskManager:
     def __init__(
         self,
@@ -56,6 +71,9 @@ class RiskManager:
             raise ValueError("entry_range_lookback_minutes cannot be negative")
 
     def observed_range_allows_entry(self, candles: Sequence[Candle], entry_price: float) -> bool:
+        return self.assess_entry_range(candles, entry_price).allowed
+
+    def assess_entry_range(self, candles: Sequence[Candle], entry_price: float) -> EntryRangeAssessment:
         """Require observed closed-1m range to cover costs plus the configured edge.
 
         This is a liquidity/volatility filter, not a forecast of attainable profit.
@@ -63,18 +81,38 @@ class RiskManager:
         Disabled by default; never use this gate to block management of an open position.
         """
         count = self.config.entry_range_lookback_minutes
+        available = len(candles)
+        details = {
+            "lookback_minutes": count,
+            "available_candles": available,
+            "window_count": min(count, available),
+            "entry_price": (
+                entry_price if isinstance(entry_price, (int, float)) and isfinite(entry_price) else None
+            ),
+        }
         if count == 0:
-            return True
-        if len(candles) < count or not isfinite(entry_price) or entry_price <= 0:
-            return False
+            return EntryRangeAssessment(True, "disabled", **details)
+        if available < count:
+            return EntryRangeAssessment(False, "insufficient_candles", **details)
+        if not isfinite(entry_price) or entry_price <= 0:
+            return EntryRangeAssessment(False, "invalid_entry_price", **details)
         window = candles[-count:]
+        details.update(
+            first_candle_timestamp=window[0].timestamp,
+            last_candle_timestamp=window[-1].timestamp,
+        )
         if any(b.timestamp - a.timestamp != 60_000 for a, b in zip(window, window[1:])):
-            return False
+            return EntryRangeAssessment(False, "non_contiguous_candles", **details)
         if any(not isfinite(c.high) or not isfinite(c.low) or c.low <= 0 or c.high < c.low for c in window):
-            return False
-        observed = (max(c.high for c in window) - min(c.low for c in window)) / entry_price
+            return EntryRangeAssessment(False, "invalid_candle_range", **details)
+        range_points = max(c.high for c in window) - min(c.low for c in window)
+        observed = range_points / entry_price
         required = self.costs.estimate_round_trip_cost(1.0, 1.0, 1.0) + self.costs.min_net_edge_pct
-        return observed >= required
+        allowed = observed >= required
+        return EntryRangeAssessment(
+            allowed, "range_sufficient" if allowed else "range_below_required",
+            **details, range_points=range_points, observed_pct=observed, required_pct=required,
+        )
 
     def protection(
         self,
